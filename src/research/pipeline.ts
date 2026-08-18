@@ -3,6 +3,7 @@ import { webSearch } from "../mcp/webSearch.js";
 import type { SearchProvider, SearchResult } from "../mcp/webSearch.js";
 import { fetchAndClean as fetchAndCleanDefault } from "../extraction/fetchAndClean.js";
 import { createCitationValidator } from "./grounding.js";
+import { assignUniqueIds } from "../shared/ids.js";
 import type { CourseJson, SourceRecord, SubtopicResult, AuditPassRecord } from "./types.js";
 import type { DecomposeTopicOutput } from "../orchestrator/templates/decomposeTopic.js";
 import type { SearchQueriesOutput } from "../orchestrator/templates/generateSearchQueries.js";
@@ -63,11 +64,16 @@ interface ResolvedDeps {
  * course/module/lesson sequencing — that's Phase 3's Course Builder,
  * consuming this function's return value directly.
  */
-export async function runResearchPipeline(
-  topic: string,
-  options: RunResearchPipelineOptions = {}
-): Promise<CourseJson> {
-  const deps: ResolvedDeps = {
+/** Shared dep-resolution for both a full pipeline run and a standalone backfillSubtopic() call. */
+function resolveDeps(options: {
+  maxSourcesPerPass?: number;
+  minExtractionConfidence?: number;
+  searchProvider?: SearchProvider;
+  orchestratorRun?: OrchestratorRunFn;
+  fetchAndClean?: FetchAndCleanFn;
+  onProgress?: ProgressListener;
+}): ResolvedDeps {
+  return {
     orchestratorRun: options.orchestratorRun ?? orchestratorRun,
     searchProvider: options.searchProvider ?? { search: webSearch },
     fetchAndClean: options.fetchAndClean ?? fetchAndCleanDefault,
@@ -75,6 +81,13 @@ export async function runResearchPipeline(
     minExtractionConfidence: options.minExtractionConfidence ?? DEFAULT_MIN_EXTRACTION_CONFIDENCE,
     onProgress: options.onProgress,
   };
+}
+
+export async function runResearchPipeline(
+  topic: string,
+  options: RunResearchPipelineOptions = {}
+): Promise<CourseJson> {
+  const deps = resolveDeps(options);
   const maxAuditRetries = options.maxAuditRetries ?? DEFAULT_MAX_AUDIT_RETRIES;
 
   // Step 1: decompose
@@ -93,7 +106,7 @@ export async function runResearchPipeline(
     );
   }
 
-  const ids = assignUniqueIds(rawSubtopics.map((s) => s.title));
+  const ids = assignUniqueIds(rawSubtopics.map((s) => s.title), { fallback: "subtopic" });
   const subtopics: SubtopicResult[] = [];
   for (let i = 0; i < rawSubtopics.length; i++) {
     const raw = rawSubtopics[i]!;
@@ -205,8 +218,21 @@ interface ResearchPassResult {
   layers: RestructureLayersOutput["layers"];
 }
 
-/** Steps 2a-2h for a single research pass over one subtopic. */
-async function researchPass(input: ResearchPassInput): Promise<ResearchPassResult> {
+interface GatherSourcesResult {
+  sources: SourceRecord[];
+  contentionSources: SourceRecord[];
+  keyPoints: ExtractGroundedKeyPointsOutput["keyPoints"];
+}
+
+/**
+ * Steps 2a-2f: two search+extract passes (an initial pass and a
+ * contention-focused pass) over one subtopic, producing the deduped source
+ * pool. Shared by researchPass() (which continues on to 2g/2h — synthesis
+ * and layering) and the standalone backfillSubtopic() export, which only
+ * needs more sources, not a re-synthesis — see the Material Aggregator
+ * (Phase 3), the one place outside this module that reaches back in here.
+ */
+async function gatherSources(input: ResearchPassInput): Promise<GatherSourcesResult> {
   const { orchestratorRun: run, searchProvider, fetchAndClean, maxSourcesPerPass, minExtractionConfidence, onProgress } =
     input.deps;
   const gapInstruction = input.gapInstruction;
@@ -280,6 +306,15 @@ async function researchPass(input: ResearchPassInput): Promise<ResearchPassResul
   );
 
   const allSources = dedupeSources([...initialSources, ...contentionSources]);
+  return { sources: allSources, contentionSources, keyPoints: extracted.keyPoints };
+}
+
+/** Steps 2a-2h for a single research pass over one subtopic. */
+async function researchPass(input: ResearchPassInput): Promise<ResearchPassResult> {
+  const { orchestratorRun: run } = input.deps;
+  const gapInstruction = input.gapInstruction;
+
+  const { sources: allSources, contentionSources, keyPoints } = await gatherSources(input);
   const allValidIds = new Set(allSources.map((s) => s.source_id));
 
   if (allValidIds.size === 0) {
@@ -294,7 +329,7 @@ async function researchPass(input: ResearchPassInput): Promise<ResearchPassResul
     "synthesize_subtopic",
     {
       subtopicTitle: input.subtopicTitle,
-      groundedKeyPoints: extracted.keyPoints,
+      groundedKeyPoints: keyPoints,
       contentionMaterial: contentionSources.map(toSourceExcerpt),
       validSourceIds: [...allValidIds],
       gapInstruction,
@@ -317,6 +352,47 @@ async function researchPass(input: ResearchPassInput): Promise<ResearchPassResul
   );
 
   return { sources: allSources, synthesis: synthesis.data, layers: layers.data.layers };
+}
+
+// ---------------------------------------------------------------------------
+// Backfill (Phase 3): the one place outside this module that reaches back
+// into the Research Agent — a narrow re-run of steps 2a-2f for a single
+// subtopic that already shipped, when Phase 3's Material Aggregator finds
+// it landed below the minimum valid-source threshold. No re-synthesis, no
+// re-audit: just more candidate sources for the Material Aggregator to
+// evaluate and (if usable) persist and link to the existing lesson.
+// ---------------------------------------------------------------------------
+
+export interface BackfillSubtopicInput {
+  topic: string;
+  subtopicTitle: string;
+  subtopicDescription: string;
+  /** Why the backfill was triggered (e.g. "only 1 valid source, need at least 2") — steers the search queries. */
+  gapInstruction?: string;
+}
+
+export interface BackfillSubtopicOptions {
+  maxSourcesPerPass?: number;
+  minExtractionConfidence?: number;
+  searchProvider?: SearchProvider;
+  orchestratorRun?: OrchestratorRunFn;
+  fetchAndClean?: FetchAndCleanFn;
+  onProgress?: ProgressListener;
+}
+
+export async function backfillSubtopic(
+  input: BackfillSubtopicInput,
+  options: BackfillSubtopicOptions = {}
+): Promise<SourceRecord[]> {
+  const deps = resolveDeps(options);
+  const { sources } = await gatherSources({
+    topic: input.topic,
+    subtopicTitle: input.subtopicTitle,
+    subtopicDescription: input.subtopicDescription,
+    gapInstruction: input.gapInstruction,
+    deps,
+  });
+  return sources;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,20 +459,6 @@ async function classifyVolatilityForSources(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function slugify(text: string): string {
-  return text.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "subtopic";
-}
-
-function assignUniqueIds(titles: string[]): string[] {
-  const seen = new Map<string, number>();
-  return titles.map((title) => {
-    const base = slugify(title);
-    const count = seen.get(base) ?? 0;
-    seen.set(base, count + 1);
-    return count === 0 ? base : `${base}-${count + 1}`;
-  });
-}
 
 function dedupeByUrl(results: SearchResult[]): SearchResult[] {
   const seen = new Set<string>();

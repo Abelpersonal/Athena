@@ -1,4 +1,4 @@
-# Teacher — Orchestrator, Search, and the Research Agent
+# Teacher — Orchestrator, Search, the Research Agent, and Course Persistence
 
 Backend-first plumbing for a personal, single-user AI learning platform.
 
@@ -9,11 +9,16 @@ Backend-first plumbing for a personal, single-user AI learning platform.
   multi-pass pipeline that decomposes a topic, researches and synthesizes each subtopic with
   cited sources, self-audits its own depth and retries the subtopics that fall short, and tags
   the topic's volatility. Its output is a structured "course JSON" — subtopics with layered,
-  cited content — and nothing else.
+  cited content — ephemeral until Phase 3 persists it.
+- **Phase 3** turns that ephemeral JSON into real, persisted course data: the **Course Builder**
+  (`src/courseBuilder/`) sequences subtopics into modules and lessons respecting prerequisite
+  order and writes `Course`/`Module`/`Lesson` records to SQLite; the **Material Aggregator**
+  (`src/materialAggregator/`) re-fetches and permanently persists the sources cited during
+  research, links them to their lesson, and triggers a targeted re-search when a lesson lands
+  below the minimum valid-source count.
 
-There is no Course Builder (module/lesson sequencing, DB persistence), Material Aggregator
-persistence, Memory Graph, or frontend here — those are Phase 3 and later. The Research Agent's
-output in this phase is written to a local JSON file for inspection, not a database.
+There is no real Memory Graph (Graphiti/Neo4j — Phase 3.5 fills in `src/memoryGraph/`'s stub),
+Mind Map generation (Phase 8), quiz/practice logic, Teaching Engine, or frontend here yet.
 
 ## Tech choices
 
@@ -41,9 +46,27 @@ output in this phase is written to a local JSON file for inspection, not a datab
   constraints a static schema can't express — see "Grounding enforcement" below.
 - **Testing:** Vitest. The LLM call is mocked in every test (no real API calls in CI); Phase 2
   additionally injects fake search/extraction dependencies into the pipeline for deterministic
-  control-flow tests.
-- **Logging:** structured JSONL to a local file — no database. That arrives in Phase 3.5 for
-  course data.
+  control-flow tests. Phase 3's DB-touching tests run against an in-memory SQLite (`getDb(":memory:")`),
+  never the real `data/teacher.db`.
+- **Logging:** structured JSONL to a local file (Orchestrator calls) plus SQLite (persisted course
+  data, from Phase 3 on) — see "The database layer" below.
+- **Database: SQLite, via Node's built-in `node:sqlite`, not `better-sqlite3`.** The PRD suggested
+  `better-sqlite3` as "a reasonable pick," not a hard requirement, and it needs a native binding
+  compiled from source (`node-gyp`) — this environment has no C++ toolchain (no Visual Studio
+  Build Tools on Windows), and the installed `better-sqlite3` version ships no prebuilt fallback.
+  Node 22+ ships a synchronous SQLite driver (`node:sqlite`'s `DatabaseSync`) that needs no native
+  compilation at all, so that's the driver, wired into Drizzle through its generic `sqlite-proxy`
+  adapter (a `(sql, params, method) => {rows}` callback — `DatabaseSync.prepare(...).run/all/get`
+  with `setReturnArrays(true)` supplies exactly that shape). Everything above the driver — the
+  schema, the query builder, transactions — is ordinary `drizzle-orm/sqlite-core`, identical to
+  what a `better-sqlite3`-backed setup would use; only `src/db/client.ts` knows which driver is
+  underneath. See "Deviations from the spec" below.
+- **Schema/migrations: Drizzle + drizzle-kit.** `npx drizzle-kit generate` diffs `src/db/schema.ts`
+  against the migration history and writes a new versioned SQL file under `drizzle/` when the
+  schema changes — no hand-editing a live DB file, ever. `getDb()` applies any pending migrations
+  automatically the first time it's called in a process, so the schema can grow phase-by-phase
+  (Phase 3.5's Memory Graph fields, Phase 4's `QuizResult`/`PracticeAttempt`/`MasteryState`, etc.)
+  without a separate manual migration step.
 
 ## Setup
 
@@ -65,6 +88,8 @@ cp .env.example .env
 | `ORCHESTRATOR_MODEL` | No | the selected provider's own default (see below) | One-line override to change the model. |
 | `ORCHESTRATOR_MAX_RETRIES` | No | `2` | Retries after the first attempt before a hard failure. |
 | `ORCHESTRATOR_LOG_PATH` | No | `logs/orchestrator.jsonl` | Where the JSONL cost/latency log is written. |
+| `TEACHER_DB_PATH` | No | `data/teacher.db` | Override the SQLite file path (`getDb()`'s default parameter). |
+| `MATERIAL_MIN_VALID_SOURCES` | No | `2` | Minimum `type: "article"` sources a lesson needs before the Material Aggregator's backfill trigger fires. |
 
 Pipeline-specific tuning (max audit retries, sources per pass, extraction confidence floor) are
 function parameters on `runResearchPipeline()`, not env vars — see "Tuning the pipeline" below.
@@ -81,6 +106,16 @@ npm run harness -- research "your topic here"
 # Phase 2, wiring-only: mocked LLM/search/extraction, no API cost, exercises every code path
 # (including the audit-retry loop) deterministically
 npm run harness -- research --dry-run "your topic here"
+
+# Phase 3: research -> Course Builder -> Material Aggregator, real APIs, writes to data/teacher.db
+npm run harness -- build "your topic here"
+
+# Phase 3, wiring-only: fully mocked, no API cost, writes to the isolated data/teacher.dry-run.db
+npm run harness -- build --dry-run "your topic here"
+
+# Dump a persisted course's structure (modules, lessons, source counts) from SQLite
+npm run inspect -- <course_id>
+npm run inspect -- --dry-run <course_id>   # reads data/teacher.dry-run.db instead
 ```
 
 The Phase 1 form prints a structured, schema-checked `summarize_text` result plus the JSONL log
@@ -94,8 +129,18 @@ extraction (see `src/harness/mocks.ts`) so you can validate the pipeline's contr
 a forced audit failure-then-retry on the first subtopic — without spending real API credits. Use
 real runs to validate output *quality*; use `--dry-run` to validate *wiring* while iterating.
 
-Both forms need `ANTHROPIC_API_KEY` and `TAVILY_API_KEY` set (except `--dry-run`, which needs
-neither). This is meant to be a scrappy debugging tool across Phases 1–6, not a polished CLI.
+The `build` form chains all three phase-3 stages: it runs the research pipeline (same as `research`,
+just not written to `output/`), hands the result to `buildCourse()`, then to `aggregateMaterials()`,
+and prints `course_id`, module/lesson counts, persisted-source count, and how many lessons
+triggered a backfill. `--dry-run` mocks every dependency (LLM, search, extraction, and
+`researchAgent.backfillSubtopic()`) and, importantly, **writes to a separate `data/teacher.dry-run.db`
+file** rather than the real `data/teacher.db` — mock course data (titled "Mock Module (m1)" etc.)
+should never land in the DB you'd actually inspect real courses in. `npm run inspect` needs the
+same `--dry-run` flag to read that same isolated file.
+
+All real (non-`--dry-run`) forms need `TAVILY_API_KEY` set, plus either `GEMINI_API_KEY` (default
+provider) or `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY`. This is meant to be a scrappy
+debugging tool across Phases 1–6, not a polished CLI.
 
 ## Running tests
 
@@ -127,10 +172,11 @@ npm run typecheck
   named in the correction prompt, confirms it succeeds once the model cites only real ids, and
   confirms that if the model *never* self-corrects, the Orchestrator throws rather than ever
   returning the fabricated citation to the caller.
-- `tests/extraction.test.ts` — mocks `fetch`; covers `fetchAndClean`'s confidence check: network
-  failure, non-2xx response, non-HTML content type, too-little-extractable-text, and confidence
-  scaling with article length — all resolving to `{ text: "", title: "", extractionConfidence: 0 }`
-  on failure rather than throwing or returning null.
+- `tests/extraction.test.ts` — mocks `fetch`; covers `fetchAndClean`'s confidence check and its
+  `sourceType` classification (Phase 3 addition): network failure and non-2xx → `"unreachable"`,
+  PDF/video/other non-HTML content types → `"pdf"`/`"video"`/`"other"`, reachable HTML with no
+  extractable article or too-little text → `"low_confidence"`, and a real substantive article →
+  `"article"` with positive confidence.
 - `tests/research.pipeline.test.ts` — runs `runResearchPipeline()` with a fully injected fake
   Orchestrator/search/extraction, covering: decomposition parsing into unique subtopic ids
   (including a title collision), a subtopic that fails its first audit and passes on retry, a
@@ -138,6 +184,25 @@ npm run typecheck
   `shallow_after_retry`, a subtopic that passes immediately with no retry, failing closed
   (`ResearchPipelineError`) when zero usable sources are found, and excluding only the
   below-threshold extractions from a subtopic's source set while keeping the usable ones.
+- `tests/courseBuilder.test.ts` — `topoSortModules()` unit tests (a real prerequisite edge
+  reorders modules away from the model's declared array order; unrelated modules keep their
+  original order; a genuine cycle throws `CourseBuilderError`; self-referencing and dangling
+  edges are ignored rather than crashing), plus `buildCourse()` integration tests against an
+  in-memory SQLite db — persisted module order/`prerequisiteOf` reflecting a real dependency
+  chain, the Memory Graph stub being called with the right `courseId`/prerequisites, and two
+  builds of similarly-titled courses against the same db not colliding on id uniqueness (the real
+  bug the run-scoped id suffix — see "The Course Builder" below — was added to fix).
+- `tests/courseBuilderTemplates.test.ts` — unit-tests `createSequenceModulesValidator` and
+  `createWriteLessonMetadataValidator` directly (coverage/uniqueness/unknown-id/dangling-edge
+  rejection, mirroring `grounding.test.ts`'s pattern for the Phase 2 validators), plus a trivial
+  check that the Memory Graph stub resolves and logs rather than doing nothing silently.
+- `tests/materialAggregator.test.ts` — `aggregateMaterials()` against an in-memory db seeded via a
+  real `buildCourse()` call: Source persistence and lesson-linking, the backfill trigger firing
+  exactly once when a lesson lands below threshold and recovering above it, a lesson still short
+  after its one backfill attempt shipping flagged `source_status: "below_threshold"` (mocked
+  failing-source case — no real API/search calls), the course's `status` flipping to `"complete"`,
+  and two subtopics citing the identical URL not crashing on the Source table's primary key
+  (`onConflictDoNothing()`).
 
 ## Architecture
 
@@ -153,14 +218,27 @@ src/
   mcp/
     webSearch.ts        # Tavily MCP adapter (search only for now)
   extraction/
-    fetchAndClean.ts    # Readability.js content extraction, with a confidence score
+    fetchAndClean.ts    # Readability.js content extraction, with a confidence score + sourceType
   research/
-    pipeline.ts         # the Research Agent's multi-pass pipeline (Phase 2 + 2.5)
+    pipeline.ts         # the Research Agent's multi-pass pipeline (Phase 2 + 2.5) + backfillSubtopic()
     grounding.ts         # createCitationValidator() — the anti-fabrication check
     types.ts              # CourseJson / SubtopicResult / SourceRecord
+  courseBuilder/         # Phase 3: sequencing + persistence
+    index.ts               # buildCourse() — orchestrates both [LLM] steps, assembles + persists rows
+    sequence.ts               # topoSortModules() — pure topological sort, no I/O
+  materialAggregator/    # Phase 3: source persistence + backfill
+    index.ts               # aggregateMaterials() — re-fetch, persist, link, backfill-trigger
+  memoryGraph/            # Phase 3.5 stub — writeTopic() logs a TODO and no-ops
+    index.ts
+  db/                     # SQLite (node:sqlite) + Drizzle
+    schema.ts                # courses / modules / lessons / sources tables
+    client.ts                  # getDb() — lazy connect + auto-migrate, sqlite-proxy driver
+  shared/
+    ids.ts                # slugify() / assignUniqueIds() — shared by pipeline.ts and courseBuilder
   harness/
-    cli.ts               # debugging CLI: Phase 1 demo + `research [--dry-run]`
-    mocks.ts              # canned dependencies for --dry-run
+    cli.ts               # debugging CLI: Phase 1 demo + `research [--dry-run]` + `build [--dry-run]`
+    inspect.ts             # `npm run inspect -- <course_id>` — dumps a persisted course from SQLite
+    mocks.ts              # canned dependencies for --dry-run (research AND build)
 tests/
   orchestrator.test.ts
   providers.test.ts
@@ -168,8 +246,13 @@ tests/
   grounding.test.ts
   extraction.test.ts
   research.pipeline.test.ts
-output/                 # research harness writes course JSON here (gitignored is NOT set —
-                         # inspect/delete freely; nothing sensitive lands here)
+  courseBuilder.test.ts
+  courseBuilderTemplates.test.ts
+  materialAggregator.test.ts
+drizzle/                 # versioned migration SQL, generated by `npm run db:generate` — committed
+drizzle.config.ts
+output/                 # research harness writes course JSON here (gitignored)
+data/                   # data/teacher.db (real) and data/teacher.dry-run.db (mock) — gitignored
 ```
 
 ### The Orchestrator pipeline
@@ -369,14 +452,128 @@ fabricated citation.
 | `fetchAndClean` | the real Readability-based one | Swap for a fake — likewise. |
 | `onProgress` | none | Callback for live progress lines (what the harness prints). |
 
+### The database layer (SQLite + Drizzle)
+
+`src/db/schema.ts` defines four tables — Phase 3's slice of the PRD's data model; `QuizResult`,
+`PracticeAttempt`, `MasteryState`, `Book`, and `UpdateEvent` belong to later phases and aren't
+modeled yet, so the schema grows incrementally instead of drifting ahead of what's built:
+
+| Table | Columns |
+|---|---|
+| `courses` | `id`, `topic`, `created_at`, `volatility_tier` (`fast`\|`medium`\|`slow`\|`mixed`, aggregated from subtopic tiers), `status` (`building`\|`complete`) |
+| `modules` | `id`, `course_id`, `title`, `description`, `order` (DB column `order_index` — sidesteps the SQL reserved word, JS field stays `order`), `prerequisite_of` (JSON array of module ids) |
+| `lessons` | `id`, `module_id`, `title`, `description`, `estimated_duration`, `layers` (JSON — same shape as Phase 2's `RestructureLayersOutput["layers"]`), `source_refs` (JSON array of source ids), `audio_cache_ref` (nullable, unused until the audio-caching phase — the column exists now so the schema doesn't change later), `source_status` (`ok`\|`below_threshold`) |
+| `sources` | `id`, `url`, `type` (`article`\|`pdf`\|`video`\|`other`\|`unreachable`\|`low_confidence`), `extracted_text`, `credibility_score`, `fetched_at` |
+
+`npm run db:generate` (`drizzle-kit generate`) diffs `schema.ts` against `drizzle/`'s migration
+history and writes a new versioned SQL file when the schema changes — run it after editing
+`schema.ts`, then commit the generated file. `getDb()` (`src/db/client.ts`) applies any pending
+migrations automatically the first time it's called in a process (`drizzle-orm/sqlite-proxy/migrator`),
+so there's no separate manual migration step and no live DB file ever needs hand-editing.
+
+`getDb(dbPath?)` defaults to `data/teacher.db` (override via `TEACHER_DB_PATH` or the parameter
+directly — tests pass `":memory:"`) and caches one connection per path. `resetDbCache()` clears
+that cache — call it before opening a different path in the same process (the harness's
+`--dry-run` build mode does this to switch to `data/teacher.dry-run.db`).
+
+### The Course Builder
+
+`buildCourse(course: CourseJson, options?)` in `src/courseBuilder/index.ts` implements the spec's
+six steps:
+
+1. **`sequence_modules` [LLM]**: groups subtopics into modules and records a *dependency graph*
+   between them (`prerequisiteOfTempIds` edges) — not yet a linear order. The model is not trusted
+   to hand back a self-consistent total order directly (same philosophy as Phase 2's depth audit
+   computing `overallPass` in code rather than trusting a model-reported aggregate).
+2. **`write_lesson_metadata` [LLM]**: given the sequencing from step 1, writes final module/lesson
+   titles, short descriptions, and a rough estimated duration (e.g. `"12 min read/listen"` — not a
+   word-count formula, per the spec's resolved default).
+3. **Assemble records [code]**: `src/courseBuilder/sequence.ts`'s `topoSortModules()` runs Kahn's
+   algorithm over step 1's dependency graph to derive the actual linear module order (ties broken
+   by the model's original array position, so it's deterministic) — throwing `CourseBuilderError`
+   if the edges describe a genuine cycle, rather than silently guessing an order. IDs are minted as
+   `{prefix}_{slugified-title}_{run-scoped-random-suffix}` — the shared suffix (not just the
+   per-call `assignUniqueIds()` de-dup) is what lets two builds with similar or identical titles
+   (a re-run of the same topic, or the dry-run harness's fixed "Mock Module"/"Mock Lesson" titles)
+   coexist in the same DB without a `UNIQUE constraint` collision; this was a real bug caught by
+   running the dry-run harness twice in a row against the same file — see `tests/courseBuilder.test.ts`.
+4. **Persist [code]**: one `db.transaction()` inserts the `Course` row, then every `Module` row,
+   then every `Lesson` row (with `source_refs: []`, `source_status: "ok"` — the Material Aggregator
+   fills those in) — all-or-nothing, so a failure partway through never leaves an orphaned module
+   with no course or a lesson with no module.
+5. **Memory Graph write [code, STUB]**: calls `memoryGraph.writeTopic(courseId, prerequisites)`
+   right after persistence succeeds — see "Memory Graph stub" below.
+6. **Output**: `{ courseId, moduleCount, lessonCount, subtopicLessonMap }` — the last field (a
+   `subtopic id -> lesson id` map) is what the Material Aggregator needs to link sources to the
+   right lesson.
+
+The depth-audit checkpoint the PRD mentions for course finalization is already satisfied by Phase
+2's per-subtopic audit loop and is not reimplemented here.
+
+### The Material Aggregator
+
+`aggregateMaterials(courseId, course, subtopicLessonMap, options?)` in
+`src/materialAggregator/index.ts` makes Phase 2's ephemeral, per-subtopic source lists into
+persisted, lesson-linked `Source` rows:
+
+1. **Re-fetch and verify [code]**: every source URL a subtopic's research pass collected gets
+   `fetchAndClean()`'d again — a fresh copy for permanent storage, not a reuse of Phase 2's
+   in-memory text, since that fetch may be stale by the time this stage runs.
+2. **Classify honestly, not fabricate a paywall detector [code]**: `fetchAndClean` now returns a
+   `sourceType` (`"article" | "pdf" | "video" | "other" | "unreachable" | "low_confidence"`)
+   grounded in what was actually observed — `"unreachable"` only for a genuine fetch/network
+   failure, `"pdf"`/`"video"`/`"other"` from the real Content-Type header, `"low_confidence"` when
+   HTML was reached and read but Readability found nothing usable (commonly caused by paywalls,
+   login walls, or JS-rendered pages — but that specific cause is never asserted, since it isn't
+   actually detected). Only `"article"` counts toward the valid-source threshold.
+3. **Persist and link [code]**: every re-fetched source (including unreachable/low-confidence
+   ones — kept for auditability, not silently dropped) is inserted into `sources` and its id
+   appended to the lesson's `source_refs`. Inserts use `onConflictDoNothing()`: `source_id` is a
+   content hash of the URL (`src/mcp/webSearch.ts`), so the same real URL — cited by two
+   subtopics, rediscovered by a backfill, or persisted again in a later `build` run over the same
+   DB — always maps to the same id, and that's expected, not a bug (`tests/materialAggregator.test.ts`
+   covers this directly).
+4. **Backfill trigger [code, delegating to Phase 2]**: if a lesson's `"article"`-type source count
+   is below `MATERIAL_MIN_VALID_SOURCES` (default 2), exactly one targeted backfill runs via
+   `researchAgent.backfillSubtopic()` — a new export from `src/research/pipeline.ts` that reuses
+   (via a shared internal `gatherSources()` helper, factored out of `researchPass()` rather than
+   duplicated) steps 2a-2f: two more search+extract passes for just that subtopic, no
+   re-synthesis, no re-audit. This is the one place Phase 3 reaches back into the Research Agent.
+   Backfilled sources are persisted directly (their own `fetchAndClean` already ran as part of the
+   backfill and already filtered to usable-confidence results, so they aren't re-fetched a third
+   time). If still below threshold after that one attempt, the lesson ships anyway flagged
+   `source_status: "below_threshold"` — bounded cost over an unbounded retry loop, mirroring
+   Phase 2's audit-retry policy.
+5. **Finish [code]**: once every subtopic is processed, the course's `status` flips from
+   `"building"` to `"complete"`.
+
+No LLM calls happen in this module's own code — the one exception is delegating to
+`backfillSubtopic()`, which does call the Orchestrator (as part of Phase 2's pipeline) as the
+deliberate, spec'd reach-back described above, not a violation of that rule.
+
+### Memory Graph stub (Phase 3.5 seam)
+
+`src/memoryGraph/index.ts`'s `writeTopic(courseId, prerequisites)` is a stub: it logs
+`[memory-graph] TODO: Phase 3.5 — ...` and resolves, doing nothing else. It's called from
+`buildCourse()` right after persistence succeeds — the exact place the real Graphiti/Neo4j call
+will go once Phase 3.5 wires it in. This is deliberately *not* silently missing: the seam is
+called from the real code path and its call is logged on every run, so it's visibly a stub rather
+than something that looks wired in but silently does nothing (the failure mode Phase 3's kickoff
+prompt explicitly called out to avoid — a constructed-but-never-invoked function is
+indistinguishable from a correctly-working no-op with zero trace either way).
+
 ### Documented gaps
 
 - **No Trafilatura fallback for low-confidence extractions.** `fetchAndClean` returns a
   confidence score; a low-confidence page is simply excluded from that subtopic's source set
-  (logged, not retried through a second extractor). This was explicitly optional for Phase 2 —
-  if extraction quality turns out to be a real bottleneck once more real-topic runs are done,
-  add it as a second attempt inside `fetchAndClean` when Readability's confidence is low, keeping
-  the same `{ text, title, extractionConfidence }` return shape so nothing downstream changes.
+  (logged, not retried through a second extractor). This was explicitly optional for Phase 2, and
+  Phase 3 explicitly named the signal to watch for: "if real runs in this phase show a meaningful
+  fraction of lessons falling below the valid-source threshold specifically because of extraction
+  failures." **That signal was not observed this phase** — every `build` run so far was `--dry-run`
+  (see "Definition of done" below for why: the real Gemini free-tier quota was exhausted before a
+  real end-to-end `build` could complete), so there's no real-run extraction data yet to judge
+  Trafilatura against. The decision stays deferred, not because it was ruled out, but because
+  there's no organic evidence yet either way — revisit once a real `build` run exists.
 - **No additional search providers yet** (arXiv, YouTube, Consensus, Firecrawl) — both the
   initial and contention-focused searches reuse Phase 1's Tavily adapter. This was a deliberate
   scope boundary (see the kickoff prompt): adding source diversity and proving the multi-pass
@@ -401,6 +598,8 @@ Anthropic-specific.
 
 ## Definition of done — status
 
+### Phase 1 + 2
+
 - [x] Orchestrator retry logic is unit-tested with a mocked LLM call.
 - [x] Every LLM call goes through `orchestrator.run()`, which only ever calls the selected
       `LLMProvider` — `@anthropic-ai/sdk` is imported only in
@@ -411,34 +610,114 @@ Anthropic-specific.
       source set, even after exhausting retries (`tests/grounding.test.ts`).
 - [x] New tests cover decomposition parsing, audit scoring/retry logic, and `fetchAndClean`'s
       confidence check.
-- [x] `npm run typecheck` clean; all 45 tests pass (`npm test`).
-- [x] Nothing in this phase persists to a database, builds course/module/lesson sequencing, or
-      touches the Memory Graph.
+- [x] `npm run typecheck` clean; all 74 tests pass (`npm test`).
 - [ ] **A real run against a genuinely non-trivial topic, with at least one subtopic that failed
-      its first depth audit and passed on retry, demonstrated in the report.** The pipeline,
-      `--dry-run` mode, and every code path this requires are built and tested (see the dry-run
-      excerpt below) — but this specific item needs a live run against real Gemini (or Anthropic)
-      + Tavily APIs, which needs API keys this environment doesn't have configured. See the note
-      at the end of this section.
+      its first depth audit and passed on retry, demonstrated in the report.** Still open — see
+      "The real-run blocker" below. Progress since it was last written up: a real Gemini API key
+      is now configured, and a real (non-mocked) run *did* get further than before — subtopic 1 of
+      a real "Special Relativity" decomposition genuinely passed its depth audit with real Tavily
+      search results and real extracted article text — before hitting a real quota wall rather
+      than a code bug.
 
-Confirmed via `npm run harness -- research --dry-run "Photosynthesis"` that the full pipeline,
-including the audit fail → targeted retry → pass path, executes correctly end-to-end:
+### Phase 3
+
+- [x] Course Builder (`sequence_modules` + `write_lesson_metadata`, both routed through the
+      Orchestrator) and Material Aggregator built and unit-tested — see `tests/courseBuilder.test.ts`,
+      `tests/courseBuilderTemplates.test.ts`, `tests/materialAggregator.test.ts`.
+- [x] Modules/lessons are correctly sequenced respecting prerequisite order — **demonstrated**
+      (not just claimed) via `tests/courseBuilder.test.ts` and a constructed `--dry-run` case
+      below, both using a genuine dependency edge the model declares out of declaration order.
+- [x] The backfill path is demonstrated (a constructed case, per the spec's "real or constructed"
+      wording for this item) — log excerpt below, plus `tests/materialAggregator.test.ts` covering
+      both the recovery and still-below-threshold-after-backfill outcomes with mocked failures.
+- [x] The Memory Graph stub exists (`src/memoryGraph/index.ts`), is called from `buildCourse()`
+      right after persistence, and logs a `Phase 3.5` TODO on every call — not silently missing.
+- [x] No mind map generation, no quiz/practice logic, no frontend.
+- [x] All Phase 1 and 2 tests still pass; new tests cover sequencing/prerequisite-order logic,
+      Source persistence and lesson-linking, and the backfill trigger (mocked failing-source case,
+      no real API/search calls in CI).
+- [x] `npm run typecheck` clean.
+- [ ] **A real run against a genuinely non-trivial topic producing persisted Course/Module/Lesson/
+      Source records in SQLite, inspectable via `npm run inspect`.** Blocked by the same real-run
+      issue as Phase 2's open item — see "The real-run blocker" below. Every other Phase 3
+      Definition-of-done item is independently satisfied via unit tests and a `--dry-run` demo.
+
+### Prerequisite-order demonstration (dry run + unit test)
+
+`npm run harness -- build --dry-run "Special Relativity"`'s mock deliberately returns modules out
+of dependency order — `sequence_modules` responds with `[m3, m1, m2]` in that array order, but
+declares `m1` a prerequisite of `m3`. `courseBuilder`'s code-side `topoSortModules()` (not the
+model's own array order) decides the real persisted order, confirmed via `npm run inspect`:
 
 ```
-[research-harness] --- Subtopic 1/2: Mock Subtopic One ---
-[research-harness] Subtopic "Mock Subtopic One" — research pass 1...
-[research-harness] Subtopic "Mock Subtopic One" FAILED the depth audit on attempt 1: misconceptionsAddressed — Mock: no misconception was explicitly addressed on this pass.
-[research-harness] Subtopic "Mock Subtopic One" — research pass 2 (targeted retry)...
-[research-harness] Subtopic "Mock Subtopic One" passed the depth audit on attempt 2.
+Module [0] mod_mock-module-m1_bf84b9 — "Mock Module (m1)"
+    prerequisite_of: mod_mock-module-m3_bf84b9
+    Lesson lsn_mock-lesson-mock-subtopic-one_bf84b9 — "Mock Lesson: Mock Subtopic One" ...
+
+Module [1] mod_mock-module-m3_bf84b9 — "Mock Module (m3)"
+    Lesson lsn_mock-lesson-mock-subtopic-three_bf84b9 — "Mock Lesson: Mock Subtopic Three" ...
+
+Module [2] mod_mock-module-m2_bf84b9 — "Mock Module (m2)"
+    Lesson lsn_mock-lesson-mock-subtopic-two_bf84b9 — "Mock Lesson: Mock Subtopic Two" ...
 ```
 
-**To close out the remaining item:** run `npm run harness -- research "<a real, non-trivial
-topic>"` with real `GEMINI_API_KEY` (or `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY`) and
-`TAVILY_API_KEY` set, inspect `output/<slug>.json`, and confirm at least one subtopic's
-`auditPasses` array has more than one entry with the first `overallPass: false`. This will cost
-real API credits (multiple LLM calls per subtopic, times however many subtopics, times up to
-`maxAuditRetries` audit retries) — pick a topic, not a one-word toy, since decomposition on a
-trivial topic may not produce enough subtopics to be a meaningful test.
+`m1` (order `0`) precedes `m3` (order `1`) despite `m3` being declared first — the persisted order
+is a genuine permutation of the model's declared order, not an echo of it.
+`tests/courseBuilder.test.ts` asserts the same thing directly against an in-memory db.
+
+### Backfill demonstration (dry run + unit test)
+
+The same `build --dry-run` run forces "Mock Subtopic Two"'s four re-fetched sources to come back
+`"unreachable"` (a deliberately constructed case, documented in `src/harness/mocks.ts`), producing
+this real log excerpt:
+
+```
+[build-harness] Aggregating materials for "Mock Subtopic Two"...
+[build-harness]   https://example.com/mock-source-9 re-fetched as "unreachable" — not counted as a valid source.
+[build-harness]   https://example.com/mock-source-10 re-fetched as "unreachable" — not counted as a valid source.
+[build-harness]   https://example.com/mock-source-11 re-fetched as "unreachable" — not counted as a valid source.
+[build-harness]   https://example.com/mock-source-12 re-fetched as "unreachable" — not counted as a valid source.
+[build-harness]   "Mock Subtopic Two" has 0 valid source(s) (< 2) — triggering one targeted backfill.
+[build-harness]   backfill for "Mock Subtopic Two" found 2 additional source(s).
+```
+
+`tests/materialAggregator.test.ts` covers both outcomes the spec's "one attempt, then ship
+flagged" policy requires: recovering above threshold (asserts `backfillSubtopic` is called
+exactly once, with the real gap description in its input) and staying below threshold after the
+one attempt (asserts `source_status: "below_threshold"` and that backfill is *not* retried a
+second time).
+
+### The real-run blocker (Phase 2 and Phase 3, shared cause)
+
+Both phases' remaining open items need the same thing: a full, real (non-mocked) pipeline run.
+That's now blocked by something more specific than "no API key configured" — a real
+`GEMINI_API_KEY` **is** configured, and multiple real runs were attempted this session. The
+blocker is Gemini's free-tier quota: `generativelanguage.googleapis.com/generate_content_free_tier_requests`
+allows **20 requests/day per project per model**. A real run against a genuinely non-trivial topic
+needs far more than that — `runResearchPipeline()` alone issues roughly 6 LLM calls per subtopic
+per research pass (`generate_search_queries`, `extract_grounded_key_points`,
+`generate_contention_queries`, `synthesize_subtopic`, `restructure_layers`, `depth_audit_score`),
+times however many subtopics `decompose_topic` returns (6, for "Special Relativity" — a real,
+observed decomposition this session), times up to `maxAuditRetries + 1` passes per subtopic that
+fails its audit — comfortably 40-100+ calls for one course, before Course Builder's 2 more calls
+or Material Aggregator's backfill calls. This isn't a timing problem that a later retry fixes; it's
+a capacity problem the free tier can't cover for a topic with more than one or two subtopics,
+confirmed live: a real "Special Relativity" run got through subtopic 1's full research pass (with
+real Tavily search and real extracted article text) and into subtopic 2 before hitting
+`RESOURCE_EXHAUSTED` with `limit: 20, model: gemini-3.6-flash`.
+
+Options to actually close these two items out, in rough order of preference:
+
+1. **Enable billing on the Gemini API key** (moves off the free tier's 20/day cap) and re-run
+   `npm run harness -- build "<a real, non-trivial topic>"`.
+2. **Switch to Anthropic** (`LLM_PROVIDER=anthropic` + a real `ANTHROPIC_API_KEY` in `.env`) for
+   one real run, since the Orchestrator is provider-agnostic by design — nothing else changes.
+3. **Spread a single run across multiple days**, relying on each model's quota resetting daily —
+   slow and awkward, not recommended.
+
+Once one real run succeeds, closing both items is the same manual check described previously:
+inspect the resulting course (via `output/<slug>.json` for Phase 2's audit-retry evidence, and
+`npm run inspect -- <course_id>` for Phase 3's persisted-record evidence).
 
 ## Deviations from the spec (documented)
 
@@ -455,3 +734,11 @@ trivial topic may not produce enough subtopics to be a meaningful test.
   grounding-retry path) untestable and pointless, and it would also have to work identically
   across vendors with different native structured-output mechanisms.
 - Trafilatura fallback and additional search providers deferred — see "Documented gaps" above.
+- **Database driver is `node:sqlite`, not `better-sqlite3`** — the PRD offered `better-sqlite3` as
+  "a reasonable pick," not a requirement, and it needs a native binding compiled via `node-gyp`;
+  this environment has no C++ build toolchain (no Visual Studio Build Tools) and the installed
+  version ships no prebuilt binary fallback. Node's own built-in `node:sqlite` (stable since
+  Node 22) needs no compilation and is wired into Drizzle's generic `sqlite-proxy` driver instead
+  — see "The database layer" above. The schema, query builder, and migration workflow are
+  unaffected; only `src/db/client.ts` would need to change to switch back if a future environment
+  has a working toolchain and prefers `better-sqlite3`'s (mildly faster) native binding.

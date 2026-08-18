@@ -1,7 +1,10 @@
 import type { OrchestratorResult, RunOptions } from "../orchestrator/index.js";
-import type { OrchestratorRunFn } from "../research/pipeline.js";
+import type { OrchestratorRunFn, BackfillSubtopicInput, FetchAndCleanFn } from "../research/pipeline.js";
 import type { SearchProvider, SearchResult } from "../mcp/webSearch.js";
 import type { CleanedContent } from "../extraction/fetchAndClean.js";
+import type { SourceRecord } from "../research/types.js";
+import type { BackfillSubtopicFn } from "../materialAggregator/index.js";
+import { slugify } from "../shared/ids.js";
 
 /**
  * Canned dependencies for `npm run harness -- research --dry-run "<topic>"`.
@@ -35,6 +38,7 @@ export async function mockFetchAndClean(url: string): Promise<CleanedContent> {
     text: `Canned mock article text standing in for the real page at ${url}. `.repeat(30),
     title: `Mock title for ${url}`,
     extractionConfidence: 0.9,
+    sourceType: "article",
   };
 }
 
@@ -67,6 +71,7 @@ export function createMockOrchestratorRun(): OrchestratorRunFn {
           subtopics: [
             { title: "Mock Subtopic One", description: "First canned subtopic — used to demo the audit retry path." },
             { title: "Mock Subtopic Two", description: "Second canned subtopic — passes its audit immediately." },
+            { title: "Mock Subtopic Three", description: "Third canned subtopic — depends on Subtopic One (Phase 3 sequencing demo)." },
           ],
         });
 
@@ -136,10 +141,111 @@ export function createMockOrchestratorRun(): OrchestratorRunFn {
       case "classify_volatility":
         return respond({ tier: "medium", justification: "Mock: assumed medium volatility for dry-run wiring checks." });
 
+      case "sequence_modules": {
+        const subtopics = (context.subtopics as Array<{ id: string; title: string }>) ?? [];
+        const byTitle = (title: string) => subtopics.find((s) => s.title === title);
+        const one = byTitle("Mock Subtopic One");
+        const two = byTitle("Mock Subtopic Two");
+        const three = byTitle("Mock Subtopic Three");
+
+        // Deliberately constructed (Phase 3 demo): modules are returned in array order
+        // [m3, m1, m2], but m1 is declared a prerequisite of m3. The final persisted order
+        // must place m1 before m3 despite m3 being listed first here — demonstrating that
+        // courseBuilder's code-side topological sort, not the model's own array order,
+        // decides the real sequencing.
+        if (one && two && three) {
+          return respond({
+            modules: [
+              { tempId: "m3", subtopicIds: [three.id], prerequisiteOfTempIds: [] },
+              { tempId: "m1", subtopicIds: [one.id], prerequisiteOfTempIds: ["m3"] },
+              { tempId: "m2", subtopicIds: [two.id], prerequisiteOfTempIds: [] },
+            ],
+          });
+        }
+
+        return respond({
+          modules: subtopics.map((s, i) => ({ tempId: `m${i + 1}`, subtopicIds: [s.id], prerequisiteOfTempIds: [] })),
+        });
+      }
+
+      case "write_lesson_metadata": {
+        const modulesCtx =
+          (context.modules as Array<{ tempId: string; subtopics: Array<{ id: string; title: string }> }>) ?? [];
+        return respond({
+          modules: modulesCtx.map((m) => ({
+            tempId: m.tempId,
+            title: `Mock Module (${m.tempId})`,
+            description: `Mock module description for ${m.tempId}, standing in for a real LLM-written summary.`,
+          })),
+          lessons: modulesCtx.flatMap((m) =>
+            m.subtopics.map((s) => ({
+              subtopicId: s.id,
+              title: `Mock Lesson: ${s.title}`,
+              description: `Mock lesson description for "${s.title}".`,
+              estimatedDuration: "8 min read/listen",
+            }))
+          ),
+        });
+      }
+
       default:
         throw new Error(`[dry-run mock] No canned response registered for task type "${taskType}".`);
     }
   }
 
   return mockRun;
+}
+
+/**
+ * Canned fetchAndClean for `npm run harness -- build --dry-run "<topic>"`'s
+ * Material Aggregator step. With the fixed 3-subtopic, 2-query-per-pass mock
+ * wiring above, "Mock Subtopic Two" always ends up owning mock-source-9
+ * through mock-source-12: subtopic One consumes 1-4 on its first research
+ * pass, then ANOTHER 4 (5-8) on its forced audit-retry pass (see
+ * createMockOrchestratorRun's depth_audit_score case), before subtopic Two
+ * starts at 9. Those four (9-12) are deliberately forced "unreachable" here
+ * so that lesson lands at 0 valid sources and the backfill trigger actually
+ * fires during a dry run, demonstrating that path without spending real
+ * API/search calls. Every other source re-fetches as a normal valid article.
+ */
+export function createMockMaterialFetchAndClean(): FetchAndCleanFn {
+  return async (url: string): Promise<CleanedContent> => {
+    const match = /mock-source-(\d+)/.exec(url);
+    const n = match ? Number(match[1]) : 0;
+    if (n >= 9 && n <= 12) {
+      return { text: "", title: "", extractionConfidence: 0, sourceType: "unreachable" };
+    }
+    return {
+      text: `Canned mock article text standing in for the real page at ${url}. `.repeat(30),
+      title: `Mock title for ${url}`,
+      extractionConfidence: 0.9,
+      sourceType: "article",
+    };
+  };
+}
+
+/**
+ * Canned researchAgent.backfillSubtopic() for the same dry run — returns two
+ * fresh, already-valid sources so the demo shows the full backfill arc: a
+ * lesson drops below threshold, the targeted re-search "runs" (mocked), and
+ * the lesson recovers above threshold rather than shipping flagged. The
+ * still-below-threshold-after-backfill branch is covered separately by a
+ * unit test (tests/materialAggregator.test.ts), not by this dry-run path.
+ */
+export function createMockBackfillSubtopic(): BackfillSubtopicFn {
+  return async (input: BackfillSubtopicInput): Promise<SourceRecord[]> => {
+    const slug = slugify(input.subtopicTitle) || "subtopic";
+    return [1, 2].map((n) => ({
+      source_id: `src_mock_backfill_${slug}_${n}`,
+      url: `https://example.com/mock-backfill-${slug}-${n}`,
+      title: `Mock backfilled source ${n} for ${input.subtopicTitle}`,
+      text: `Canned mock backfilled article text for "${input.subtopicTitle}", long enough to look like real extracted content. `.repeat(
+        20
+      ),
+      extractionConfidence: 0.85,
+      domain: "example.com",
+      query: "mock backfill query",
+      role: "initial" as const,
+    }));
+  };
 }

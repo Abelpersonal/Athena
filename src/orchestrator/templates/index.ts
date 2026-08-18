@@ -11,6 +11,8 @@ import "./synthesizeSubtopic.js";
 import "./restructureLayers.js";
 import "./depthAuditScore.js";
 import "./classifyVolatility.js";
+import "./sequenceModules.js";
+import "./writeLessonMetadata.js";
 
 export * from "./registry.js";
 export * from "./summarizeText.js";
@@ -22,3 +24,5 @@ export * from "./synthesizeSubtopic.js";
 export * from "./restructureLayers.js";
 export * from "./depthAuditScore.js";
 export * from "./classifyVolatility.js";
+export * from "./sequenceModules.js";
+export * from "./writeLessonMetadata.js";

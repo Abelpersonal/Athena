@@ -2,6 +2,19 @@ import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 
 /**
+ * Coarse, honestly-derived source category — grounded in what the fetch
+ * actually observed, not a fabricated paywall/video detector:
+ *   - "unreachable": the fetch itself failed (network error, non-2xx, body read failure)
+ *   - "pdf" / "video" / "other": reached, but the Content-Type wasn't HTML
+ *   - "low_confidence": HTML was reached and read, but Readability found nothing
+ *     usable (empty parse, parse exception, or too-short text) — commonly caused
+ *     by paywalls, login walls, or JS-rendered pages, but that cause is never
+ *     asserted since it isn't actually detected
+ *   - "article": a real, usable extraction (extractionConfidence > 0)
+ */
+export type SourceType = "article" | "pdf" | "video" | "other" | "unreachable" | "low_confidence";
+
+/**
  * Result of a content-extraction attempt. Always resolves — never rejects
  * and never returns null — so callers uniformly check extractionConfidence
  * rather than branching on success/failure. A confidence of 0 means the
@@ -12,6 +25,7 @@ export interface CleanedContent {
   text: string;
   title: string;
   extractionConfidence: number;
+  sourceType: SourceType;
 }
 
 const FETCH_TIMEOUT_MS = 15_000;
@@ -22,7 +36,15 @@ const MIN_USABLE_TEXT_LENGTH = 200;
 /** At/above this length, confidence caps out at 1. */
 const CONFIDENT_TEXT_LENGTH = 3000;
 
-const EMPTY_RESULT: CleanedContent = { text: "", title: "", extractionConfidence: 0 };
+function emptyResult(sourceType: SourceType): CleanedContent {
+  return { text: "", title: "", extractionConfidence: 0, sourceType };
+}
+
+function classifyNonHtmlContentType(contentType: string): SourceType {
+  if (contentType.includes("pdf")) return "pdf";
+  if (contentType.startsWith("video/")) return "video";
+  return "other";
+}
 
 /**
  * Fetches a URL and extracts its main article content via Readability.js.
@@ -50,20 +72,20 @@ export async function fetchAndClean(url: string): Promise<CleanedContent> {
     });
   } catch (error) {
     console.warn(`[extraction] Fetch failed for ${url}: ${(error as Error).message}`);
-    return EMPTY_RESULT;
+    return emptyResult("unreachable");
   } finally {
     clearTimeout(timeout);
   }
 
   if (!response.ok) {
     console.warn(`[extraction] Fetch returned HTTP ${response.status} for ${url}`);
-    return EMPTY_RESULT;
+    return emptyResult("unreachable");
   }
 
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.includes("html")) {
     console.warn(`[extraction] Skipping non-HTML content-type "${contentType}" for ${url}`);
-    return EMPTY_RESULT;
+    return emptyResult(classifyNonHtmlContentType(contentType));
   }
 
   let html: string;
@@ -71,7 +93,7 @@ export async function fetchAndClean(url: string): Promise<CleanedContent> {
     html = await response.text();
   } catch (error) {
     console.warn(`[extraction] Failed to read response body for ${url}: ${(error as Error).message}`);
-    return EMPTY_RESULT;
+    return emptyResult("unreachable");
   }
 
   try {
@@ -80,15 +102,21 @@ export async function fetchAndClean(url: string): Promise<CleanedContent> {
 
     if (!article?.textContent) {
       console.warn(`[extraction] Readability found no article content for ${url}`);
-      return EMPTY_RESULT;
+      return emptyResult("low_confidence");
     }
 
     const text = article.textContent.trim();
     const title = article.title?.trim() ?? "";
-    return { text, title, extractionConfidence: scoreConfidence(text, title) };
+    const extractionConfidence = scoreConfidence(text, title);
+    return {
+      text,
+      title,
+      extractionConfidence,
+      sourceType: extractionConfidence > 0 ? "article" : "low_confidence",
+    };
   } catch (error) {
     console.warn(`[extraction] Readability/JSDOM parse failed for ${url}: ${(error as Error).message}`);
-    return EMPTY_RESULT;
+    return emptyResult("low_confidence");
   }
 }
 

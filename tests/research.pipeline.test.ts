@@ -27,6 +27,7 @@ const fakeFetchAndClean = async (url: string): Promise<CleanedContent> => ({
   text: "x".repeat(500),
   title: `Title for ${url}`,
   extractionConfidence: 0.8,
+  sourceType: "article",
 });
 
 /**
@@ -215,6 +216,7 @@ describe("runResearchPipeline", () => {
       text: "too short to matter",
       title: "t",
       extractionConfidence: 0.1,
+      sourceType: "low_confidence",
     });
 
     await expect(
@@ -235,7 +237,12 @@ describe("runResearchPipeline", () => {
     // (2 initial-search queries + 2 contention-search queries). Odd-numbered urls are low confidence.
     const mixedConfidenceFetch = async (url: string): Promise<CleanedContent> => {
       const isLow = /s(1|3)$/.test(url);
-      return { text: "x".repeat(500), title: `Title for ${url}`, extractionConfidence: isLow ? 0.1 : 0.8 };
+      return {
+        text: "x".repeat(500),
+        title: `Title for ${url}`,
+        extractionConfidence: isLow ? 0.1 : 0.8,
+        sourceType: isLow ? "low_confidence" : "article",
+      };
     };
 
     const course = await runResearchPipeline("Some Topic", {
