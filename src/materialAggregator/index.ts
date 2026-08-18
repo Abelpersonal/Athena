@@ -6,12 +6,14 @@ import { getDb, type TeacherDb } from "../db/client.js";
 import { lessons, sources as sourcesTable, courses } from "../db/schema.js";
 import type { CourseJson, SourceRecord } from "../research/types.js";
 import type { SourceType } from "../extraction/fetchAndClean.js";
+import { writeSubtopicFacts as writeSubtopicFactsDefault } from "../memoryGraph/index.js";
 
 export type ProgressListener = (message: string) => void;
 export type BackfillSubtopicFn = (
   input: Parameters<typeof backfillSubtopicDefault>[0],
   options?: BackfillSubtopicOptions
 ) => ReturnType<typeof backfillSubtopicDefault>;
+export type WriteSubtopicFactsFn = typeof writeSubtopicFactsDefault;
 
 /** Minimum valid (type === "article") sources a lesson needs before it ships without a backfill flag. Configurable per the Phase 3 "open questions" default. */
 const DEFAULT_MIN_VALID_SOURCES = Number(process.env.MATERIAL_MIN_VALID_SOURCES ?? 2);
@@ -23,6 +25,8 @@ export interface AggregateMaterialsOptions {
   backfillSubtopic?: BackfillSubtopicFn;
   /** Injectable for tests. Default: getDb() (real, migrated SQLite at data/teacher.db). */
   db?: TeacherDb;
+  /** Injectable for tests. Default: the real memoryGraph.writeSubtopicFacts() (Phase 3.5). */
+  writeSubtopicFacts?: WriteSubtopicFactsFn;
   minValidSources?: number;
   onProgress?: ProgressListener;
 }
@@ -63,6 +67,7 @@ export async function aggregateMaterials(
   const fetchAndClean = options.fetchAndClean ?? fetchAndCleanDefault;
   const backfill = options.backfillSubtopic ?? backfillSubtopicDefault;
   const db = options.db ?? (await getDb());
+  const writeFacts = options.writeSubtopicFacts ?? writeSubtopicFactsDefault;
   const minValidSources = options.minValidSources ?? DEFAULT_MIN_VALID_SOURCES;
   const onProgress = options.onProgress;
 
@@ -112,6 +117,10 @@ export async function aggregateMaterials(
       .where(eq(lessons.id, lessonId));
 
     sourceCount += persisted.length;
+
+    // Phase 3.5: write this subtopic's grounded key points to the Memory Graph now that
+    // their source_ids are persisted, real ids (not just Phase 2's ephemeral ones).
+    await writeFacts(courseId, subtopic.id, subtopic.keyPoints);
   }
 
   await db.update(courses).set({ status: "complete" }).where(eq(courses.id, courseId));

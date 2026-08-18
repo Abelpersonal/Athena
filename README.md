@@ -1,4 +1,4 @@
-# Teacher — Orchestrator, Search, the Research Agent, and Course Persistence
+# Teacher — Orchestrator, Search, the Research Agent, Course Persistence, and the Memory Graph
 
 Backend-first plumbing for a personal, single-user AI learning platform.
 
@@ -16,9 +16,16 @@ Backend-first plumbing for a personal, single-user AI learning platform.
   (`src/materialAggregator/`) re-fetches and permanently persists the sources cited during
   research, links them to their lesson, and triggers a targeted re-search when a lesson lands
   below the minimum valid-source count.
+- **Phase 3.5** stands up the real **Memory Graph** — Graphiti on FalkorDB, run as a separate
+  Docker service and reached over MCP (`src/memoryGraph/`) — and fills in Phase 3's stub exactly
+  at its Course Builder call site, plus writes Phase 2's grounded key points as dated episodic
+  facts once the Material Aggregator has persisted their real source ids.
 
-There is no real Memory Graph (Graphiti/Neo4j — Phase 3.5 fills in `src/memoryGraph/`'s stub),
-Mind Map generation (Phase 8), quiz/practice logic, Teaching Engine, or frontend here yet.
+There is no Mind Map generation (Phase 8), quiz/practice logic, Teaching Engine, or frontend here
+yet. **Important caveat, read before relying on Phase 3.5's Definition-of-done checklist below:**
+this environment has no Docker installed, so the Memory Graph's Docker Compose setup, live MCP
+writes, and `inspect-graph` output could not be run or verified live here — see "The Docker
+verification gap" near the end of this README before treating those items as confirmed.
 
 ## Tech choices
 
@@ -65,8 +72,18 @@ Mind Map generation (Phase 8), quiz/practice logic, Teaching Engine, or frontend
   against the migration history and writes a new versioned SQL file under `drizzle/` when the
   schema changes — no hand-editing a live DB file, ever. `getDb()` applies any pending migrations
   automatically the first time it's called in a process, so the schema can grow phase-by-phase
-  (Phase 3.5's Memory Graph fields, Phase 4's `QuizResult`/`PracticeAttempt`/`MasteryState`, etc.)
-  without a separate manual migration step.
+  (Phase 4's `QuizResult`/`PracticeAttempt`/`MasteryState`, etc.) without a separate manual
+  migration step. The Memory Graph (Phase 3.5, below) is a genuinely separate graph database, not
+  more SQLite tables — it doesn't touch this schema at all.
+- **Memory Graph: Graphiti on FalkorDB, run as a separate Docker service, reached over MCP.**
+  Graphiti (`getzep/graphiti`) turns raw text ("episodes") into a temporal knowledge graph — entity
+  nodes, relationship edges as dated facts, automatic supersession when new facts contradict old
+  ones — which is exactly the "supersede, don't just append" model Phase 6's delta detection will
+  need later. Its own MCP server (not a library Teacher imports) exposes an HTTP endpoint; the
+  actual transport is the modern **Streamable HTTP** MCP transport (confirmed by reading
+  `getzep/graphiti`'s own server source — legacy SSE is explicitly marked deprecated there), so
+  `src/memoryGraph/graphitiClient.ts` uses `StreamableHTTPClientTransport`, not Phase 1's
+  `StdioClientTransport` pattern. See "The Memory Graph" below.
 
 ## Setup
 
@@ -77,7 +94,45 @@ cp .env.example .env
 # — or set LLM_PROVIDER=anthropic and fill in ANTHROPIC_API_KEY instead
 ```
 
+### Setting up the Memory Graph (Docker)
+
+The Memory Graph runs as a **separate local service** from Teacher's own Node process — Node
+can't reliably launch and manage a Docker Compose stack itself for a personal dev setup, so this
+is a manual one-time (per machine) step, not something `npm install` or the harness does for you.
+
+```bash
+cd mcp_server
+cp .env.example .env
+# fill in GOOGLE_API_KEY — same value as Teacher's own GEMINI_API_KEY (Graphiti's own config
+# reads GOOGLE_API_KEY, not GEMINI_API_KEY; see mcp_server/config.yaml)
+docker compose up -d
+```
+
+This starts one container (`zepai/knowledge-graph-mcp:latest`, getzep/graphiti's official
+pre-built image — Teacher's `docker-compose.yml` references it directly rather than cloning and
+building graphiti's own repo) bundling FalkorDB and the Graphiti MCP server together:
+
+- `http://localhost:8000/mcp/` — the MCP endpoint Teacher's `src/memoryGraph/` client connects to
+- `http://localhost:8000/health` — health check
+- `http://localhost:3000` — FalkorDB's own browser UI, for poking at the raw graph directly
+- `redis://localhost:6379` — FalkorDB's Redis-protocol port
+
+Confirm it's up with `curl http://localhost:8000/health`, then run any `npm run harness -- build`
+or `npm run inspect-graph` command from Teacher's own root as usual — no other wiring needed.
+**This setup has not been run in the environment this code was written in — no Docker is
+installed there.** See "The Docker verification gap" near the end of this README.
+
+#### Why FalkorDB, not Neo4j
+
+The PRD names Neo4j, but this deviates to **FalkorDB** deliberately: it's the graphiti Docker
+Compose quickstart's own default, and it's meaningfully lighter to run on a single personal
+machine (one combined container vs. a separate JVM-based Neo4j service). Neo4j remains a
+documented fallback — `getzep/graphiti`'s repo ships a `docker-compose-neo4j.yml` alongside the
+FalkorDB one, so switching later is a config swap, not a rewrite, if FalkorDB gives real trouble.
+
 ### Environment variables
+
+Teacher's own `.env` (repo root):
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
@@ -90,6 +145,19 @@ cp .env.example .env
 | `ORCHESTRATOR_LOG_PATH` | No | `logs/orchestrator.jsonl` | Where the JSONL cost/latency log is written. |
 | `TEACHER_DB_PATH` | No | `data/teacher.db` | Override the SQLite file path (`getDb()`'s default parameter). |
 | `MATERIAL_MIN_VALID_SOURCES` | No | `2` | Minimum `type: "article"` sources a lesson needs before the Material Aggregator's backfill trigger fires. |
+| `GRAPHITI_MCP_URL` | No | `http://localhost:8000/mcp/` | Where `src/memoryGraph/` connects — override if the graph service runs on a different host/port. |
+
+`mcp_server/.env` (separate file, the Graphiti service's own config — not read by Teacher's Node
+process at all):
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `GOOGLE_API_KEY` | Yes | — | Graphiti's own internal LLM + embedding calls (entity/fact extraction from episodes). Same key value as Teacher's `GEMINI_API_KEY`, different env var name (Graphiti's config expects `GOOGLE_API_KEY`). |
+| `MODEL_NAME` | No | `gemini-3.7-flash` | Overrides `mcp_server/config.yaml`'s LLM model. |
+| `EMBEDDER_MODEL` | No | `gemini-embedding-001` | Overrides the embedding model. |
+| `SEMAPHORE_LIMIT` | No | `10` | Episode processing concurrency — lower this if you hit 429s. |
+| `GRAPHITI_GROUP_ID` | No | `main` | Namespaces graph data. Left at one shared default deliberately — see "The Memory Graph" below. |
+| `FALKORDB_PASSWORD`, `FALKORDB_DATABASE`, `BROWSER` | No | blank, `default_db`, `1` | FalkorDB tuning; `BROWSER=0` disables the :3000 UI. |
 
 Pipeline-specific tuning (max audit retries, sources per pass, extraction confidence floor) are
 function parameters on `runResearchPipeline()`, not env vars — see "Tuning the pipeline" below.
@@ -116,6 +184,10 @@ npm run harness -- build --dry-run "your topic here"
 # Dump a persisted course's structure (modules, lessons, source counts) from SQLite
 npm run inspect -- <course_id>
 npm run inspect -- --dry-run <course_id>   # reads data/teacher.dry-run.db instead
+
+# Dump whatever's stored for a topic in the Memory Graph (Phase 3.5) — nodes, facts,
+# episodes, dates. Needs `docker compose up` running in mcp_server/ (see Setup above).
+npm run inspect-graph -- "your topic here"
 ```
 
 The Phase 1 form prints a structured, schema-checked `summarize_text` result plus the JSONL log
@@ -129,18 +201,24 @@ extraction (see `src/harness/mocks.ts`) so you can validate the pipeline's contr
 a forced audit failure-then-retry on the first subtopic — without spending real API credits. Use
 real runs to validate output *quality*; use `--dry-run` to validate *wiring* while iterating.
 
-The `build` form chains all three phase-3 stages: it runs the research pipeline (same as `research`,
+The `build` form chains all three Phase 3 stages: it runs the research pipeline (same as `research`,
 just not written to `output/`), hands the result to `buildCourse()`, then to `aggregateMaterials()`,
 and prints `course_id`, module/lesson counts, persisted-source count, and how many lessons
-triggered a backfill. `--dry-run` mocks every dependency (LLM, search, extraction, and
-`researchAgent.backfillSubtopic()`) and, importantly, **writes to a separate `data/teacher.dry-run.db`
-file** rather than the real `data/teacher.db` — mock course data (titled "Mock Module (m1)" etc.)
-should never land in the DB you'd actually inspect real courses in. `npm run inspect` needs the
-same `--dry-run` flag to read that same isolated file.
+triggered a backfill. As of Phase 3.5, `buildCourse()` also writes the topic + prerequisites to the
+Memory Graph, and `aggregateMaterials()` writes each subtopic's grounded key points there too —
+both degrade to a logged error rather than failing the whole `build` command if the graph service
+isn't reachable (e.g. `docker compose up` isn't running — see Setup). `--dry-run` mocks every
+dependency (LLM, search, extraction, `researchAgent.backfillSubtopic()`, and both Memory Graph
+writes) and, importantly, **writes to a separate `data/teacher.dry-run.db` file** rather than the
+real `data/teacher.db` — mock course data (titled "Mock Module (m1)" etc.) should never land in
+the DB you'd actually inspect real courses in. `npm run inspect` needs the same `--dry-run` flag to
+read that same isolated file.
 
 All real (non-`--dry-run`) forms need `TAVILY_API_KEY` set, plus either `GEMINI_API_KEY` (default
-provider) or `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY`. This is meant to be a scrappy
-debugging tool across Phases 1–6, not a polished CLI.
+provider) or `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY`. `build` additionally talks to the
+Memory Graph service (see Setup) when not run with `--dry-run`, though a missing graph service
+degrades rather than fails the command. This is meant to be a scrappy debugging tool across
+Phases 1–6, not a polished CLI.
 
 ## Running tests
 
@@ -189,20 +267,28 @@ npm run typecheck
   original order; a genuine cycle throws `CourseBuilderError`; self-referencing and dangling
   edges are ignored rather than crashing), plus `buildCourse()` integration tests against an
   in-memory SQLite db — persisted module order/`prerequisiteOf` reflecting a real dependency
-  chain, the Memory Graph stub being called with the right `courseId`/prerequisites, and two
-  builds of similarly-titled courses against the same db not colliding on id uniqueness (the real
-  bug the run-scoped id suffix — see "The Course Builder" below — was added to fix).
+  chain, `writeTopicToMemoryGraph` being called with the right `courseId`/`topic`/prerequisites,
+  and two builds of similarly-titled courses against the same db not colliding on id uniqueness
+  (the real bug the run-scoped id suffix — see "The Course Builder" below — was added to fix).
 - `tests/courseBuilderTemplates.test.ts` — unit-tests `createSequenceModulesValidator` and
   `createWriteLessonMetadataValidator` directly (coverage/uniqueness/unknown-id/dangling-edge
-  rejection, mirroring `grounding.test.ts`'s pattern for the Phase 2 validators), plus a trivial
-  check that the Memory Graph stub resolves and logs rather than doing nothing silently.
+  rejection, mirroring `grounding.test.ts`'s pattern for the Phase 2 validators).
 - `tests/materialAggregator.test.ts` — `aggregateMaterials()` against an in-memory db seeded via a
   real `buildCourse()` call: Source persistence and lesson-linking, the backfill trigger firing
   exactly once when a lesson lands below threshold and recovering above it, a lesson still short
   after its one backfill attempt shipping flagged `source_status: "below_threshold"` (mocked
   failing-source case — no real API/search calls), the course's `status` flipping to `"complete"`,
-  and two subtopics citing the identical URL not crashing on the Source table's primary key
-  (`onConflictDoNothing()`).
+  two subtopics citing the identical URL not crashing on the Source table's primary key
+  (`onConflictDoNothing()`), and `writeSubtopicFacts` being called once per subtopic with the right
+  `courseId`/`subtopicId`/`keyPoints`.
+- `tests/memoryGraph.test.ts` — mocks `@modelcontextprotocol/sdk`'s `Client` and
+  `StreamableHTTPClientTransport` directly (no Docker needed in CI): `writeTopic`'s call shape
+  (one `add_memory` episode plus one `add_triplet` per prerequisite, and still writing the episode
+  when there are zero prerequisites), `writeSubtopicFacts`'s call shape (one `add_memory` per key
+  point, each JSON-encoding `{point, source_id}`), graceful degradation on a simulated connection
+  failure for both write paths (resolves without throwing, logs loudly), and `getTopicHistory`
+  combining `search_nodes`/`search_memory_facts`/`get_episodes` into one result or returning
+  `{nodes: [], facts: [], episodes: [], error}` rather than throwing when the graph is unreachable.
 
 ## Architecture
 
@@ -228,8 +314,10 @@ src/
     sequence.ts               # topoSortModules() — pure topological sort, no I/O
   materialAggregator/    # Phase 3: source persistence + backfill
     index.ts               # aggregateMaterials() — re-fetch, persist, link, backfill-trigger
-  memoryGraph/            # Phase 3.5 stub — writeTopic() logs a TODO and no-ops
-    index.ts
+  memoryGraph/            # Phase 3.5: the Memory Graph client
+    index.ts                # writeTopic() / writeSubtopicFacts() / getTopicHistory() — public API
+    graphitiClient.ts          # GraphitiMCPClient — MCP connection + tool-call plumbing
+    types.ts                    # TS mirrors of Graphiti's response TypedDicts
   db/                     # SQLite (node:sqlite) + Drizzle
     schema.ts                # courses / modules / lessons / sources tables
     client.ts                  # getDb() — lazy connect + auto-migrate, sqlite-proxy driver
@@ -238,6 +326,7 @@ src/
   harness/
     cli.ts               # debugging CLI: Phase 1 demo + `research [--dry-run]` + `build [--dry-run]`
     inspect.ts             # `npm run inspect -- <course_id>` — dumps a persisted course from SQLite
+    inspectGraph.ts          # `npm run inspect-graph -- "<topic>"` — dumps Memory Graph history
     mocks.ts              # canned dependencies for --dry-run (research AND build)
 tests/
   orchestrator.test.ts
@@ -249,8 +338,14 @@ tests/
   courseBuilder.test.ts
   courseBuilderTemplates.test.ts
   materialAggregator.test.ts
+  memoryGraph.test.ts
 drizzle/                 # versioned migration SQL, generated by `npm run db:generate` — committed
 drizzle.config.ts
+mcp_server/              # Docker Compose for Graphiti + FalkorDB (Phase 3.5) — see Setup above
+  docker-compose.yml        # references zepai/knowledge-graph-mcp:latest directly, no build step
+  config.yaml                # Teacher's override: llm/embedder provider = gemini, database = falkordb
+  .env.example
+  .env                       # gitignored — GOOGLE_API_KEY etc.
 output/                 # research harness writes course JSON here (gitignored)
 data/                   # data/teacher.db (real) and data/teacher.dry-run.db (mock) — gitignored
 ```
@@ -501,8 +596,8 @@ six steps:
    then every `Lesson` row (with `source_refs: []`, `source_status: "ok"` — the Material Aggregator
    fills those in) — all-or-nothing, so a failure partway through never leaves an orphaned module
    with no course or a lesson with no module.
-5. **Memory Graph write [code, STUB]**: calls `memoryGraph.writeTopic(courseId, prerequisites)`
-   right after persistence succeeds — see "Memory Graph stub" below.
+5. **Memory Graph write [code]**: calls `memoryGraph.writeTopic(courseId, course.topic, prerequisites)`
+   right after persistence succeeds — see "The Memory Graph" below.
 6. **Output**: `{ courseId, moduleCount, lessonCount, subtopicLessonMap }` — the last field (a
    `subtopic id -> lesson id` map) is what the Material Aggregator needs to link sources to the
    right lesson.
@@ -544,23 +639,88 @@ persisted, lesson-linked `Source` rows:
    time). If still below threshold after that one attempt, the lesson ships anyway flagged
    `source_status: "below_threshold"` — bounded cost over an unbounded retry loop, mirroring
    Phase 2's audit-retry policy.
-5. **Finish [code]**: once every subtopic is processed, the course's `status` flips from
+5. **Memory Graph write [code, Phase 3.5]**: right after a subtopic's lesson row and sources are
+   persisted (real, DB-backed ids now exist for every `source_id`), `memoryGraph.writeSubtopicFacts()`
+   writes that subtopic's grounded key points to the graph — see "The Memory Graph" below.
+6. **Finish [code]**: once every subtopic is processed, the course's `status` flips from
    `"building"` to `"complete"`.
 
 No LLM calls happen in this module's own code — the one exception is delegating to
 `backfillSubtopic()`, which does call the Orchestrator (as part of Phase 2's pipeline) as the
 deliberate, spec'd reach-back described above, not a violation of that rule.
 
-### Memory Graph stub (Phase 3.5 seam)
+### The Memory Graph (Phase 3.5)
 
-`src/memoryGraph/index.ts`'s `writeTopic(courseId, prerequisites)` is a stub: it logs
-`[memory-graph] TODO: Phase 3.5 — ...` and resolves, doing nothing else. It's called from
-`buildCourse()` right after persistence succeeds — the exact place the real Graphiti/Neo4j call
-will go once Phase 3.5 wires it in. This is deliberately *not* silently missing: the seam is
-called from the real code path and its call is logged on every run, so it's visibly a stub rather
-than something that looks wired in but silently does nothing (the failure mode Phase 3's kickoff
-prompt explicitly called out to avoid — a constructed-but-never-invoked function is
-indistinguishable from a correctly-working no-op with zero trace either way).
+`src/memoryGraph/index.ts` is the only module that touches Graphiti's MCP protocol directly — the
+same "one gateway" pattern as the Orchestrator for LLM calls and `SearchProvider` for web search.
+It replaces Phase 3's `writeTopic()` stub exactly at its Course Builder call site (one added
+parameter, `topic` — the stub only took `courseId`/`prerequisites`) and adds two more functions:
+
+- **`writeTopic(courseId, topic, prerequisites)`** — called from `buildCourse()` right after
+  persistence succeeds. Writes an `add_memory` episode describing the course (so a Topic entity
+  gets created via Graphiti's own extraction even when there are zero prerequisites — an
+  `add_triplet` call always needs two named endpoints, so it can't create a bare node on its own),
+  then one **`add_triplet`** call per prerequisite: a precise, synchronous
+  `topic -[REQUIRES_PREREQUISITE]-> prerequisite` edge, written directly rather than hoping the
+  model infers the same relationship from prose.
+- **`writeSubtopicFacts(courseId, subtopicId, keyPoints)`** — called from `aggregateMaterials()`
+  once a subtopic's sources are persisted. Writes Phase 2 step 2d's raw `extract_grounded_key_points`
+  output (atomic, `source_id`-tagged points) as **one `add_memory` episode per key point** — not
+  the paragraph-length step 2g synthesis, and not one batched episode for the whole subtopic.
+  Per-point episodes are what makes each fact independently diffable/supersedable later, which is
+  exactly what Phase 6's Knowledge Update Agent needs. This closes a real gap found while wiring
+  this up: Phase 2's pipeline already computed these key points (feeding them into
+  `synthesize_subtopic`) but never surfaced them past that one call — `SubtopicResult.keyPoints`
+  is a new field threading them through to `CourseJson`, not a new extraction step.
+- **`getTopicHistory(topic)`** — the read path: `search_nodes` + `search_memory_facts` + a
+  group-scoped `get_episodes` call, combined into one `{nodes, facts, episodes}` result. Used for
+  manual verification now (`npm run inspect-graph`); Phase 5's overlap detection and Phase 6's
+  delta detection build on this same read path later.
+
+**Every write degrades sensibly on failure** — logs loudly (`console.error`, not a silent catch)
+and returns normally, never throwing. The graph is currently a side effect of course generation,
+not something course generation depends on succeeding; `tests/memoryGraph.test.ts` proves this by
+simulating a connection failure and asserting both write functions still resolve.
+
+**Transport**: confirmed by reading `getzep/graphiti`'s actual `mcp_server` source (not assumed)
+that `server.transport: "http"` in its config maps to `run_streamable_http_async()` — the modern
+**Streamable HTTP** MCP transport (`StreamableHTTPClientTransport`, single `POST .../mcp/` endpoint
+with an SSE upgrade for streaming responses) — while `"sse"` (the older two-endpoint transport) is
+explicitly commented as deprecated in graphiti's own config schema. `src/memoryGraph/graphitiClient.ts`
+uses `StreamableHTTPClientTransport`, a genuinely different transport class from Phase 1's
+`StdioClientTransport` (Tavily is a local subprocess; Graphiti is an HTTP service).
+
+**Tool result parsing** is defensive: Graphiti's `@mcp.tool()`-decorated functions return typed
+dicts, which the MCP SDK may surface as an already-parsed `structuredContent` field or only as a
+JSON-stringified text content block depending on server/SDK version. `GraphitiMCPClient.callTool()`
+checks `structuredContent` first, then falls back to parsing `content[0].text` as JSON — this exact
+branch has **not been exercised against a real server** in this environment (see "The Docker
+verification gap" below), so treat it as a reasoned-but-unverified assumption, not a confirmed fact,
+until it's run once against a live `docker compose up`.
+
+**`add_memory` is asynchronous** — it queues the episode and returns a `"queued"` message
+immediately; Graphiti's own LLM-based entity/fact extraction runs in the background afterward.
+This means a `writeTopic`/`writeSubtopicFacts` call returning successfully does **not** mean the
+data is queryable yet — `npm run inspect-graph` may show nothing for a few seconds after a `build`
+run completes, which is expected background-processing latency, not a failure (the command's own
+output says as much when it finds nothing).
+
+**`group_id` is left at the server's shared default (`main`)** on every call from Teacher's client
+— deliberately not namespaced per course. Phase 5's stated future need ("query existing mastery to
+detect topic overlap") only works if different courses' topics and facts live in the same
+queryable graph rather than siloed islands, so every course this app ever builds accumulates into
+one graph. `courseId`/`subtopicId` are still recorded (in episode names and `source_description`)
+for provenance, just not used to partition the graph.
+
+**LLM provider inside Graphiti itself**: `mcp_server/config.yaml` sets both `llm.provider` and
+`embedder.provider` to `"gemini"` (upstream's own default is `"openai"` for both — these are two
+independently-configured blocks, so setting one without the other silently leaves embeddings on
+a provider with no configured key). This reuses the same Google AI Studio key Teacher's own
+Orchestrator already defaults to, avoiding a second, unrelated API key just for Graphiti's internal
+bookkeeping — consistent with the "LLM provider swap" deviation documented elsewhere in this
+README. The embedding model (`gemini-embedding-001`, 3072-dim) was verified live against Google's
+current docs rather than assumed — `text-embedding-004`, the name that shows up in older
+references, is now a legacy model.
 
 ### Documented gaps
 
@@ -610,7 +770,7 @@ Anthropic-specific.
       source set, even after exhausting retries (`tests/grounding.test.ts`).
 - [x] New tests cover decomposition parsing, audit scoring/retry logic, and `fetchAndClean`'s
       confidence check.
-- [x] `npm run typecheck` clean; all 74 tests pass (`npm test`).
+- [x] `npm run typecheck` clean; all 82 tests pass (`npm test`).
 - [ ] **A real run against a genuinely non-trivial topic, with at least one subtopic that failed
       its first depth audit and passed on retry, demonstrated in the report.** Still open — see
       "The real-run blocker" below. Progress since it was last written up: a real Gemini API key
@@ -630,8 +790,9 @@ Anthropic-specific.
 - [x] The backfill path is demonstrated (a constructed case, per the spec's "real or constructed"
       wording for this item) — log excerpt below, plus `tests/materialAggregator.test.ts` covering
       both the recovery and still-below-threshold-after-backfill outcomes with mocked failures.
-- [x] The Memory Graph stub exists (`src/memoryGraph/index.ts`), is called from `buildCourse()`
-      right after persistence, and logs a `Phase 3.5` TODO on every call — not silently missing.
+- [x] The Memory Graph stub existed (`src/memoryGraph/index.ts`), was called from `buildCourse()`
+      right after persistence, and logged a `Phase 3.5` TODO on every call — not silently missing.
+      **Now superseded**: Phase 3.5 replaced this stub with a real implementation — see below.
 - [x] No mind map generation, no quiz/practice logic, no frontend.
 - [x] All Phase 1 and 2 tests still pass; new tests cover sequencing/prerequisite-order logic,
       Source persistence and lesson-linking, and the backfill trigger (mocked failing-source case,
@@ -641,6 +802,27 @@ Anthropic-specific.
       Source records in SQLite, inspectable via `npm run inspect`.** Blocked by the same real-run
       issue as Phase 2's open item — see "The real-run blocker" below. Every other Phase 3
       Definition-of-done item is independently satisfied via unit tests and a `--dry-run` demo.
+
+### Phase 3.5
+
+- [x] `docker compose up` **documented** in README (Setup, above), referencing getzep/graphiti's
+      official pre-built image directly. **Not run** — see "The Docker verification gap" below;
+      this environment has no Docker installed, so this item is unverified, not confirmed working.
+- [ ] A real `npm run harness -- build "some topic"` run writing topic/prerequisite nodes/edges and
+      per-subtopic facts to the graph, verified with `inspect-graph`. **Not done** — needs both a
+      real LLM run (blocked, see "The real-run blocker") *and* a running Graphiti service (blocked,
+      see "The Docker verification gap"). Wiring is unit-tested (`tests/memoryGraph.test.ts`) and
+      the call sites are in place (`buildCourse()` → `writeTopic()`, `aggregateMaterials()` →
+      `writeSubtopicFacts()`), but neither has executed against a real graph.
+- [x] Phase 3's stub is fully replaced — `grep -rn "TODO: Phase 3.5" src/ tests/` returns no matches.
+- [x] Unit tests mock the MCP client (no Docker needed in CI): `writeTopic`'s call shape,
+      `writeSubtopicFacts`'s call shape, and graceful degradation on a simulated connection
+      failure for both — `tests/memoryGraph.test.ts`.
+- [x] All Phase 1–3 tests still pass (82/82, `npm test`).
+- [x] `npm run typecheck` clean.
+- [x] README updated: Docker Compose setup, FalkorDB choice and why, new env vars, `inspect-graph`
+      usage, and the confirmed Streamable HTTP transport (read from graphiti's own source — see
+      "The Memory Graph" above).
 
 ### Prerequisite-order demonstration (dry run + unit test)
 
@@ -719,6 +901,35 @@ Once one real run succeeds, closing both items is the same manual check describe
 inspect the resulting course (via `output/<slug>.json` for Phase 2's audit-retry evidence, and
 `npm run inspect -- <course_id>` for Phase 3's persisted-record evidence).
 
+### The Docker verification gap (Phase 3.5)
+
+**This environment has no Docker installed** — `docker`/`docker compose` are not on `PATH`, and no
+Docker Desktop install was found in the usual locations. This is a harder blocker than Phase 2/3's
+quota issue: it's not that a real run got partway before hitting a wall, it's that **nothing in
+Phase 3.5 has been run against a live Graphiti server at all**. Concretely, this means the
+following are reasoned from reading `getzep/graphiti`'s actual source (not guessed from memory —
+see "The Memory Graph" above for what was specifically verified: transport, tool names/signatures,
+config schema, response shapes) but **not confirmed by actually running them**:
+
+- That `docker compose up` in `mcp_server/` actually brings up a healthy service with this exact
+  compose file and config — the file references a real published image and real upstream config
+  keys, but has never been pulled or started.
+- That `src/memoryGraph/graphitiClient.ts`'s `StreamableHTTPClientTransport` usage actually
+  connects and completes the MCP handshake against a real server, not just a mocked one.
+- That `GraphitiMCPClient.callTool()`'s defensive `structuredContent`-then-`content[0].text`
+  parsing matches what the real server actually returns for this MCP SDK/server version pairing.
+- That `mcp_server/config.yaml`'s Gemini provider config for both `llm` and `embedder` is accepted
+  and produces real entity/fact extraction from a real episode.
+
+None of this changes what's verifiable without Docker, which is everything unit-testable: the
+client's call shapes, argument construction, response parsing logic, and graceful-degradation
+behavior are all covered by `tests/memoryGraph.test.ts` against a mocked MCP client, and typecheck
++ the full test suite are clean. **To close this out**: install Docker Desktop (or run this on a
+machine that has it), `cd mcp_server && docker compose up -d`, confirm `curl localhost:8000/health`
+responds, then run `npm run harness -- build "<a real, non-trivial topic>"` (this also needs the
+real-run blocker above resolved first, since `build` needs real LLM calls too) followed by
+`npm run inspect-graph -- "<that topic>"` to confirm nodes/edges/facts actually landed.
+
 ## Deviations from the spec (documented)
 
 - **LLM vendor is swappable and defaults to Gemini, not Claude** — see "LLM provider swap" above.
@@ -742,3 +953,16 @@ inspect the resulting course (via `output/<slug>.json` for Phase 2's audit-retry
   — see "The database layer" above. The schema, query builder, and migration workflow are
   unaffected; only `src/db/client.ts` would need to change to switch back if a future environment
   has a working toolchain and prefers `better-sqlite3`'s (mildly faster) native binding.
+- **Memory Graph backend is FalkorDB, not Neo4j** — the PRD names Neo4j, but this was an explicit,
+  requested deviation (not something arrived at independently): FalkorDB is `getzep/graphiti`'s own
+  Docker Compose quickstart default, and one combined FalkorDB+MCP-server container is meaningfully
+  lighter to run on a single personal machine than a separate JVM-based Neo4j service alongside it.
+  Neo4j stays a documented fallback — graphiti's own repo ships a `docker-compose-neo4j.yml`
+  alongside the FalkorDB one, and `mcp_server/config.yaml`'s `database.providers.neo4j` block is
+  already present (just not selected) — so switching later is a config change, not new code.
+- **Graphiti's own internal LLM/embedder provider is Gemini, not OpenAI** — upstream's own default
+  config uses OpenAI for both; `mcp_server/config.yaml` overrides both to `"gemini"` so Graphiti's
+  entity/fact extraction reuses the same Google AI Studio key Teacher's own Orchestrator already
+  defaults to, rather than requiring a second, unrelated OpenAI key just for this one service's
+  internal bookkeeping. Not requested explicitly, but a natural extension of the already-adopted
+  "default to Gemini" decision — documented here rather than left implicit in a config file.

@@ -1,0 +1,121 @@
+# Graphiti MCP Server Configuration — Teacher's override of the image's
+# baked-in default (which defaults llm/embedder to "openai"). This is a
+# straight copy of upstream getzep/graphiti's default config.yaml with two
+# lines changed: llm.provider and embedder.provider, both "openai" -> "gemini",
+# so Graphiti's own internal entity-extraction/embedding calls reuse the same
+# Gemini key Teacher's own Orchestrator already defaults to (GOOGLE_API_KEY
+# below — same value as Teacher's GEMINI_API_KEY, just the env var name
+# Graphiti's own config expects). Supports environment variable expansion via
+# ${VAR_NAME} or ${VAR_NAME:default_value}.
+
+server:
+  transport: "http" # Streamable HTTP — "sse" is explicitly deprecated upstream
+  host: "0.0.0.0"
+  port: 8000
+
+llm:
+  provider: "gemini" # Teacher deviation: upstream default is "openai"
+  model: ${MODEL_NAME:gemini-3.7-flash}
+  max_tokens: 4096
+  structured_output_mode: ${LLM_STRUCTURED_OUTPUT_MODE:json_schema}
+
+  providers:
+    openai:
+      api_key: ${OPENAI_API_KEY}
+      api_url: ${OPENAI_API_URL:https://api.openai.com/v1}
+      organization_id: ${OPENAI_ORGANIZATION_ID:}
+
+    azure_openai:
+      api_key: ${AZURE_OPENAI_API_KEY}
+      api_url: ${AZURE_OPENAI_ENDPOINT}
+      api_version: ${AZURE_OPENAI_API_VERSION:2024-10-21}
+      deployment_name: ${AZURE_OPENAI_DEPLOYMENT}
+      use_azure_ad: ${USE_AZURE_AD:false}
+
+    anthropic:
+      api_key: ${ANTHROPIC_API_KEY}
+      api_url: ${ANTHROPIC_API_URL:https://api.anthropic.com}
+      max_retries: 3
+
+    gemini:
+      api_key: ${GOOGLE_API_KEY}
+      project_id: ${GOOGLE_PROJECT_ID:}
+      location: ${GOOGLE_LOCATION:us-central1}
+
+    groq:
+      api_key: ${GROQ_API_KEY}
+      api_url: ${GROQ_API_URL:https://api.groq.com/openai/v1}
+
+embedder:
+  provider: "gemini" # Teacher deviation: upstream default is "openai"
+  # text-embedding-004 is now a legacy Google model — gemini-embedding-001 is
+  # the current text embedding model (verified live, Aug 2026); 3072 is its
+  # native output size (it supports truncation via output_dimensionality, but
+  # that's left at the default here rather than guessed at).
+  model: ${EMBEDDER_MODEL:gemini-embedding-001}
+  dimensions: 3072
+
+  providers:
+    openai:
+      api_key: ${OPENAI_API_KEY}
+      api_url: ${OPENAI_API_URL:https://api.openai.com/v1}
+      organization_id: ${OPENAI_ORGANIZATION_ID:}
+
+    azure_openai:
+      api_key: ${AZURE_OPENAI_API_KEY}
+      api_url: ${AZURE_OPENAI_EMBEDDINGS_ENDPOINT}
+      api_version: ${AZURE_OPENAI_API_VERSION:2024-10-21}
+      deployment_name: ${AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}
+      use_azure_ad: ${USE_AZURE_AD:false}
+
+    gemini:
+      api_key: ${GOOGLE_API_KEY}
+      project_id: ${GOOGLE_PROJECT_ID:}
+      location: ${GOOGLE_LOCATION:us-central1}
+
+    voyage:
+      api_key: ${VOYAGE_API_KEY}
+      api_url: ${VOYAGE_API_URL:https://api.voyageai.com/v1}
+      model: "voyage-3"
+
+database:
+  provider: "falkordb" # Matches upstream's own default — see README for the FalkorDB-over-Neo4j reasoning
+
+  providers:
+    falkordb:
+      uri: ${FALKORDB_URI:redis://localhost:6379}
+      password: ${FALKORDB_PASSWORD:}
+      database: ${FALKORDB_DATABASE:default_db}
+
+    neo4j:
+      uri: ${NEO4J_URI:bolt://localhost:7687}
+      username: ${NEO4J_USER:neo4j}
+      password: ${NEO4J_PASSWORD}
+      database: ${NEO4J_DATABASE:neo4j}
+      use_parallel_runtime: ${USE_PARALLEL_RUNTIME:false}
+
+graphiti:
+  group_id: ${GRAPHITI_GROUP_ID:main}
+  episode_id_prefix: ${EPISODE_ID_PREFIX:}
+  user_id: ${USER_ID:mcp_user}
+  entity_types:
+    - name: "Preference"
+      description: "User preferences, choices, opinions, or selections (PRIORITIZE over most other types except User/Assistant)"
+    - name: "Requirement"
+      description: "Specific needs, features, or functionality that must be fulfilled"
+    - name: "Procedure"
+      description: "Standard operating procedures and sequential instructions"
+    - name: "Location"
+      description: "Physical or virtual places where activities occur"
+    - name: "Event"
+      description: "Time-bound activities, occurrences, or experiences"
+    - name: "Organization"
+      description: "Companies, institutions, groups, or formal entities"
+    - name: "Document"
+      description: "Information content in various forms (books, articles, reports, etc.)"
+    - name: "Topic"
+      description: "Subject of conversation, interest, or knowledge domain (use as last resort)"
+    - name: "Person"
+      description: "An individual human referenced in the content"
+    - name: "Object"
+      description: "Physical items, tools, devices, or possessions (use as last resort)"

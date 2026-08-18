@@ -1,7 +1,6 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { createSequenceModulesValidator } from "../src/orchestrator/templates/sequenceModules.js";
 import { createWriteLessonMetadataValidator } from "../src/orchestrator/templates/writeLessonMetadata.js";
-import { writeTopic } from "../src/memoryGraph/index.js";
 
 describe("createSequenceModulesValidator", () => {
   const subtopicIds = new Set(["s1", "s2"]);
@@ -80,15 +79,5 @@ describe("createWriteLessonMetadataValidator", () => {
     const validate = createWriteLessonMetadataValidator(moduleTempIds, subtopicIds);
     const result = validate({ modules: [{ tempId: "m1", title: "T", description: "D" }], lessons: [] });
     expect(result.success).toBe(false);
-  });
-});
-
-describe("memoryGraph.writeTopic (Phase 3.5 stub)", () => {
-  it("resolves without throwing and logs a TODO rather than doing nothing silently", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    await expect(writeTopic("crs_test", ["prereq A"])).resolves.toBeUndefined();
-    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Phase 3.5"));
-    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("crs_test"));
-    logSpy.mockRestore();
   });
 });

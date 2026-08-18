@@ -61,6 +61,7 @@ function makeSubtopic(id: string, title: string): SubtopicResult {
     title,
     description: `Description for ${title}`,
     sources: [],
+    keyPoints: [{ point: `Key point for ${title}`, source_id: "src_1" }],
     synthesis: {
       claims: [{ text: "A claim", source_ids: ["src_1"], addressesContention: false }],
       contentionNotes: [],
@@ -137,13 +138,13 @@ describe("buildCourse", () => {
     resetDbCache();
     const db = await getDb(":memory:");
     const course = makeCourseJson();
-    const memoryGraphCalls: Array<{ courseId: string; prerequisites: string[] }> = [];
+    const memoryGraphCalls: Array<{ courseId: string; topic: string; prerequisites: string[] }> = [];
 
     const result = await buildCourse(course, {
       orchestratorRun: makeCourseBuilderMock() as never,
       db,
-      writeTopicToMemoryGraph: async (courseId, prerequisites) => {
-        memoryGraphCalls.push({ courseId, prerequisites });
+      writeTopicToMemoryGraph: async (courseId, topic, prerequisites) => {
+        memoryGraphCalls.push({ courseId, topic, prerequisites });
       },
     });
 
@@ -173,7 +174,9 @@ describe("buildCourse", () => {
       expect(lesson.layers.intuition.text).toContain("intuition content for");
     }
 
-    expect(memoryGraphCalls).toEqual([{ courseId: result.courseId, prerequisites: ["Basic algebra"] }]);
+    expect(memoryGraphCalls).toEqual([
+      { courseId: result.courseId, topic: "Test Topic", prerequisites: ["Basic algebra"] },
+    ]);
   });
 
   it("mints distinct ids across two builds of similarly-titled courses against the same db (no UNIQUE collision)", async () => {

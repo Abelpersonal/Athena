@@ -1,6 +1,7 @@
 import type { SynthesizeSubtopicOutput } from "../orchestrator/templates/synthesizeSubtopic.js";
 import type { RestructureLayersOutput } from "../orchestrator/templates/restructureLayers.js";
 import type { DepthAuditScoreOutput } from "../orchestrator/templates/depthAuditScore.js";
+import type { ExtractGroundedKeyPointsOutput } from "../orchestrator/templates/extractGroundedKeyPoints.js";
 
 /** One piece of fetched-and-cleaned source material used to research a subtopic. */
 export interface SourceRecord {
@@ -27,6 +28,8 @@ export interface SubtopicResult {
   title: string;
   description: string;
   sources: SourceRecord[];
+  /** Step 2d's raw output: atomic, source_id-tagged points — this is what Phase 3.5 writes to the Memory Graph as individually diffable facts, not the paragraph-length `synthesis` prose. */
+  keyPoints: ExtractGroundedKeyPointsOutput["keyPoints"];
   synthesis: SynthesizeSubtopicOutput;
   layers: RestructureLayersOutput["layers"];
   auditPasses: AuditPassRecord[];

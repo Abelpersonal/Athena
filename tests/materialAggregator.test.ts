@@ -30,6 +30,7 @@ function makeSubtopic(id: string, title: string, sourceRecords: SourceRecord[]):
     title,
     description: `Description for ${title}`,
     sources: sourceRecords,
+    keyPoints: sourceRecords.map((s, i) => ({ point: `Key point ${i} for ${title}`, source_id: s.source_id })),
     synthesis: { claims: [{ text: "claim", source_ids: [sourceRecords[0]!.source_id], addressesContention: false }], contentionNotes: [] },
     layers: {
       intuition: layer("intuition"),
@@ -103,6 +104,7 @@ describe("aggregateMaterials", () => {
       backfillSubtopic: async () => {
         throw new Error("backfill should not be called — 2 valid sources already meets the default threshold");
       },
+      writeSubtopicFacts: async () => {},
     });
 
     expect(result.sourceCount).toBe(2);
@@ -146,6 +148,7 @@ describe("aggregateMaterials", () => {
         capturedInput = input;
         return [makeSource("src_backfill_1", "https://example.com/backfill1"), makeSource("src_backfill_2", "https://example.com/backfill2")];
       },
+      writeSubtopicFacts: async () => {},
     });
 
     expect(backfillCalls).toBe(1);
@@ -184,6 +187,7 @@ describe("aggregateMaterials", () => {
         backfillCalls += 1;
         return []; // backfill genuinely found nothing usable
       },
+      writeSubtopicFacts: async () => {},
     });
 
     expect(backfillCalls).toBe(1); // exactly one attempt, no looping
@@ -212,6 +216,7 @@ describe("aggregateMaterials", () => {
         "https://example.com/d2": { text: "t", title: "t", extractionConfidence: 0.9, sourceType: "article" },
       }),
       backfillSubtopic: async () => [],
+      writeSubtopicFacts: async () => {},
     });
 
     const { courses } = await import("../src/db/schema.js");
@@ -246,10 +251,44 @@ describe("aggregateMaterials", () => {
       backfillSubtopic: async () => {
         throw new Error("should not be called — every subtopic has 2 valid sources");
       },
+      writeSubtopicFacts: async () => {},
     });
 
     expect(result.sourceCount).toBe(4); // 2 sourceRefs per lesson, even though src_shared is one physical row
     const persistedSources = await db.select().from(sources);
     expect(persistedSources).toHaveLength(3); // src_shared, src_e2, src_f2 — no duplicate row for the shared url
+  });
+
+  it("calls writeSubtopicFacts once per subtopic with its keyPoints, courseId, and subtopicId", async () => {
+    resetDbCache();
+    const db = await getDb(":memory:");
+    const src = makeSource("src_g1", "https://example.com/g1");
+    const course: CourseJson = {
+      topic: "Topic",
+      prerequisites: [],
+      subtopics: [makeSubtopic("sub-g", "Subtopic G", [src, makeSource("src_g2", "https://example.com/g2")])],
+      generatedAt: new Date().toISOString(),
+    };
+    const built = await seedCourse(db, course);
+
+    const calls: Array<{ courseId: string; subtopicId: string; keyPoints: unknown }> = [];
+    await aggregateMaterials(built.courseId, course, built.subtopicLessonMap, {
+      db,
+      fetchAndClean: fetchAndCleanReturning({
+        "https://example.com/g1": { text: "t", title: "t", extractionConfidence: 0.9, sourceType: "article" },
+        "https://example.com/g2": { text: "t", title: "t", extractionConfidence: 0.9, sourceType: "article" },
+      }),
+      backfillSubtopic: async () => {
+        throw new Error("should not be called");
+      },
+      writeSubtopicFacts: async (courseId, subtopicId, keyPoints) => {
+        calls.push({ courseId, subtopicId, keyPoints });
+      },
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.courseId).toBe(built.courseId);
+    expect(calls[0]!.subtopicId).toBe("sub-g");
+    expect(calls[0]!.keyPoints).toEqual(course.subtopics[0]!.keyPoints);
   });
 });

@@ -1,0 +1,45 @@
+# Graphiti Memory Graph — Phase 3.5. This references getzep/graphiti's
+# official pre-built image directly (zepai/knowledge-graph-mcp:latest) rather
+# than cloning and building graphiti's own repo — that image already bundles
+# FalkorDB + the MCP server in one container, so `docker compose up` here is
+# fully self-contained. See ../README.md's "Memory Graph (Phase 3.5)" section
+# for setup steps and the FalkorDB-over-Neo4j reasoning.
+services:
+  graphiti-falkordb:
+    image: zepai/knowledge-graph-mcp:latest
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      # FalkorDB (bundled in this image)
+      - FALKORDB_PASSWORD=${FALKORDB_PASSWORD:-}
+      - BROWSER=${BROWSER:-1} # FalkorDB Browser UI at :3000 — set to 0 to disable
+      - FALKORDB_URI=redis://localhost:6379
+      - FALKORDB_DATABASE=${FALKORDB_DATABASE:-default_db}
+      # MCP server
+      - GRAPHITI_GROUP_ID=${GRAPHITI_GROUP_ID:-main}
+      - SEMAPHORE_LIMIT=${SEMAPHORE_LIMIT:-10}
+      - CONFIG_PATH=/app/mcp/config/config.yaml
+    volumes:
+      # Overrides the image's baked-in default config (which defaults to OpenAI for
+      # both llm and embedder) with Teacher's own: Gemini for both, FalkorDB. See
+      # ./config.yaml.
+      - ./config.yaml:/app/mcp/config/config.yaml:ro
+      - falkordb_data:/var/lib/falkordb/data
+      - mcp_logs:/var/log/graphiti
+    ports:
+      - "6379:6379" # FalkorDB / Redis protocol
+      - "3000:3000" # FalkorDB Browser UI
+      - "8000:8000" # Graphiti MCP server (Streamable HTTP) — http://localhost:8000/mcp/
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  falkordb_data:
+    driver: local
+  mcp_logs:
+    driver: local

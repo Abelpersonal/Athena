@@ -20,14 +20,14 @@ export { CourseBuilderError } from "./sequence.js";
 
 export type OrchestratorRunFn = typeof orchestratorRun;
 export type ProgressListener = (message: string) => void;
-export type WriteTopicFn = (courseId: string, prerequisites: string[]) => Promise<void>;
+export type WriteTopicFn = (courseId: string, topic: string, prerequisites: string[]) => Promise<void>;
 
 export interface BuildCourseOptions {
   /** Injectable for tests and dry-run harness mode. Default: the real orchestrator.run(). */
   orchestratorRun?: OrchestratorRunFn;
   /** Injectable for tests. Default: getDb() (real, migrated SQLite at data/teacher.db). */
   db?: TeacherDb;
-  /** Injectable for tests. Default: the Phase 3.5 Memory Graph stub. */
+  /** Injectable for tests. Default: the real Memory Graph writeTopic() (Phase 3.5). */
   writeTopicToMemoryGraph?: WriteTopicFn;
   onProgress?: ProgressListener;
 }
@@ -180,8 +180,8 @@ export async function buildCourse(course: CourseJson, options: BuildCourseOption
     for (const row of lessonRows) await tx.insert(lessons).values(row);
   });
 
-  // Step 5 [code, STUB]: Memory Graph write — see src/memoryGraph/index.ts (Phase 3.5).
-  await writeTopicToMemoryGraph(courseId, course.prerequisites);
+  // Step 5 [code]: Memory Graph write — see src/memoryGraph/index.ts (Phase 3.5).
+  await writeTopicToMemoryGraph(courseId, course.topic, course.prerequisites);
 
   // Step 6: output course_id.
   return { courseId, moduleCount: moduleRows.length, lessonCount: lessonRows.length, subtopicLessonMap };

@@ -196,6 +196,7 @@ async function processSubtopic(input: ProcessSubtopicInput): Promise<SubtopicRes
     title: input.title,
     description: input.description,
     sources: passResult.sources,
+    keyPoints: passResult.keyPoints,
     synthesis: passResult.synthesis,
     layers: passResult.layers,
     auditPasses,
@@ -214,6 +215,7 @@ interface ResearchPassInput {
 
 interface ResearchPassResult {
   sources: SourceRecord[];
+  keyPoints: ExtractGroundedKeyPointsOutput["keyPoints"];
   synthesis: SynthesizeSubtopicOutput;
   layers: RestructureLayersOutput["layers"];
 }
@@ -351,7 +353,7 @@ async function researchPass(input: ResearchPassInput): Promise<ResearchPassResul
     { validateExtra: createCitationValidator(allValidIds, extractLayersCitations) }
   );
 
-  return { sources: allSources, synthesis: synthesis.data, layers: layers.data.layers };
+  return { sources: allSources, keyPoints, synthesis: synthesis.data, layers: layers.data.layers };
 }
 
 // ---------------------------------------------------------------------------
