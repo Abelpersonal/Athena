@@ -1,0 +1,29 @@
+{
+  "name": "teacher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal AI learning platform - Phase 1: Orchestrator + MCP web search integration",
+  "type": "module",
+  "scripts": {
+    "harness": "tsx src/harness/cli.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.117.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "dotenv": "^17.4.2",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
