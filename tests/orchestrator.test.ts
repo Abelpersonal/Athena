@@ -1,33 +1,31 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const mockCreate = vi.fn();
+const mockCall = vi.fn();
 
-vi.mock("@anthropic-ai/sdk", () => ({
-  default: vi.fn().mockImplementation(function MockAnthropic() {
-    return { messages: { create: mockCreate } };
-  }),
+// Mock at the provider-selection seam, not the raw vendor SDK — the
+// Orchestrator's retry/validation logic is vendor-agnostic (it only talks to
+// LLMProvider), so this is the right boundary to test against regardless of
+// which provider LLM_PROVIDER selects for real runs.
+vi.mock("../src/orchestrator/providers/index.js", () => ({
+  getProvider: () => ({ name: "mock", defaultModel: "mock-model", call: mockCall }),
 }));
 
 const { run, OrchestratorError } = await import("../src/orchestrator/index.js");
 
-function textResponse(text: string, stopReason: string = "end_turn") {
-  return {
-    content: [{ type: "text", text }],
-    stop_reason: stopReason,
-    usage: { input_tokens: 10, output_tokens: 20 },
-  };
+function llmResult(text: string, finishReason: "end_turn" | "max_tokens" | "refusal" | "other" = "end_turn") {
+  return { text, inputTokens: 10, outputTokens: 20, finishReason };
 }
 
 describe("orchestrator retry logic", () => {
   beforeEach(() => {
-    mockCreate.mockReset();
+    mockCall.mockReset();
   });
 
   it("retries once on an invalid response, then succeeds", async () => {
-    mockCreate
-      .mockResolvedValueOnce(textResponse("this is not json at all"))
+    mockCall
+      .mockResolvedValueOnce(llmResult("this is not json at all"))
       .mockResolvedValueOnce(
-        textResponse(JSON.stringify({ summary: "A short summary.", wordCount: 3 }))
+        llmResult(JSON.stringify({ summary: "A short summary.", wordCount: 3 }))
       );
 
     const result = await run(
@@ -36,16 +34,16 @@ describe("orchestrator retry logic", () => {
       "test-module"
     );
 
-    expect(mockCreate).toHaveBeenCalledTimes(2);
+    expect(mockCall).toHaveBeenCalledTimes(2);
     expect(result.attempts).toBe(2);
     expect(result.data).toEqual({ summary: "A short summary.", wordCount: 3 });
   });
 
   it("retries on a schema-invalid response (missing field), then succeeds", async () => {
-    mockCreate
-      .mockResolvedValueOnce(textResponse(JSON.stringify({ summary: "Missing word count" })))
+    mockCall
+      .mockResolvedValueOnce(llmResult(JSON.stringify({ summary: "Missing word count" })))
       .mockResolvedValueOnce(
-        textResponse(JSON.stringify({ summary: "Now complete.", wordCount: 2 }))
+        llmResult(JSON.stringify({ summary: "Now complete.", wordCount: 2 }))
       );
 
     const result = await run(
@@ -54,18 +52,17 @@ describe("orchestrator retry logic", () => {
       "test-module"
     );
 
-    expect(mockCreate).toHaveBeenCalledTimes(2);
+    expect(mockCall).toHaveBeenCalledTimes(2);
     expect(result.data).toEqual({ summary: "Now complete.", wordCount: 2 });
 
     // The retry prompt sent on the second call should carry a correction note.
-    const secondCallArgs = mockCreate.mock.calls[1]?.[0];
-    const secondUserMessage = secondCallArgs.messages[0].content as string;
-    expect(secondUserMessage).toContain("CORRECTION NEEDED");
+    const secondCallArgs = mockCall.mock.calls[1]?.[0];
+    expect(secondCallArgs.userPrompt).toContain("CORRECTION NEEDED");
   });
 
   it("succeeds on the first attempt when the response is valid immediately", async () => {
-    mockCreate.mockResolvedValueOnce(
-      textResponse(JSON.stringify({ keyPoints: ["Point one", "Point two"] }))
+    mockCall.mockResolvedValueOnce(
+      llmResult(JSON.stringify({ keyPoints: ["Point one", "Point two"] }))
     );
 
     const result = await run(
@@ -74,30 +71,30 @@ describe("orchestrator retry logic", () => {
       "test-module"
     );
 
-    expect(mockCreate).toHaveBeenCalledTimes(1);
+    expect(mockCall).toHaveBeenCalledTimes(1);
     expect(result.attempts).toBe(1);
     expect(result.data).toEqual({ keyPoints: ["Point one", "Point two"] });
   });
 
   it("throws OrchestratorError after exhausting the configured retries", async () => {
-    mockCreate.mockResolvedValue(textResponse("still not valid json"));
+    mockCall.mockResolvedValue(llmResult("still not valid json"));
 
     await expect(
       run("summarize_text", { text: "Some text." }, "test-module", { maxRetries: 1 })
     ).rejects.toThrow(OrchestratorError);
 
     // 1 initial attempt + 1 retry = 2 calls total.
-    expect(mockCreate).toHaveBeenCalledTimes(2);
+    expect(mockCall).toHaveBeenCalledTimes(2);
   });
 
   it("does not retry on a model refusal", async () => {
-    mockCreate.mockResolvedValueOnce(textResponse("", "refusal"));
+    mockCall.mockResolvedValueOnce(llmResult("", "refusal"));
 
     await expect(
       run("summarize_text", { text: "Some text." }, "test-module")
     ).rejects.toThrow(OrchestratorError);
 
-    expect(mockCreate).toHaveBeenCalledTimes(1);
+    expect(mockCall).toHaveBeenCalledTimes(1);
   });
 
   it("throws a descriptive error for an unregistered task type", async () => {
@@ -105,6 +102,6 @@ describe("orchestrator retry logic", () => {
       run("not_a_real_task_type", {}, "test-module")
     ).rejects.toThrow(/No prompt template registered/);
 
-    expect(mockCreate).not.toHaveBeenCalled();
+    expect(mockCall).not.toHaveBeenCalled();
   });
 });

@@ -14,6 +14,8 @@ export interface SearchResult {
   source_id: string;
   /** The query that produced this result. */
   query: string;
+  /** Publish date as reported by the search provider, if any (used for volatility tagging in Phase 2). */
+  publishedDate?: string;
 }
 
 /**
@@ -31,6 +33,7 @@ interface TavilyResultItem {
   url?: string;
   content?: string;
   score?: number;
+  published_date?: string;
 }
 
 export interface TavilyMCPSearchProviderOptions {
@@ -64,6 +67,29 @@ function extractResultItems(parsed: unknown): TavilyResultItem[] {
     return (parsed as { results: TavilyResultItem[] }).results;
   }
   return [];
+}
+
+/**
+ * The real tavily_search tool (confirmed live, both keyless and with an API
+ * key) returns a plain-text block, not JSON — a "Detailed Results:" header
+ * followed by repeated `Title: / ID: / URL: / Content:` groups separated by
+ * blank lines. Parses that shape directly rather than assuming JSON.
+ */
+function parseDetailedResultsText(text: string): TavilyResultItem[] {
+  const body = text.replace(/^Detailed Results:\s*/i, "");
+  const entries = body.split(/\n(?=Title:\s)/).map((e) => e.trim()).filter(Boolean);
+
+  const items: TavilyResultItem[] = [];
+  for (const entry of entries) {
+    const url = entry.match(/URL:\s*(.*)/)?.[1]?.trim();
+    if (!url) continue;
+    items.push({
+      url,
+      title: entry.match(/Title:\s*(.*)/)?.[1]?.trim(),
+      content: entry.match(/Content:\s*([\s\S]*)/)?.[1]?.trim(),
+    });
+  }
+  return items;
 }
 
 /**
@@ -150,7 +176,7 @@ export class TavilyMCPSearchProvider implements SearchProvider {
   private async searchOne(client: Client, query: string): Promise<SearchResult[]> {
     try {
       const result = await client.callTool({
-        name: "tavily-search",
+        name: "tavily_search",
         arguments: { query, max_results: this.maxResultsPerQuery },
       });
 
@@ -181,15 +207,20 @@ export class TavilyMCPSearchProvider implements SearchProvider {
       const text = (block as { text?: unknown }).text;
       if (typeof text !== "string") continue;
 
-      let parsed: unknown;
+      // Try JSON first (some configurations/versions may return it); the
+      // confirmed-live shape is plain "Title: / URL: / Content:" text, so
+      // fall back to parsing that rather than silently dropping real results.
+      let items: TavilyResultItem[];
       try {
-        parsed = JSON.parse(text);
+        items = extractResultItems(JSON.parse(text));
       } catch {
-        // Not JSON — skip rather than fabricate a result from raw prose.
-        continue;
+        items = [];
+      }
+      if (items.length === 0) {
+        items = parseDetailedResultsText(text);
       }
 
-      for (const item of extractResultItems(parsed)) {
+      for (const item of items) {
         if (!item.url) continue;
         results.push({
           url: item.url,
@@ -197,6 +228,7 @@ export class TavilyMCPSearchProvider implements SearchProvider {
           snippet: item.content ?? "",
           source_id: makeSourceId(item.url),
           query,
+          ...(item.published_date ? { publishedDate: item.published_date } : {}),
         });
       }
     }

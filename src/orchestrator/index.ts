@@ -1,13 +1,12 @@
-import Anthropic from "@anthropic-ai/sdk";
 // Side-effect import: registers the built-in prompt templates (see templates/index.ts).
 import "./templates/index.js";
 import { getTemplate } from "./templates/registry.js";
 import { validateResponse, buildRetryPrompt } from "./validate.js";
 import { logOrchestratorCall } from "./logging.js";
 import { estimateCostUsd } from "./pricing.js";
+import { getProvider } from "./providers/index.js";
 import type { OrchestratorResult } from "./types.js";
 
-const DEFAULT_MODEL = process.env.ORCHESTRATOR_MODEL || "claude-sonnet-5";
 const DEFAULT_MAX_RETRIES = Number(process.env.ORCHESTRATOR_MAX_RETRIES ?? 2);
 
 export class OrchestratorError extends Error {
@@ -21,29 +20,33 @@ export class OrchestratorError extends Error {
   }
 }
 
+export type ValidateExtraResult = { success: true } | { success: false; error: string };
+
 export interface RunOptions {
   /** Max retries after the first attempt before surfacing a hard failure. Default: ORCHESTRATOR_MAX_RETRIES env var, or 2. */
   maxRetries?: number;
-  /** Override the model for this call. Default: ORCHESTRATOR_MODEL env var, or a mid/high-tier current model. */
+  /** Override the model for this call. Default: ORCHESTRATOR_MODEL env var, or the selected provider's own default model. */
   model?: string;
-}
-
-let sharedClient: Anthropic | null = null;
-function getClient(): Anthropic {
-  if (!sharedClient) {
-    sharedClient = new Anthropic();
-  }
-  return sharedClient;
-}
-
-function isTextBlock(block: Anthropic.ContentBlock): block is Anthropic.TextBlock {
-  return block.type === "text";
+  /**
+   * Extra validation beyond the template's static Zod schema, for
+   * constraints that depend on this specific call's context rather than the
+   * task type in general — e.g. "every cited source_id must be one of the
+   * ones actually provided in this call's context", which a schema fixed at
+   * template-registration time can't express. Runs only after the schema
+   * validates; a failure here is retried exactly like a schema failure
+   * (same correction-note-and-retry path, same attempt budget).
+   */
+  validateExtra?: (data: unknown) => ValidateExtraResult;
 }
 
 /**
  * The Orchestrator / Prompt Engineer's single public entry point. Every
- * calling module (agent) uses this instead of importing @anthropic-ai/sdk
- * directly.
+ * calling module (agent) uses this instead of importing an LLM SDK directly
+ * — the Orchestrator itself only ever talks to the vendor-neutral
+ * `LLMProvider` interface (`./providers/`), never to `@anthropic-ai/sdk` or
+ * `@google/genai` directly. Which vendor actually runs is selected once via
+ * `LLM_PROVIDER` ("anthropic" | "gemini", default "gemini") — see
+ * `./providers/index.ts`.
  *
  * Pipeline: receive(taskType, context, callingModule) -> look up template
  * -> inject context -> call model -> validate response -> on failure,
@@ -57,9 +60,9 @@ export async function run<T = unknown>(
   options: RunOptions = {}
 ): Promise<OrchestratorResult<T>> {
   const template = getTemplate<Record<string, unknown>, T>(taskType);
-  const model = options.model || DEFAULT_MODEL;
+  const provider = getProvider();
+  const model = options.model || process.env.ORCHESTRATOR_MODEL || provider.defaultModel;
   const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
-  const anthropic = getClient();
 
   const originalUserPrompt = template.buildUserPrompt(context);
   let userPrompt = originalUserPrompt;
@@ -90,28 +93,26 @@ export async function run<T = unknown>(
   while (attempts < maxRetries + 1) {
     attempts += 1;
 
-    let response: Anthropic.Message;
+    let result;
     try {
-      response = await anthropic.messages.create({
+      result = await provider.call({
         model,
-        max_tokens: template.maxTokens ?? 2048,
-        system: template.systemPrompt,
-        thinking: template.thinking ? { type: "adaptive" } : { type: "disabled" },
-        output_config: { effort: template.effort ?? "low" },
-        messages: [{ role: "user", content: userPrompt }],
+        maxTokens: template.maxTokens ?? 2048,
+        systemPrompt: template.systemPrompt,
+        userPrompt,
+        thinking: template.thinking ?? false,
+        effort: template.effort ?? "low",
       });
     } catch (error) {
       await finalizeFailure(`API call failed: ${(error as Error).message}`);
       throw error;
     }
 
-    totalInputTokens += response.usage.input_tokens;
-    totalOutputTokens += response.usage.output_tokens;
+    totalInputTokens += result.inputTokens;
+    totalOutputTokens += result.outputTokens;
+    lastRaw = result.text;
 
-    const textBlock = response.content.find(isTextBlock);
-    lastRaw = textBlock?.text ?? "";
-
-    if (response.stop_reason === "refusal") {
+    if (result.finishReason === "refusal") {
       lastError = "Model refused the request";
       await finalizeFailure(lastError);
       throw new OrchestratorError(
@@ -122,7 +123,20 @@ export async function run<T = unknown>(
     }
 
     const validation = validateResponse<T>(template.outputSchema, lastRaw);
-    if (validation.success) {
+    let failureReason: string | null = null;
+
+    if (!validation.success) {
+      failureReason = validation.error;
+    } else if (options.validateExtra) {
+      const extra = options.validateExtra(validation.data);
+      if (!extra.success) failureReason = extra.error;
+    }
+
+    if (failureReason === null) {
+      // validation.success is guaranteed true here (failureReason is only
+      // ever null when validation succeeded and validateExtra, if present,
+      // also passed) but TS can't see that across the branch above.
+      const data = (validation as { success: true; data: T }).data;
       await logOrchestratorCall({
         taskType,
         model,
@@ -139,14 +153,14 @@ export async function run<T = unknown>(
       return {
         taskType,
         promptVersion: template.version,
-        data: validation.data,
+        data,
         attempts,
         raw: lastRaw,
       };
     }
 
-    lastError = validation.error;
-    userPrompt = buildRetryPrompt(originalUserPrompt, lastRaw, validation.error);
+    lastError = failureReason;
+    userPrompt = buildRetryPrompt(originalUserPrompt, lastRaw, failureReason);
   }
 
   await finalizeFailure(lastError);
@@ -158,4 +172,6 @@ export async function run<T = unknown>(
 }
 
 export { registerTemplate, getTemplate, listTaskTypes } from "./templates/registry.js";
+export { getProvider, resetProviderCache } from "./providers/index.js";
+export type { LLMProvider, LLMCallParams, LLMCallResult, LLMFinishReason } from "./providers/index.js";
 export type { PromptTemplate, OrchestratorResult, EffortLevel } from "./types.js";

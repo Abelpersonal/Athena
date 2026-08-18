@@ -90,7 +90,7 @@ describe("TavilyMCPSearchProvider", () => {
     expect(mockConnect).not.toHaveBeenCalled();
   });
 
-  it("skips non-JSON text content instead of fabricating a result", async () => {
+  it("skips unstructured prose (neither JSON nor the Detailed Results text shape) instead of fabricating a result", async () => {
     mockCallTool.mockResolvedValueOnce({
       isError: false,
       content: [{ type: "text", text: "not json, just prose" }],
@@ -100,5 +100,55 @@ describe("TavilyMCPSearchProvider", () => {
     const results = await provider.search(["anything"]);
 
     expect(results).toEqual([]);
+  });
+
+  it("parses the real tavily_search plain-text response shape (Title:/ID:/URL:/Content: blocks)", async () => {
+    // Confirmed live against the real tavily-mcp package — the actual
+    // response is plain text, not JSON, and Phase 1's original JSON-only
+    // parser silently dropped every real result because of it.
+    const text = [
+      "Detailed Results:",
+      "",
+      "Title: Photosynthesis",
+      "ID: 5d4967-00",
+      "URL: https://en.wikipedia.org/wiki/Photosynthesis",
+      "Content: Photosynthesis is the process by which plants convert light into",
+      "chemical energy, spanning multiple lines of content.",
+      "",
+      "Title: Photosynthesis - PMC - NIH",
+      "ID: b36053-01",
+      "URL: https://pmc.ncbi.nlm.nih.gov/articles/PMC5264509",
+      "Content: Photosynthesis is the ultimate source of food and oxygen.",
+    ].join("\n");
+
+    mockCallTool.mockResolvedValueOnce({
+      isError: false,
+      content: [{ type: "text", text }],
+    });
+
+    const provider = new TavilyMCPSearchProvider({ apiKey: "test-key" });
+    const results = await provider.search(["photosynthesis"]);
+
+    expect(results).toHaveLength(2);
+    expect(results[0]).toMatchObject({
+      url: "https://en.wikipedia.org/wiki/Photosynthesis",
+      title: "Photosynthesis",
+    });
+    expect(results[0]!.snippet).toContain("chemical energy, spanning multiple lines");
+    expect(results[1]).toMatchObject({
+      url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC5264509",
+      title: "Photosynthesis - PMC - NIH",
+    });
+  });
+
+  it("calls the tool named tavily_search (not tavily-search)", async () => {
+    mockCallTool.mockResolvedValueOnce({ isError: false, content: [] });
+
+    const provider = new TavilyMCPSearchProvider({ apiKey: "test-key" });
+    await provider.search(["anything"]);
+
+    expect(mockCallTool).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "tavily_search" })
+    );
   });
 });

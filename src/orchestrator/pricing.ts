@@ -19,6 +19,13 @@ export const PRICING_USD_PER_MILLION_TOKENS: Record<
   "claude-sonnet-5": { input: 3.0, output: 15.0 },
   "claude-sonnet-4-6": { input: 3.0, output: 15.0 },
   "claude-haiku-4-5": { input: 1.0, output: 5.0 },
+  // Gemini — introductory rates (through 2026-12-31); pro-tier rates are the
+  // <=200k-token-prompt tier (this project's prompts are always well under that).
+  "gemini-3.7-flash": { input: 0.75, output: 3.75 },
+  "gemini-3.6-flash": { input: 0.75, output: 3.75 },
+  "gemini-2.5-flash": { input: 0.3, output: 2.5 },
+  "gemini-2.5-pro": { input: 1.25, output: 10.0 },
+  "gemini-3.1-pro-preview": { input: 2.0, output: 12.0 },
 };
 
 export function estimateCostUsd(
