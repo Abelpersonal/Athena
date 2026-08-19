@@ -1,4 +1,4 @@
-# Teacher — Orchestrator, Search, the Research Agent, Course Persistence, and the Memory Graph
+# Teacher — Orchestrator, Search, the Research Agent, Course Persistence, the Memory Graph, and Quiz/Practice Engines
 
 Backend-first plumbing for a personal, single-user AI learning platform.
 
@@ -20,12 +20,29 @@ Backend-first plumbing for a personal, single-user AI learning platform.
   Docker service and reached over MCP (`src/memoryGraph/`) — and fills in Phase 3's stub exactly
   at its Course Builder call site, plus writes Phase 2's grounded key points as dated episodic
   facts once the Material Aggregator has persisted their real source ids.
+- **Phase 4** builds the two modules that turn "content was generated" into "the user actually
+  learned something": the **Quiz/Assessment Engine** (`src/quizEngine/`) generates tiered
+  (recall/application/transfer) questions grounded in a lesson's own persisted content, captures
+  answers via the CLI harness, scores objective questions in code and free-text answers
+  semantically via the Orchestrator, and persists `QuizResult` rows. The **Practice/Experience
+  Engine** (`src/practiceEngine/`) classifies a module's topic_type, selects and generates a
+  practice format (project/simulation/debate — simulation and debate run as real multi-turn CLI
+  dialogues), critiques the learner's actual output, and persists `PracticeAttempt` rows, with up
+  to `DEFAULT_ESCALATION_CAP` (3) attempts auto-escalating in difficulty. Both engines write to
+  the new `MasteryState` table — SQLite for queryable current state, and the Memory Graph for a
+  dated history of how each concept node's score changed — see "Phase 4" below for the full
+  writeup, including two documented deviations from the PRD's literal spec.
 
-There is no Mind Map generation (Phase 8), quiz/practice logic, Teaching Engine, or frontend here
-yet. **Important caveat, read before relying on Phase 3.5's Definition-of-done checklist below:**
-this environment has no Docker installed, so the Memory Graph's Docker Compose setup, live MCP
-writes, and `inspect-graph` output could not be run or verified live here — see "The Docker
-verification gap" near the end of this README before treating those items as confirmed.
+There is no Mind Map generation (Phase 8), Teaching Engine/voice (Phase 7.5), Continuous
+Learning/Knowledge Update Agents (Phase 6), Goal/Career Path Planner (Phase 5), or frontend here
+yet. **Important caveat, read before relying on the Definition-of-done checklists below:** this
+environment has no Docker installed, so the Memory Graph's Docker Compose setup, live MCP writes,
+and `inspect-graph` output could not be run or verified live here (Phase 3.5's gap, which also
+applies to Phase 4's `MasteryState` Memory Graph mirroring) — see "The Docker verification gap"
+near the end of this README before treating those items as confirmed. This environment also has
+no `TAVILY_API_KEY` configured, so a real (non-mocked) `research`/`build` run — and therefore a
+quiz/practice run grounded in genuinely-researched lesson content — could not be done either; see
+"The real-run blocker" below for how Phase 4 worked around this for its own demonstration.
 
 ## Tech choices
 
@@ -146,6 +163,9 @@ Teacher's own `.env` (repo root):
 | `TEACHER_DB_PATH` | No | `data/teacher.db` | Override the SQLite file path (`getDb()`'s default parameter). |
 | `MATERIAL_MIN_VALID_SOURCES` | No | `2` | Minimum `type: "article"` sources a lesson needs before the Material Aggregator's backfill trigger fires. |
 | `GRAPHITI_MCP_URL` | No | `http://localhost:8000/mcp/` | Where `src/memoryGraph/` connects — override if the graph service runs on a different host/port. |
+| `QUIZ_QUESTIONS_PER_TIER` | No | `2` | Questions generated per requested tier by the Quiz Engine. |
+| `QUIZ_WEAK_CONCEPT_THRESHOLD` | No | `0.6` | Below this `knowledge_score`, a concept node is surfaced in `weakConceptNodes` (Phase 4; not load-bearing yet — see "The Quiz/Assessment Engine" below). |
+| `PRACTICE_ESCALATION_CAP` | No | `3` | Max attempts per module before the Practice Engine stops auto-generating harder variants (the cap'th attempt, and every attempt after it, stays at `novel_unguided`). |
 
 `mcp_server/.env` (separate file, the Graphiti service's own config — not read by Teacher's Node
 process at all):
@@ -188,6 +208,18 @@ npm run inspect -- --dry-run <course_id>   # reads data/teacher.dry-run.db inste
 # Dump whatever's stored for a topic in the Memory Graph (Phase 3.5) — nodes, facts,
 # episodes, dates. Needs `docker compose up` running in mcp_server/ (see Setup above).
 npm run inspect-graph -- "your topic here"
+
+# Phase 4: run a quiz session against one already-persisted lesson, real APIs. Prompts for
+# each question via the CLI (a number for multiple-choice, free text otherwise), then prints
+# per-tier and overall scores plus the updated MasteryState row. Omit [tier] to test all three.
+npm run harness -- quiz <lesson_id> [recall|application|transfer]
+
+# Phase 4: run a practice session against one already-persisted module, real APIs. Prints the
+# generated task/scenario/claim; for "simulation"/"debate" formats this is a real multi-turn
+# CLI dialogue (type your reply each turn, "/end" to finish) — for "project" it's a multi-line
+# submission ended with a line containing only "/done". Then prints the critique, a reflection
+# prompt (captured the same way), and the updated MasteryState.experience_score.
+npm run harness -- practice <module_id>
 ```
 
 The Phase 1 form prints a structured, schema-checked `summarize_text` result plus the JSONL log
@@ -214,10 +246,13 @@ real `data/teacher.db` — mock course data (titled "Mock Module (m1)" etc.) sho
 the DB you'd actually inspect real courses in. `npm run inspect` needs the same `--dry-run` flag to
 read that same isolated file.
 
-All real (non-`--dry-run`) forms need `TAVILY_API_KEY` set, plus either `GEMINI_API_KEY` (default
-provider) or `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY`. `build` additionally talks to the
-Memory Graph service (see Setup) when not run with `--dry-run`, though a missing graph service
-degrades rather than fails the command. This is meant to be a scrappy debugging tool across
+All real (non-`--dry-run`) `research`/`build` forms need `TAVILY_API_KEY` set, plus either
+`GEMINI_API_KEY` (default provider) or `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY`. `build`
+additionally talks to the Memory Graph service (see Setup) when not run with `--dry-run`, though a
+missing graph service degrades rather than fails the command. `quiz`/`practice` (Phase 4) need only
+an LLM key (no `TAVILY_API_KEY` — they don't search the web) plus a lesson/module id that's
+already persisted, from any prior `build` or `build --dry-run` run; they also talk to the Memory
+Graph the same way `build` does. This is meant to be a scrappy debugging tool across
 Phases 1–6, not a polished CLI.
 
 ## Running tests
@@ -286,9 +321,43 @@ npm run typecheck
   (one `add_memory` episode plus one `add_triplet` per prerequisite, and still writing the episode
   when there are zero prerequisites), `writeSubtopicFacts`'s call shape (one `add_memory` per key
   point, each JSON-encoding `{point, source_id}`), graceful degradation on a simulated connection
-  failure for both write paths (resolves without throwing, logs loudly), and `getTopicHistory`
+  failure for both write paths (resolves without throwing, logs loudly), `getTopicHistory`
   combining `search_nodes`/`search_memory_facts`/`get_episodes` into one result or returning
-  `{nodes: [], facts: [], episodes: [], error}` rather than throwing when the graph is unreachable.
+  `{nodes: [], facts: [], episodes: [], error}` rather than throwing when the graph is unreachable,
+  and (Phase 4) `writeMasteryUpdate`'s call shape — one `add_memory` episode per call (a new dated
+  fact, never an overwrite), the episode name/body correctly distinguishing `"knowledge"` from
+  `"experience"` updates, and the same graceful-degradation behavior on a connection failure.
+- `tests/quizEngine.test.ts` (Phase 4) — `generateQuizQuestions`: all three tiers requested by
+  default and tagged correctly on the returned questions, only the tiers actually passed are
+  requested from the Orchestrator, every call is grounded in the lesson's real persisted
+  title/description/layers (not a generic prompt), the multiple_choice/free_text question shapes
+  round-trip correctly, and an unknown lesson id throws `QuizEngineError`.
+  `scoreAndRecordQuiz`: multiple_choice questions are scored in code with zero LLM calls while
+  free_text questions trigger exactly one `score_free_text_answer` call each — proven with a
+  known-good answer (mocked to score 0.9) and a known-bad answer (mocked to score 0.1) and
+  asserting the returned scores land where expected, one `QuizResult` row is persisted per tier
+  tested, `MasteryState.knowledgeScore` is upserted via a targeted column update that leaves a
+  pre-existing `experienceScore` untouched, weak concept nodes are surfaced below (and only below)
+  the configured threshold, and the Memory Graph mirror is called once with the right concept node
+  id, `"knowledge"` type, and score.
+- `tests/practiceEngine.test.ts` (Phase 4) — `difficultyForAttemptNumber` unit tests (attempt 1 is
+  `guided`, attempt 2 is `harder`, the cap'th attempt and every attempt after it is
+  `novel_unguided` — proving the "stops escalating" cap behavior directly, not just via
+  integration). `preparePracticeSession`: both `classify_topic_type` branches exercised against
+  independent mocked responses (a skill-based module producing `project` content, a conceptual
+  module producing `debate` content), an unknown module id throwing `PracticeEngineError`, and
+  attempt-number/prior-mistakes threading — a seeded prior `PracticeAttempt` row correctly bumps
+  `attemptNumber` to 2, escalates `difficulty` to `harder`, and threads that attempt's `feedback`
+  into the next content-generation call's `priorMistakes` context. `runDialogueTurn` routes a
+  simulation turn through `dialogue_turn` with the persona and running history, and rejects a
+  project-format session (no dialogue content) with `PracticeEngineError`.
+  `critiquePracticeAttempt` asserts the learner's actual submission text reaches the critique call
+  and comes back referenced in the critique — the PRD's "not a templated response" quality bar,
+  checked directly rather than only via a schema shape. `recordPracticeAttempt`: persists the
+  `PracticeAttempt` row correctly, updates `MasteryState.experienceScore` for every lesson in the
+  module while leaving each lesson's pre-existing `knowledgeScore` untouched, calls the Memory
+  Graph mirror once per lesson with `"experience"` type, and reports
+  `willEscalateNextAttempt: false` once the cap is reached.
 
 ## Architecture
 
@@ -315,17 +384,21 @@ src/
   materialAggregator/    # Phase 3: source persistence + backfill
     index.ts               # aggregateMaterials() — re-fetch, persist, link, backfill-trigger
   memoryGraph/            # Phase 3.5: the Memory Graph client
-    index.ts                # writeTopic() / writeSubtopicFacts() / getTopicHistory() — public API
+    index.ts                # writeTopic() / writeSubtopicFacts() / getTopicHistory() / writeMasteryUpdate() (Phase 4) — public API
     graphitiClient.ts          # GraphitiMCPClient — MCP connection + tool-call plumbing
     types.ts                    # TS mirrors of Graphiti's response TypedDicts
+  quizEngine/             # Phase 4: the Quiz/Assessment Engine
+    index.ts                # generateQuizQuestions() / scoreAndRecordQuiz() — public API
+  practiceEngine/         # Phase 4: the Practice/Experience Engine
+    index.ts                # preparePracticeSession() / runDialogueTurn() / critiquePracticeAttempt() / generateReflectionPromptText() / recordPracticeAttempt() — public API
   db/                     # SQLite (node:sqlite) + Drizzle
-    schema.ts                # courses / modules / lessons / sources tables
+    schema.ts                # courses / modules / lessons / sources / quizResults / practiceAttempts / masteryState (Phase 4) tables
     client.ts                  # getDb() — lazy connect + auto-migrate, sqlite-proxy driver
   shared/
     ids.ts                # slugify() / assignUniqueIds() — shared by pipeline.ts and courseBuilder
   harness/
-    cli.ts               # debugging CLI: Phase 1 demo + `research [--dry-run]` + `build [--dry-run]`
-    inspect.ts             # `npm run inspect -- <course_id>` — dumps a persisted course from SQLite
+    cli.ts               # debugging CLI: Phase 1 demo + `research [--dry-run]` + `build [--dry-run]` + `quiz` + `practice` (Phase 4)
+    inspect.ts             # `npm run inspect -- <course_id>` — dumps a persisted course from SQLite, incl. QuizResult/PracticeAttempt/MasteryState (Phase 4)
     inspectGraph.ts          # `npm run inspect-graph -- "<topic>"` — dumps Memory Graph history
     mocks.ts              # canned dependencies for --dry-run (research AND build)
 tests/
@@ -339,6 +412,8 @@ tests/
   courseBuilderTemplates.test.ts
   materialAggregator.test.ts
   memoryGraph.test.ts
+  quizEngine.test.ts        # Phase 4
+  practiceEngine.test.ts    # Phase 4
 drizzle/                 # versioned migration SQL, generated by `npm run db:generate` — committed
 drizzle.config.ts
 mcp_server/              # Docker Compose for Graphiti + FalkorDB (Phase 3.5) — see Setup above
@@ -549,9 +624,9 @@ fabricated citation.
 
 ### The database layer (SQLite + Drizzle)
 
-`src/db/schema.ts` defines four tables — Phase 3's slice of the PRD's data model; `QuizResult`,
-`PracticeAttempt`, `MasteryState`, `Book`, and `UpdateEvent` belong to later phases and aren't
-modeled yet, so the schema grows incrementally instead of drifting ahead of what's built:
+`src/db/schema.ts` defines Phase 3's four tables plus Phase 4's three — `Book` and `UpdateEvent`
+belong to later phases and aren't modeled yet, so the schema grows incrementally instead of
+drifting ahead of what's built:
 
 | Table | Columns |
 |---|---|
@@ -559,6 +634,9 @@ modeled yet, so the schema grows incrementally instead of drifting ahead of what
 | `modules` | `id`, `course_id`, `title`, `description`, `order` (DB column `order_index` — sidesteps the SQL reserved word, JS field stays `order`), `prerequisite_of` (JSON array of module ids) |
 | `lessons` | `id`, `module_id`, `title`, `description`, `estimated_duration`, `layers` (JSON — same shape as Phase 2's `RestructureLayersOutput["layers"]`), `source_refs` (JSON array of source ids), `audio_cache_ref` (nullable, unused until the audio-caching phase — the column exists now so the schema doesn't change later), `source_status` (`ok`\|`below_threshold`) |
 | `sources` | `id`, `url`, `type` (`article`\|`pdf`\|`video`\|`other`\|`unreachable`\|`low_confidence`), `extracted_text`, `credibility_score`, `fetched_at` |
+| `quiz_results` (Phase 4) | `id`, `lesson_id`, `tier` (`recall`\|`application`\|`transfer`), `score` (0-1 real), `date` — one row per (lesson, tier) tested in a quiz session, not per question |
+| `practice_attempts` (Phase 4) | `id`, `module_id`, `type` (`project`\|`simulation`\|`debate`), `attempt_number`, `feedback`, `reflection_notes` (nullable), `date` |
+| `mastery_state` (Phase 4) | `concept_node_id` (primary key), `knowledge_score` (0-1 real, nullable), `experience_score` (0-1 real, nullable), `last_updated` — see "The Quiz/Assessment Engine" and "The Practice/Experience Engine" below for how the two score columns are kept independent |
 
 `npm run db:generate` (`drizzle-kit generate`) diffs `schema.ts` against `drizzle/`'s migration
 history and writes a new versioned SQL file when the schema changes — run it after editing
@@ -721,6 +799,240 @@ bookkeeping — consistent with the "LLM provider swap" deviation documented els
 README. The embedding model (`gemini-embedding-001`, 3072-dim) was verified live against Google's
 current docs rather than assumed — `text-embedding-004`, the name that shows up in older
 references, is now a legacy model.
+
+## Phase 4: the Quiz/Assessment Engine and Practice/Experience Engine
+
+Phases 1-3.5 got content generated and persisted. Phase 4 is the first phase that checks whether
+the user actually learned anything — the **Quiz/Assessment Engine** (`src/quizEngine/`) tests
+knowledge, the **Practice/Experience Engine** (`src/practiceEngine/`) builds applied experience,
+and both write to the new `MasteryState` table that every later phase's "how well does the user
+know X" question depends on (Phase 5's overlap detection, Phase 6's Continuous Learning Agent,
+Phase 8's Mind Map mastery display). No Teaching Engine/voice (Phase 7.5), Continuous Learning or
+Knowledge Update Agents (Phase 6), Goal Planner (Phase 5), or frontend — everything is exercised
+through the CLI harness, same as every phase so far.
+
+### concept_node_id granularity (documented simplification)
+
+The PRD's eventual data model ties `MasteryState` to fine-grained concept nodes that the Mind Map
+Agent (Phase 8) will define. Phase 8 doesn't exist yet, so **`concept_node_id` defaults to
+`lesson_id` everywhere in Phase 4** — coarser than the PRD's eventual intent, but consistent (one
+scheme used everywhere, not a placeholder in one place and something else elsewhere) and
+upgradable later without a data migration: Phase 8 can introduce finer node ids and backfill.
+
+This has one real consequence worth calling out: `QuizResult` is naturally lesson-scoped (`lesson_id`
+column) and maps to `concept_node_id` directly, one-to-one. `PracticeAttempt` is module-scoped
+(`module_id` column, per the PRD's own data model), which is coarser than a single lesson —
+`recordPracticeAttempt()` handles this by **broadcasting** the attempt's `performanceScore` to
+`MasteryState.experienceScore` for *every* lesson under that module (see `src/practiceEngine/index.ts`).
+This means a module with three lessons gets three `MasteryState` rows all updated to the same
+experience score after one practice attempt — a real approximation, not a precise per-lesson signal,
+but it keeps every `MasteryState` row addressable by the same `concept_node_id` scheme a quiz would
+use for the same lesson, so a later reader (Phase 5's overlap detection, Phase 8's Mind Map) can
+join quiz and practice signal on one row per lesson without knowing about this module-vs-lesson
+scoping difference. The real inspect run below shows this directly: a lesson that was both quizzed
+and practiced (via its module) ends up with both `knowledge_score` and `experience_score`
+populated on the *same* row.
+
+### Deviation: topic_type is classified by the Practice Engine, not the Research Agent
+
+The PRD's Practice Engine spec takes `topic_type` (conceptual vs. skill-based) as an input "set by
+the Research Agent." Phase 2's Research Agent, as actually built, doesn't classify this — it was
+never part of Phase 2's spec. Rather than reaching back into an already-verified earlier phase to
+add a classification step it didn't originally need (and risking destabilizing it for a field only
+Phase 4 uses), the Practice Engine classifies `topic_type` itself as its own first step: one more
+`[LLM]` call (`classify_topic_type`, `src/orchestrator/templates/classifyTopicType.ts`), one more
+registered template, routed through the Orchestrator like everything else. This keeps Phase 4
+self-contained. See `preparePracticeSession()` in `src/practiceEngine/index.ts` for where this
+runs (step 0, before format selection).
+
+### The Quiz/Assessment Engine
+
+`src/quizEngine/index.ts` exposes two functions matching the PRD's pipeline split — question
+generation is separate from scoring/persistence so the CLI harness can present questions and
+collect answers in between:
+
+1. **`generateQuizQuestions(lessonId, tiers, options)`** — `[LLM]`, one call per requested tier
+   (`generate_recall_questions` / `generate_application_questions` / `generate_transfer_questions`,
+   one registered template each, per the PRD's "one new template per question tier"). Each call is
+   grounded in the lesson's own persisted content — pulled straight from the `Lesson` row's `title`,
+   `description`, and `layers` (the same five-layer content the Course Builder wrote in Phase 3) —
+   never a generic, ungrounded prompt. Recall questions test direct facts/definitions from the
+   lesson; application questions require using a lesson concept to solve a concrete problem;
+   transfer questions describe a genuinely novel scenario not explicitly covered in the lesson text,
+   grounded only in the lesson's *underlying* concept. Each question is either `multiple_choice`
+   (options + a 0-based `correctOptionIndex`, scored in code) or `free_text` (a `rubric` describing
+   what a correct answer must contain, written by the same call that wrote the question, so scoring
+   later doesn't need to re-derive what "correct" means from scratch).
+2. **`[code]` present questions, capture answers** — the CLI harness's job (`npm run harness -- quiz`),
+   via `node:readline/promises`: multiple-choice prompts for a number (re-prompting on a
+   non-numeric/out-of-range answer), free-text prompts for a line of text.
+3. **`scoreAndRecordQuiz(lessonId, questions, answers, options)`** — `[code]` scores every
+   `multiple_choice` answer directly (exact match against `correctOptionIndex`, 1 or 0, no LLM
+   call); `[LLM]` scores every `free_text` answer **semantically**, via one `score_free_text_answer`
+   call per free-text question — the model grades the learner's actual wording against the
+   question's rubric, not a keyword match, and returns a continuous 0-1 score plus a short
+   explanation. `tests/quizEngine.test.ts` proves this is genuinely semantic scoring by mocking two
+   different answers to different scores and asserting they land where expected (a "known-good" and
+   a "known-bad" answer), and the real run below (see "Definition of done") shows a real free-text
+   answer scored 0 against a rubric it didn't actually match — proof the scorer checks meaning
+   against the specific rubric, not just plausibility.
+4. **`[code]`** writes one `QuizResult` row per tier tested (the tier's score is the average of that
+   tier's question scores this session — not one row per question), then upserts
+   `MasteryState.knowledgeScore` for `concept_node_id = lessonId`. The upsert (Drizzle's
+   `onConflictDoUpdate`) targets **only** the `knowledge_score` and `last_updated` columns — an
+   existing `experience_score` on that row is never touched by a quiz run (`tests/quizEngine.test.ts`
+   proves this directly: pre-seed a row with an `experienceScore`, run a quiz, assert it's
+   unchanged). The new `knowledgeScore` is the average of *every* question answered this session,
+   across all tiers tested — replacing the previous value, since this is a current-state table, not
+   an accumulating history (the Memory Graph is where the history lives — see below).
+5. **`[code]`** mirrors the same update into the Memory Graph as a new dated fact
+   (`memoryGraph.writeMasteryUpdate(conceptNodeId, "knowledge", score, detail)`) and surfaces weak
+   concept nodes: any concept node whose new `knowledgeScore` falls below `QUIZ_WEAK_CONCEPT_THRESHOLD`
+   (default `0.6`) is returned in `weakConceptNodes` and logged — per the PRD, this data just needs
+   to exist in the right shape for now; nothing consumes it yet (Phase 8's Mind Map and Phase 4's
+   own "candidates for targeted practice" wiring are later work).
+
+**Score scale**: `knowledge_score` (and `experience_score`, below) are **0-1 continuous** for both
+objective and free-text questions — the resolved default from the PRD's open questions, chosen for
+consistency between the two very different scoring mechanisms (exact-match vs. semantic grading)
+that both need to land on the same scale.
+
+### The Practice/Experience Engine
+
+`src/practiceEngine/index.ts` implements the PRD's pipeline as a sequence of small, independently
+testable functions (mirroring the Quiz Engine's split between generation, presentation, and
+recording) rather than one monolithic function, since the CLI harness needs to interleave real user
+I/O (multi-turn dialogue, multi-line submissions) between several of the LLM steps:
+
+1. **`preparePracticeSession(moduleId, options)`** runs steps 0-1: `[LLM]` `classify_topic_type`
+   (the deviation above) grounded in the module's title/description and its lessons' summaries;
+   `[LLM]` `select_practice_format` given that classification (project/simulation/debate — the
+   template's system prompt documents project as usually best for skill_based, debate for
+   conceptual, simulation as a flexible middle ground for either, but the model chooses freely
+   rather than a hardcoded mapping, since format fit genuinely depends on the specific content, not
+   just the topic_type label). It also computes `attemptNumber` (count of existing
+   `PracticeAttempt` rows for this module, +1) and the resulting `difficulty` (see escalation cap,
+   below), then generates that format's actual content — a realistic task/dataset/prompt
+   (`generate_project_brief`), a scenario + AI persona/rules + opening line
+   (`generate_simulation_scenario`), or a contested claim + assigned position + opponent's opening
+   argument + opponent rules (`generate_debate_prompt`) — grounded in the module's lessons, and
+   (once difficulty has escalated past `guided`) in the previous attempt's actual feedback text, so
+   a harder variant targets a real recurring mistake rather than being generically harder.
+2. **`runDialogueTurn(session, history, userInput, options)`** — the multi-turn step, shared by
+   *both* `simulation` and `debate` (the PRD's step 2 wording — "respond in character, adapt to the
+   user's input" — is generic, not format-specific, so one registered template, `dialogue_turn`,
+   drives both rather than duplicating a near-identical prompt per format). The CLI harness
+   (`npm run harness -- practice`) drives the actual multi-turn loop via `node:readline/promises`:
+   read the learner's typed reply, call this once per turn with the running conversation history,
+   print the AI's in-character reply, repeat until the learner types `/end` (or an 8-turn safety
+   cap is hit). `project`-format sessions skip this step entirely — the harness instead collects a
+   multi-line submission ended by a line containing only `/done`.
+3. **`critiquePracticeAttempt(session, userOutput, options)`** — `[LLM]` `critique_practice_attempt`,
+   given the practice brief (what the learner was asked to do) and `userOutput` (their actual
+   submission or the full dialogue transcript). This is explicitly a PRD quality bar, not just a
+   schema check: the critique must reference what the learner *specifically* did, not a templated
+   response. `tests/practiceEngine.test.ts` asserts the learner's actual output text reaches the
+   call and is referenced back in the mocked critique; the real run below shows a genuinely specific
+   critique quoting the learner's exact (weak) response. The same call also returns a continuous
+   `performanceScore` (0-1, same scale as `knowledge_score`) — this is what becomes
+   `MasteryState.experienceScore`.
+4. **`[code]`** the CLI harness generates a reflection prompt (`generateReflectionPromptText`,
+   `[LLM]` `generate_reflection_prompt`, tailored to the actual critique just given — "what worked /
+   what would you change," per the PRD) and captures the learner's typed reflection the same
+   multi-line-until-`/done` way.
+5. **`recordPracticeAttempt(session, critique, reflectionNotes, performanceScore, options)`** —
+   `[code]` persists one `PracticeAttempt` row (`feedback` + `reflectionNotes` together, since both
+   are known by this point) and updates `MasteryState.experienceScore` for every lesson under the
+   module (see the concept_node_id broadcast, above) via an upsert that targets **only**
+   `experience_score` and `last_updated` — a practice run never touches `knowledgeScore`
+   (`tests/practiceEngine.test.ts` proves this the same way the Quiz Engine's symmetric test does).
+   Mirrors each update into the Memory Graph the same way the Quiz Engine does, tagged `"experience"`.
+
+**Escalation cap**: default **3 attempts** per module before the engine stops auto-generating
+progressively harder variants, configurable via `PRACTICE_ESCALATION_CAP`. The pure mapping —
+exported as `difficultyForAttemptNumber(attemptNumber, cap)` for direct unit testing — is: attempt
+1 is `"guided"`, attempts 2 through `cap - 1` are `"harder"`, and attempt `cap` **and every attempt
+after it** stay at `"novel_unguided"` rather than escalating indefinitely (with the default cap of
+3: attempt 1 guided, attempt 2 harder, attempt 3+ novel_unguided). `recordPracticeAttempt()`'s
+`willEscalateNextAttempt` return field tells the harness (and the report below) whether the next
+run will actually be harder or has already hit the ceiling.
+
+**Weak-concept threshold** (Quiz Engine): default `0.6`, per the PRD's resolved default —
+explicitly not load-bearing yet, since nothing downstream consumes `weakConceptNodes` until a later
+phase wires it up (same status as the PRD describes).
+
+### Definition of done — Phase 4 (real run, both branches)
+
+Docker still isn't installed in this environment (same gap as Phase 3.5 — see "The Docker
+verification gap" below) and `TAVILY_API_KEY` still isn't configured (same gap Phase 2/3's
+"real-run blocker" section describes), so a real `research`/`build` run wasn't possible here either.
+Unlike Phase 2/3, though, the Quiz and Practice Engines don't need web search at all — they operate
+entirely on already-persisted lesson/module content — so a real (non-mocked) run against real
+`GEMINI_API_KEY` calls **was** done, grounded in a course built via `build --dry-run` (mock lesson
+text) plus one hand-seeded module/lesson with genuine SQL content (to get a fair real classification
+on both `topic_type` branches — the dry-run course's three modules all share near-identical mock
+text and would likely all classify the same way):
+
+- **All three quiz tiers, real and grounded**: against the mock lesson, `generateQuizQuestions`
+  produced real recall questions asking about the lesson's own (mock) layer text, a real
+  application question about diagnosing a failed deployment using the lesson's Mechanics/Application
+  layers, and — genuinely novel, per the transfer-tier spec — real transfer questions about
+  fiber-optic signal degradation and drone-delivery load balancing, neither mentioned anywhere in
+  the lesson, but grounded in the same "frequency/capacity-threshold" and "distributed load"
+  concepts the lesson's mock content gestures at.
+- **Real objective + free-text scoring, both correct**: answering the first multiple-choice question
+  correctly and a deliberately wrong one incorrectly scored exactly `1` and `0` in code, no LLM
+  call. A free-text answer about real Newton's-Laws inertia — a *plausible-sounding but actually
+  off-topic* answer relative to this lesson's (mock) rubric — was correctly scored `0` by the
+  semantic grader, and a genuinely weak "I don't remember" answer also scored `0`: `tierScores:
+  { recall: 0.5, application: 0, transfer: 0 }`, `overallScore: 0.167`.
+- **MasteryState + weak concept node, real and persisted**: the low overall score correctly
+  triggered `weakConceptNodes: ["lsn_mock-lesson-mock-subtopic-one_30b30d"]`, and the row is visible
+  via the extended `npm run inspect`:
+  ```
+  QuizResult qr_... — tier: recall, score: 0.50
+  QuizResult qr_... — tier: application, score: 0.00
+  QuizResult qr_... — tier: transfer, score: 0.00
+  MasteryState (concept_node_id: lsn_mock-lesson-mock-subtopic-one_30b30d) — knowledge_score: 0.1667, experience_score: 0.1
+  ```
+- **Correct format selection, both topic_type branches, real classifications**: the mock module
+  (generic, no concrete task described) was classified `"conceptual"` with the justification
+  *"the provided mock module description and lesson content lack actionable procedural tasks...
+  describing topic material that leans toward understanding ideas rather than executing a
+  practical skill"* and routed to `debate`, generating a real contested claim about peer-review
+  learning. The hand-seeded module (real SQL JOIN/WHERE/GROUP BY/HAVING content) was classified
+  `"skill_based"` with justification *"mastery of SQL query writing requires the practical
+  execution of writing syntax... rather than just understanding relational database theory
+  conceptually"* and routed to `project`, generating a genuinely well-grounded task (join
+  `customers`/`orders`, filter by `is_active`/`status`/date range, `GROUP BY` + `HAVING
+  total_spent_2023 > 500`) that directly exercises the concepts named in that lesson's own Mechanics
+  layer — real evidence that format selection tracks topic_type correctly, and that content
+  quality scales with how real the underlying lesson content is (the mock-content debate is
+  noticeably more generic than the real-content SQL project, as expected).
+- **Specific, non-templated critique**: attempt 1's response ("I think it's basically fine, no
+  major issues that I can see") produced a critique that directly quotes that response and explains
+  specifically why it conceded the debate instead of arguing the assigned position — not a generic
+  "good effort" response.
+- **A harder attempt 2 that visibly incorporates attempt 1's mistake**: running
+  `preparePracticeSession` again for the same module produced `attemptNumber: 2`, `difficulty:
+  "harder"`, `priorMistakes` populated verbatim with attempt 1's critique text, and a **new**
+  generated claim (about reviewer vs. receiver learning gains, a harder framing of the same
+  underlying idea) whose `opponentRules` explicitly instruct the AI opponent to *"push back firmly
+  if the user gives passive, agreeable, or non-committal responses (e.g., 'I agree' or 'looks
+  fine')"* — a direct, visible response to exactly the mistake attempt 1 made.
+  `recordPracticeAttempt`'s `willEscalateNextAttempt: true` after attempt 1 confirmed this was
+  expected before attempt 2 ran.
+- **knowledge_score and experience_score updated independently, on the same row, confirmed in
+  SQLite**: the lesson that was both quizzed and practiced (via its module) shows
+  `knowledge_score: 0.1667` (from the quiz, untouched by the practice run) and
+  `experience_score: 0.1` (from the practice run's `performanceScore`, untouched by the quiz) on
+  one `MasteryState` row — exactly the independent-update guarantee both engines' tests assert.
+- **Memory Graph mirroring**: both `writeMasteryUpdate` calls (one `"knowledge"`, one
+  `"experience"`) were attempted against the real client and degraded gracefully (logged, not
+  thrown) since no Graphiti service is running in this environment — same documented gap as Phase
+  3.5, and covered independently by `tests/memoryGraph.test.ts`'s `writeMasteryUpdate` suite (call
+  shape, `"knowledge"`-vs-`"experience"` distinction, graceful degradation).
+- All 108 tests pass (`npm test`), `npm run typecheck` is clean.
 
 ### Documented gaps
 
@@ -966,3 +1278,13 @@ real-run blocker above resolved first, since `build` needs real LLM calls too) f
   defaults to, rather than requiring a second, unrelated OpenAI key just for this one service's
   internal bookkeeping. Not requested explicitly, but a natural extension of the already-adopted
   "default to Gemini" decision — documented here rather than left implicit in a config file.
+- **(Phase 4) `topic_type` is classified by the Practice Engine itself, not "set by the Research
+  Agent"** — the PRD's literal spec assumes Phase 2's Research Agent already tags this; the actual
+  Phase 2 build doesn't. Rather than retrofitting an already-verified earlier phase for a field only
+  Phase 4 uses, `classify_topic_type` is Phase 4's own first step. See "Deviation: topic_type is
+  classified by the Practice Engine, not the Research Agent" above.
+- **(Phase 4) `concept_node_id` defaults to `lesson_id`, coarser than the PRD's eventual
+  Mind-Map-defined granularity** — Phase 8 (Mind Map Agent) doesn't exist yet to define finer nodes.
+  A module-scoped `PracticeAttempt`'s `experienceScore` update is broadcast to every lesson under
+  that module rather than being tracked at a finer grain. See "concept_node_id granularity
+  (documented simplification)" above for the full reasoning and its one real consequence.

@@ -157,6 +157,37 @@ export async function getTopicHistory(
   }
 }
 
+/**
+ * Phase 4: mirrors a MasteryState update (SQLite is the queryable
+ * current-state table — see src/db/schema.ts) into the Memory Graph as a new
+ * DATED FACT, never an overwrite. Every call is its own `add_memory` episode
+ * (same "one episode per atomic fact" reasoning as writeSubtopicFacts), so
+ * the graph accumulates a real history of how a concept node's score changed
+ * over time — exactly the temporal, cross-cutting data Phase 3.5 stood up
+ * the graph for, and what Phase 5's overlap detection will read.
+ */
+export async function writeMasteryUpdate(
+  conceptNodeId: string,
+  scoreType: "knowledge" | "experience",
+  score: number,
+  detail: string,
+  client: GraphitiMCPClient = getDefaultClient()
+): Promise<void> {
+  try {
+    await client.callTool("add_memory", {
+      name: `Mastery: ${conceptNodeId} (${scoreType})`,
+      episode_body: `${scoreType === "knowledge" ? "Knowledge" : "Experience"} score for concept node "${conceptNodeId}" updated to ${score.toFixed(2)}. ${detail}`,
+      source: "text",
+      source_description: `Teacher ${scoreType === "knowledge" ? "Quiz" : "Practice"} Engine (concept_node_id: ${conceptNodeId})`,
+      reference_time: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error(
+      `[memory-graph] Failed to write ${scoreType} mastery update for "${conceptNodeId}": ${(error as Error).message}`
+    );
+  }
+}
+
 /** Closes the default client's MCP connection (call before process exit). */
 export async function closeMemoryGraph(): Promise<void> {
   if (defaultClient) {

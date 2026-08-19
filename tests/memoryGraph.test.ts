@@ -17,7 +17,9 @@ vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
 }));
 
 const { GraphitiMCPClient } = await import("../src/memoryGraph/graphitiClient.js");
-const { writeTopic, writeSubtopicFacts, getTopicHistory } = await import("../src/memoryGraph/index.js");
+const { writeTopic, writeSubtopicFacts, getTopicHistory, writeMasteryUpdate } = await import(
+  "../src/memoryGraph/index.js"
+);
 
 function toolResult(data: unknown): { isError: false; content: Array<{ type: "text"; text: string }> } {
   return { isError: false, content: [{ type: "text", text: JSON.stringify(data) }] };
@@ -154,6 +156,51 @@ describe("memoryGraph", () => {
       ).resolves.toBeUndefined();
 
       expect(mockCallTool).toHaveBeenCalledTimes(2);
+      expect(errorSpy).toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+  });
+
+  describe("writeMasteryUpdate", () => {
+    it("writes one add_memory episode per call — a new dated fact, not an overwrite", async () => {
+      mockCallTool.mockResolvedValue(toolResult({ message: "ok" }));
+      const client = new GraphitiMCPClient();
+
+      await writeMasteryUpdate("lsn_1", "knowledge", 0.72, "Quiz session covering tier(s) — recall: 0.80.", client);
+
+      expect(mockCallTool).toHaveBeenCalledTimes(1);
+      const call = mockCallTool.mock.calls[0]![0];
+      expect(call).toMatchObject({
+        name: "add_memory",
+        arguments: expect.objectContaining({
+          name: "Mastery: lsn_1 (knowledge)",
+          source: "text",
+          source_description: expect.stringContaining("lsn_1"),
+        }),
+      });
+      expect(call.arguments.episode_body).toContain("0.72");
+      expect(call.arguments.episode_body).toContain("Knowledge");
+    });
+
+    it("distinguishes 'experience' updates from 'knowledge' updates in the episode name and body", async () => {
+      mockCallTool.mockResolvedValue(toolResult({ message: "ok" }));
+      const client = new GraphitiMCPClient();
+
+      await writeMasteryUpdate("lsn_2", "experience", 0.5, "Practice attempt 1 (project) on module.", client);
+
+      const call = mockCallTool.mock.calls[0]![0];
+      expect(call.arguments.name).toBe("Mastery: lsn_2 (experience)");
+      expect(call.arguments.episode_body).toContain("Experience");
+    });
+
+    it("degrades gracefully (resolves, logs) when the graph server is unreachable", async () => {
+      mockConnect.mockRejectedValue(new Error("ECONNREFUSED"));
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const client = new GraphitiMCPClient();
+
+      await expect(writeMasteryUpdate("lsn_3", "knowledge", 0.3, "detail", client)).resolves.toBeUndefined();
+
+      expect(mockCallTool).not.toHaveBeenCalled();
       expect(errorSpy).toHaveBeenCalled();
       errorSpy.mockRestore();
     });

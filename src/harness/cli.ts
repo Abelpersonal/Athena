@@ -2,6 +2,7 @@
 import "dotenv/config";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { createInterface } from "node:readline/promises";
 import { webSearch, closeWebSearch } from "../mcp/webSearch.js";
 import { run } from "../orchestrator/index.js";
 import { getLogPath } from "../orchestrator/logging.js";
@@ -18,6 +19,25 @@ import {
   createMockMaterialFetchAndClean,
   createMockBackfillSubtopic,
 } from "./mocks.js";
+import {
+  generateQuizQuestions,
+  scoreAndRecordQuiz,
+  ALL_QUIZ_TIERS,
+  QuizEngineError,
+  type QuizTier,
+  type QuizQuestion,
+  type QuizAnswer,
+} from "../quizEngine/index.js";
+import {
+  preparePracticeSession,
+  runDialogueTurn,
+  critiquePracticeAttempt,
+  generateReflectionPromptText,
+  recordPracticeAttempt,
+  PracticeEngineError,
+  type PracticeSession,
+  type DialogueHistoryEntry,
+} from "../practiceEngine/index.js";
 
 /**
  * Debugging CLI across Phases 1-6. Modes:
@@ -27,6 +47,15 @@ import {
  *   npm run harness -- research --dry-run "<topic>"  Phase 2 pipeline with mocked LLM/search/fetch (no API cost)
  *   npm run harness -- build "<topic>"               Phase 3: research -> Course Builder -> Material Aggregator, real APIs + real DB
  *   npm run harness -- build --dry-run "<topic>"      same, fully mocked (no API cost, writes to data/teacher.dry-run.db)
+ *   npm run harness -- quiz <lesson_id> [tier]        Phase 4: Quiz Engine, real APIs — CLI prompts, prints score + updated mastery state
+ *   npm run harness -- practice <module_id>           Phase 4: Practice Engine, real APIs — CLI (multi-turn for simulation/debate), prints critique + reflection + updated experience score
+ *
+ * quiz/practice have no --dry-run mode (unlike research/build) — they operate on
+ * lesson/module content that must already be persisted (from a prior research/build
+ * run), and their own LLM calls are cheap enough per-invocation that mocking them
+ * wasn't judged worth the added harness complexity. Their engine functions are still
+ * fully dependency-injectable (orchestratorRun/db) for unit tests — see tests/quizEngine.test.ts
+ * and tests/practiceEngine.test.ts.
  */
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -37,6 +66,14 @@ async function main(): Promise<void> {
   }
   if (args[0] === "build") {
     await runBuildCommand(args.slice(1));
+    return;
+  }
+  if (args[0] === "quiz") {
+    await runQuizCommand(args.slice(1));
+    return;
+  }
+  if (args[0] === "practice") {
+    await runPracticeCommand(args.slice(1));
     return;
   }
 
@@ -233,6 +270,217 @@ function printSummary(course: CourseJson, elapsedSeconds: string, outPath: strin
 
   if (!dryRun) {
     console.log(`\n[research-harness] JSONL log written to: ${getLogPath()}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: quiz [lesson_id] [tier]
+// ---------------------------------------------------------------------------
+
+async function collectMultilineInput(
+  rl: ReturnType<typeof createInterface>,
+  instructions: string
+): Promise<string> {
+  console.log(instructions);
+  const lines: string[] = [];
+  for (;;) {
+    const line = await rl.question("");
+    if (line.trim() === "/done") break;
+    lines.push(line);
+  }
+  return lines.join("\n").trim();
+}
+
+async function runQuizCommand(args: string[]): Promise<void> {
+  const [lessonId, tierArg] = args;
+  if (!lessonId) {
+    console.error("Usage: npm run harness -- quiz <lesson_id> [recall|application|transfer]");
+    process.exitCode = 1;
+    return;
+  }
+  if (tierArg && !ALL_QUIZ_TIERS.includes(tierArg as QuizTier)) {
+    console.error(`Invalid tier "${tierArg}". Must be one of: ${ALL_QUIZ_TIERS.join(", ")}.`);
+    process.exitCode = 1;
+    return;
+  }
+  const tiers: QuizTier[] = tierArg ? [tierArg as QuizTier] : ALL_QUIZ_TIERS;
+
+  const db = await getDb();
+  const onProgress = (message: string) => console.log(`[quiz-harness] ${message}`);
+
+  let questions: QuizQuestion[];
+  try {
+    questions = await generateQuizQuestions(lessonId, tiers, { db, onProgress });
+  } catch (error) {
+    if (error instanceof QuizEngineError) {
+      console.error(`\n[quiz-harness] ${error.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
+  }
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answers: QuizAnswer[] = [];
+  try {
+    for (let i = 0; i < questions.length; i++) {
+      const q = questions[i]!;
+      console.log(`\n[${i + 1}/${questions.length}] (${q.tier}) ${q.prompt}`);
+      if (q.type === "multiple_choice") {
+        q.options.forEach((opt, idx) => console.log(`  ${idx + 1}. ${opt}`));
+        let selectedIndex = Number.NaN;
+        while (!Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= q.options.length) {
+          const raw = await rl.question(`Your answer (1-${q.options.length}): `);
+          selectedIndex = Number(raw.trim()) - 1;
+        }
+        answers.push({ questionId: q.id, answer: selectedIndex });
+      } else {
+        const raw = await rl.question("Your answer: ");
+        answers.push({ questionId: q.id, answer: raw.trim() });
+      }
+    }
+  } finally {
+    rl.close();
+  }
+
+  const result = await scoreAndRecordQuiz(lessonId, questions, answers, { db, onProgress });
+
+  console.log(`\n[quiz-harness] Results for lesson ${lessonId}:`);
+  for (const [tier, score] of Object.entries(result.tierScores)) {
+    console.log(`  ${tier}: ${(score as number).toFixed(2)}`);
+  }
+  console.log(`  overall: ${result.overallScore.toFixed(2)}`);
+  console.log(
+    `\n[quiz-harness] Updated MasteryState — concept_node_id: ${result.masteryState.conceptNodeId}, ` +
+      `knowledge_score: ${result.masteryState.knowledgeScore?.toFixed(2)}, ` +
+      `experience_score: ${result.masteryState.experienceScore ?? "(untouched)"}, ` +
+      `last_updated: ${result.masteryState.lastUpdated}`
+  );
+  if (result.weakConceptNodes.length > 0) {
+    console.log(`[quiz-harness] Weak concept node(s) flagged: ${result.weakConceptNodes.join(", ")}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: practice [module_id]
+// ---------------------------------------------------------------------------
+
+function describePracticeContent(session: PracticeSession): void {
+  console.log(`\n[practice-harness] topic_type: ${session.topicType} (${session.topicTypeJustification})`);
+  console.log(`[practice-harness] format: ${session.format} (${session.formatJustification})`);
+  console.log(`[practice-harness] attempt: ${session.attemptNumber}, difficulty: ${session.difficulty}`);
+  if (session.priorMistakes) {
+    console.log(`[practice-harness] targeting recurring mistake(s) from the last attempt: ${session.priorMistakes}`);
+  }
+  if (session.format === "project" && session.project) {
+    console.log(`\nTask: ${session.project.task}`);
+    console.log(`\nStarting material:\n${session.project.datasetOrPrompt}`);
+    console.log(`\nExpected deliverable: ${session.project.deliverableExpectations}`);
+  } else if (session.format === "simulation" && session.simulation) {
+    console.log(`\nScenario: ${session.simulation.scenario}`);
+    console.log(`Counterpart: ${session.simulation.personaName} (${session.simulation.personaRole})`);
+  } else if (session.format === "debate" && session.debate) {
+    console.log(`\nContested claim: ${session.debate.claim}`);
+    console.log(`Your assigned position: ${session.debate.userPosition}`);
+  }
+}
+
+async function runDialogueLoop(
+  rl: ReturnType<typeof createInterface>,
+  session: PracticeSession,
+  openingLine: string,
+  onProgress: (message: string) => void
+): Promise<string> {
+  const MAX_USER_TURNS = 8;
+  const history: DialogueHistoryEntry[] = [{ speaker: "ai", text: openingLine }];
+  console.log(`\n${session.format === "simulation" ? session.simulation!.personaName : "Opponent"}: ${openingLine}`);
+  console.log('(Type your reply each turn. Type "/end" on its own line to finish the dialogue.)');
+
+  for (let turn = 0; turn < MAX_USER_TURNS; turn++) {
+    const userInput = await rl.question("\nYou: ");
+    if (userInput.trim() === "/end") break;
+
+    const priorHistory = [...history];
+    const reply = await runDialogueTurn(session, priorHistory, userInput, { onProgress });
+    history.push({ speaker: "user", text: userInput }, { speaker: "ai", text: reply });
+    console.log(`\n${session.format === "simulation" ? session.simulation!.personaName : "Opponent"}: ${reply}`);
+
+    if (turn === MAX_USER_TURNS - 1) {
+      console.log(`\n(Reached the ${MAX_USER_TURNS}-turn safety cap — ending the dialogue here.)`);
+    }
+  }
+
+  return history.map((h) => `${h.speaker === "user" ? "Learner" : "Counterpart"}: ${h.text}`).join("\n");
+}
+
+async function runPracticeCommand(args: string[]): Promise<void> {
+  const moduleId = args[0];
+  if (!moduleId) {
+    console.error("Usage: npm run harness -- practice <module_id>");
+    process.exitCode = 1;
+    return;
+  }
+
+  const db = await getDb();
+  const onProgress = (message: string) => console.log(`[practice-harness] ${message}`);
+
+  let session: PracticeSession;
+  try {
+    session = await preparePracticeSession(moduleId, { db, onProgress });
+  } catch (error) {
+    if (error instanceof PracticeEngineError) {
+      console.error(`\n[practice-harness] ${error.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
+  }
+
+  describePracticeContent(session);
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  let userOutput: string;
+  try {
+    if (session.format === "project") {
+      userOutput = await collectMultilineInput(
+        rl,
+        '\nType your submission. End with a line containing only "/done".'
+      );
+    } else {
+      const openingLine =
+        session.format === "simulation" ? session.simulation!.openingLine : session.debate!.openingArgument;
+      userOutput = await runDialogueLoop(rl, session, openingLine, onProgress);
+    }
+
+    console.log("\n[practice-harness] Generating critique...");
+    const { critique, performanceScore } = await critiquePracticeAttempt(session, userOutput, { onProgress });
+    console.log(`\nCritique:\n${critique}`);
+    console.log(`\nPerformance score: ${performanceScore.toFixed(2)}`);
+
+    const reflectionPrompt = await generateReflectionPromptText(session, critique, { onProgress });
+    const reflectionNotes = await collectMultilineInput(
+      rl,
+      `\nReflection prompt: ${reflectionPrompt}\n(Type your reflection. End with a line containing only "/done".)`
+    );
+
+    const recorded = await recordPracticeAttempt(session, critique, reflectionNotes, performanceScore, {
+      db,
+      onProgress,
+    });
+
+    console.log(
+      `\n[practice-harness] Recorded PracticeAttempt ${recorded.attemptId} (attempt ${recorded.attemptNumber}, type: ${session.format}).`
+    );
+    console.log(
+      `[practice-harness] Updated MasteryState.experience_score = ${performanceScore.toFixed(2)} for lesson(s): ${recorded.updatedLessonIds.join(", ")}`
+    );
+    console.log(
+      recorded.willEscalateNextAttempt
+        ? "[practice-harness] Next attempt on this module will be generated at a harder difficulty, incorporating this attempt's critique."
+        : "[practice-harness] Escalation cap reached — future attempts on this module stay at novel_unguided difficulty."
+    );
+  } finally {
+    rl.close();
   }
 }
 

@@ -3,7 +3,7 @@ import "dotenv/config";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/client.js";
-import { courses, modules, lessons, sources } from "../db/schema.js";
+import { courses, modules, lessons, sources, quizResults, practiceAttempts, masteryState } from "../db/schema.js";
 
 /**
  * Dumps a persisted course's structure from SQLite — modules in persisted
@@ -63,6 +63,32 @@ async function main(): Promise<void> {
           lesson.sourceStatus === "below_threshold" ? " [BELOW_THRESHOLD]" : ""
         }`
       );
+
+      const lessonQuizResults = await db.select().from(quizResults).where(eq(quizResults.lessonId, lesson.id));
+      for (const qr of lessonQuizResults) {
+        console.log(`      QuizResult ${qr.id} — tier: ${qr.tier}, score: ${qr.score.toFixed(2)}, date: ${qr.date}`);
+      }
+
+      const [mastery] = await db.select().from(masteryState).where(eq(masteryState.conceptNodeId, lesson.id));
+      if (mastery) {
+        console.log(
+          `      MasteryState (concept_node_id: ${mastery.conceptNodeId}) — knowledge_score: ` +
+            `${mastery.knowledgeScore ?? "(none yet)"}, experience_score: ${mastery.experienceScore ?? "(none yet)"}, ` +
+            `last_updated: ${mastery.lastUpdated}`
+        );
+      }
+    }
+
+    const modulePracticeAttempts = await db
+      .select()
+      .from(practiceAttempts)
+      .where(eq(practiceAttempts.moduleId, mod.id));
+    for (const pa of modulePracticeAttempts) {
+      console.log(
+        `    PracticeAttempt ${pa.id} — type: ${pa.type}, attempt #${pa.attemptNumber}, date: ${pa.date}`
+      );
+      console.log(`      feedback: ${pa.feedback}`);
+      if (pa.reflectionNotes) console.log(`      reflection_notes: ${pa.reflectionNotes}`);
     }
   }
 
