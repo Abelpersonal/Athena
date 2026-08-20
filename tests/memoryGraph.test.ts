@@ -17,9 +17,8 @@ vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
 }));
 
 const { GraphitiMCPClient } = await import("../src/memoryGraph/graphitiClient.js");
-const { writeTopic, writeSubtopicFacts, getTopicHistory, writeMasteryUpdate } = await import(
-  "../src/memoryGraph/index.js"
-);
+const { writeTopic, writeSubtopicFacts, getTopicHistory, writeMasteryUpdate, supersedeFact, getCrossCourseConnections } =
+  await import("../src/memoryGraph/index.js");
 
 function toolResult(data: unknown): { isError: false; content: Array<{ type: "text"; text: string }> } {
   return { isError: false, content: [{ type: "text", text: JSON.stringify(data) }] };
@@ -279,6 +278,109 @@ describe("memoryGraph", () => {
       const history = await getTopicHistory("Anything", client);
 
       expect(history).toEqual({ nodes: [], facts: [], episodes: [], error: expect.any(String) });
+    });
+  });
+
+  describe("supersedeFact (Phase 6)", () => {
+    it("calls add_triplet with the new claim, a stable topic-scoped target node, and the old claim referenced for audit/semantic-search purposes", async () => {
+      mockCallTool.mockResolvedValue(toolResult({ message: "ok", nodes: [], edges: [] }));
+      const client = new GraphitiMCPClient();
+
+      await supersedeFact("Python", "Python 2 is still widely used.", "Python 2 reached end-of-life in 2020.", client);
+
+      expect(mockCallTool).toHaveBeenCalledTimes(1);
+      const call = mockCallTool.mock.calls[0]![0];
+      expect(call).toMatchObject({
+        name: "add_triplet",
+        arguments: {
+          source_node_name: "Python",
+          edge_name: "HAS_FACT",
+          target_node_name: "Python — current facts",
+        },
+      });
+      // Never a hard delete — supersession must go through add_triplet's contradiction resolution.
+      expect(mockCallTool.mock.calls.every((c) => c[0].name !== "delete_entity_edge")).toBe(true);
+      expect(call.arguments.fact).toContain("Python 2 reached end-of-life in 2020.");
+      expect(call.arguments.fact).toContain("Python 2 is still widely used.");
+    });
+
+    it("reuses the SAME target node name across repeated calls for one topic, so Graphiti's node-pair search finds every prior fact as an invalidation candidate", async () => {
+      mockCallTool.mockResolvedValue(toolResult({ message: "ok", nodes: [], edges: [] }));
+      const client = new GraphitiMCPClient();
+
+      await supersedeFact("Rust", "Old claim A.", "New claim A.", client);
+      await supersedeFact("Rust", "Old claim B.", "New claim B.", client);
+
+      const targets = mockCallTool.mock.calls.map((c) => c[0].arguments.target_node_name);
+      expect(new Set(targets).size).toBe(1);
+    });
+
+    it("degrades gracefully (resolves, logs) when the graph server is unreachable", async () => {
+      mockConnect.mockRejectedValue(new Error("ECONNREFUSED"));
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const client = new GraphitiMCPClient();
+
+      await expect(supersedeFact("Topic", "old", "new", client)).resolves.toBeUndefined();
+
+      expect(mockCallTool).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+  });
+
+  describe("getCrossCourseConnections (Phase 6)", () => {
+    it("extracts connected topic names from REQUIRES_PREREQUISITE-shaped fact text, in either direction", async () => {
+      mockCallTool.mockResolvedValue(
+        toolResult({
+          message: "ok",
+          facts: [
+            {
+              uuid: "e1",
+              name: "REQUIRES_PREREQUISITE",
+              fact: '"Special Relativity" requires prior knowledge of "Algebra".',
+              source_node_uuid: "n1",
+              target_node_uuid: "n2",
+              group_id: "main",
+              created_at: null,
+              valid_at: null,
+              invalid_at: null,
+            },
+            {
+              uuid: "e2",
+              name: "REQUIRES_PREREQUISITE",
+              fact: '"General Relativity" requires prior knowledge of "Special Relativity".',
+              source_node_uuid: "n3",
+              target_node_uuid: "n1",
+              group_id: "main",
+              created_at: null,
+              valid_at: null,
+              invalid_at: null,
+            },
+          ],
+        })
+      );
+      const client = new GraphitiMCPClient();
+
+      const result = await getCrossCourseConnections("Special Relativity", client);
+
+      expect(result.error).toBeUndefined();
+      expect(new Set(result.connectedTopics)).toEqual(new Set(["Algebra", "General Relativity"]));
+    });
+
+    it("returns an empty array (not a throw) when no facts mention the topic", async () => {
+      mockCallTool.mockResolvedValue(toolResult({ message: "ok", facts: [] }));
+      const client = new GraphitiMCPClient();
+
+      const result = await getCrossCourseConnections("Unconnected Topic", client);
+      expect(result).toEqual({ connectedTopics: [] });
+    });
+
+    it("degrades gracefully (returns an error field, not a throw) when the graph is unreachable", async () => {
+      mockConnect.mockRejectedValue(new Error("ECONNREFUSED"));
+      const client = new GraphitiMCPClient();
+
+      const result = await getCrossCourseConnections("Anything", client);
+      expect(result).toEqual({ connectedTopics: [], error: expect.any(String) });
     });
   });
 });

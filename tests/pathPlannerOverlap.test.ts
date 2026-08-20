@@ -58,12 +58,12 @@ describe("decideOverlapBranch (pure)", () => {
   });
 
   it("fresh_high_score: high score, angle-compatible, within the volatility-tier recheck window", () => {
-    const c = candidate({ volatilityTier: "medium", lastUpdated: daysAgo(10) }); // medium window default: 90 days
+    const c = candidate({ volatilityTier: "medium", lastUpdated: daysAgo(10) }); // medium window default: 60 days
     expect(decideOverlapBranch(c, "Goal X", NOW)).toEqual({ kind: "fresh_high_score", courseId: "crs_1" });
   });
 
   it("stale_needs_refresh: high score, angle-compatible, but past the volatility-tier recheck window", () => {
-    const c = candidate({ volatilityTier: "fast", lastUpdated: daysAgo(45) }); // fast window default: 30 days
+    const c = candidate({ volatilityTier: "fast", lastUpdated: daysAgo(45) }); // fast window default: 14 days
     const result = decideOverlapBranch(c, "Goal X", NOW);
     expect(result.kind).toBe("stale_needs_refresh");
     if (result.kind === "stale_needs_refresh") {
@@ -83,9 +83,9 @@ describe("decideOverlapBranch (pure)", () => {
     expect(decideOverlapBranch(c, "Goal X", NOW, { highScoreThreshold: 0.4 }).kind).toBe("fresh_high_score");
   });
 
-  it("resolved defaults match the PRD's documented values", () => {
+  it("resolved defaults match the PRD's documented values (recheck window now sourced from Phase 6's shared getRecheckIntervalDays)", () => {
     expect(DEFAULT_HIGH_SCORE_THRESHOLD).toBe(0.75);
-    expect(DEFAULT_RECHECK_WINDOW_DAYS).toEqual({ fast: 30, medium: 90, slow: 180, mixed: 90 });
+    expect(DEFAULT_RECHECK_WINDOW_DAYS).toEqual({ fast: 14, medium: 60, slow: 180, mixed: 60 });
   });
 });
 

@@ -5,6 +5,9 @@ import type { CleanedContent } from "../extraction/fetchAndClean.js";
 import type { SourceRecord } from "../research/types.js";
 import type { BackfillSubtopicFn } from "../materialAggregator/index.js";
 import { slugify } from "../shared/ids.js";
+import type { OpenLibraryBookResult } from "../mcp/openLibrary.js";
+import type { GutenbergMatch } from "../mcp/gutenberg.js";
+import type { SearchOpenLibraryFn, CheckGutenbergFn } from "../continuousLearning/index.js";
 
 /**
  * Canned dependencies for `npm run harness -- research --dry-run "<topic>"`.
@@ -188,12 +191,99 @@ export function createMockOrchestratorRun(): OrchestratorRunFn {
         });
       }
 
+      case "generate_book_candidates":
+        // Deliberately constructed (Phase 6 demo): one verifiable candidate and one
+        // "Unverifiable" one, so `suggest --dry-run` (with createMockOpenLibraryProvider below)
+        // visibly demonstrates BOTH the persisted-and-verified path and the
+        // dropped-as-unverified path, not just the happy path.
+        return respond({
+          candidates: [
+            { title: "Mock Foundational Book", author: "Mock Author", category: "core", rationale: "Mock rationale for the core recommendation." },
+            {
+              title: "Mock Unverifiable Book (forces the rejection path)",
+              author: "Nobody",
+              category: "optional_deep_dive",
+              rationale: "Demonstrates a candidate that fails Open Library verification and is dropped, never persisted.",
+            },
+          ],
+        });
+
+      case "infer_course_domain":
+        return respond({ domain: "Mock Domain" });
+
+      case "generate_next_topic_suggestions":
+        return respond({
+          deepen: {
+            topicName: "Mock Deepen Topic",
+            description: "Mock canned deepen suggestion — the natural next step in the same domain.",
+            rationale: "Mock rationale for staying in this domain.",
+          },
+          branch: {
+            topicName: "Mock Branch Topic",
+            description: "Mock canned branch suggestion — an adjacent or novel domain.",
+            domain: "Mock Adjacent Domain",
+            rationale: "Mock rationale for branching out.",
+          },
+        });
+
+      case "generate_recheck_queries":
+        return respond({ queries: ["mock recheck query one", "mock recheck query two"] });
+
+      case "compare_findings_to_facts": {
+        // Deliberately constructed (Phase 6 demo): cycles through all three real severities
+        // (one delta per lesson, up to 3) so a dry run visibly demonstrates minor/moderate/major
+        // routing, not just the happy (no-delta) path.
+        const lessonsCtx = (context.lessons as Array<{ id: string; title: string }>) ?? [];
+        const severities = ["minor", "moderate", "major"] as const;
+        const deltas = lessonsCtx.slice(0, 3).map((lesson, i) => ({
+          existingFactSummary: `Mock existing fact for "${lesson.title}".`,
+          newFindingSummary: `Mock updated finding for "${lesson.title}".`,
+          severity: severities[i] ?? "minor",
+          explanation: `Mock ${severities[i] ?? "minor"}-severity delta for "${lesson.title}", for dry-run wiring checks.`,
+          relatedLessonId: lesson.id,
+        }));
+        return respond({ deltas });
+      }
+
+      case "generate_update_lesson":
+        return respond({
+          title: "Mock Update: something changed",
+          whatChanged: "Mock canned description of what changed, standing in for a real delta explanation.",
+          updatedGuidance: "Mock canned corrected guidance for the learner.",
+        });
+
       default:
         throw new Error(`[dry-run mock] No canned response registered for task type "${taskType}".`);
     }
   }
 
   return mockRun;
+}
+
+/**
+ * Canned BookAvailabilityProvider for `npm run harness -- suggest --dry-run <course_id>`.
+ * Rejects any title containing "Unverifiable" (see createMockOrchestratorRun's
+ * generate_book_candidates case above) so the dry run visibly demonstrates the real
+ * "candidate found by the model but not confirmed on Open Library -> dropped, never persisted"
+ * path, not just the happy path.
+ */
+export function createMockOpenLibraryProvider(): SearchOpenLibraryFn {
+  return async (title: string, author?: string): Promise<OpenLibraryBookResult[]> => {
+    if (title.includes("Unverifiable")) return [];
+    return [{ title, author: author ?? "Mock Author", workId: "OL_MOCK_1W", editionCount: 5, firstPublishYear: 2020 }];
+  };
+}
+
+/**
+ * Canned FreeTextAvailabilityProvider for the same dry run — reports a free full text ONLY for
+ * "Mock Foundational Book", so the demo shows both the "Gutenberg confirmed" and "not on
+ * Gutenberg" branches rather than always taking one.
+ */
+export function createMockGutenbergProvider(): CheckGutenbergFn {
+  return async (title: string): Promise<GutenbergMatch | null> => {
+    if (title !== "Mock Foundational Book") return null;
+    return { gutenbergId: 1, title, url: "https://www.gutenberg.org/ebooks/1" };
+  };
 }
 
 /**

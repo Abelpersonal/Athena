@@ -5,9 +5,10 @@ import { getDb, type TeacherDb } from "../db/client.js";
 import { courses, modules, lessons, masteryState } from "../db/schema.js";
 import { getTopicHistory as getTopicHistoryDefault } from "../memoryGraph/index.js";
 import type { TopicHistoryResult } from "../memoryGraph/index.js";
+import { DEFAULT_RECHECK_INTERVAL_DAYS, type VolatilityTier } from "../shared/recheckInterval.js";
 
 export type OrchestratorRunFn = typeof orchestratorRun;
-export type VolatilityTier = "fast" | "medium" | "slow" | "mixed";
+export type { VolatilityTier } from "../shared/recheckInterval.js";
 
 /**
  * Overlap detection (Phase 5, Deliverable 3). For each PathTopic, before any
@@ -133,18 +134,16 @@ export function createGetExistingLessonTitles(db: TeacherDb): (courseId: string)
 export const DEFAULT_HIGH_SCORE_THRESHOLD = Number(process.env.PATH_HIGH_SCORE_THRESHOLD ?? 0.75);
 
 /**
- * "Past volatility recheck window" default, per the PRD's resolved default:
- * a simple date check (last_updated older than a volatility-tier-based
- * interval) rather than blocking on Phase 6's Knowledge Update Agent
- * recheck-scheduling logic, which doesn't exist yet — Phase 6 will formalize
- * this later.
+ * "Past volatility recheck window" default, per the PRD's resolved default: a simple date check
+ * (last_updated older than a volatility-tier-based interval). Phase 5 originally defined its own
+ * stopgap copy of this map (30/90/180/90 days) while waiting for Phase 6 to formalize the real
+ * interval logic; it now defers entirely to Phase 6's shared getRecheckIntervalDays()
+ * (src/shared/recheckInterval.ts, defaults 14/60/180/60) so the two phases can't drift into
+ * inconsistent definitions of "stale." Kept as a same-shaped export (now sourced from the shared
+ * module) so existing callers/tests that reference DEFAULT_RECHECK_WINDOW_DAYS don't need to change
+ * their import path.
  */
-export const DEFAULT_RECHECK_WINDOW_DAYS: Record<VolatilityTier, number> = {
-  fast: Number(process.env.PATH_RECHECK_WINDOW_DAYS_FAST ?? 30),
-  medium: Number(process.env.PATH_RECHECK_WINDOW_DAYS_MEDIUM ?? 90),
-  slow: Number(process.env.PATH_RECHECK_WINDOW_DAYS_SLOW ?? 180),
-  mixed: Number(process.env.PATH_RECHECK_WINDOW_DAYS_MIXED ?? 90),
-};
+export const DEFAULT_RECHECK_WINDOW_DAYS: Record<VolatilityTier, number> = DEFAULT_RECHECK_INTERVAL_DAYS;
 
 export interface OverlapThresholds {
   highScoreThreshold?: number;

@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import {
   generateQuizQuestions,
   scoreAndRecordQuiz,
+  checkAndMarkCourseCompletion,
   QuizEngineError,
   ALL_QUIZ_TIERS,
   type QuizQuestion,
@@ -317,5 +318,132 @@ describe("scoreAndRecordQuiz", () => {
     expect(calls[0]!.conceptNodeId).toBe(lessonId);
     expect(calls[0]!.scoreType).toBe("knowledge");
     expect(calls[0]!.score).toBeCloseTo((1 + 1 + 0.9 + 0.9) / 4);
+  });
+});
+
+describe("checkAndMarkCourseCompletion (Phase 6 completion trigger)", () => {
+  beforeEach(() => {
+    resetDbCache();
+  });
+
+  /** A two-lesson course, so completion genuinely requires BOTH lessons covered, not just one. */
+  async function seedTwoLessonCourse(db: TeacherDb): Promise<{ courseId: string; lessonId1: string; lessonId2: string }> {
+    const courseId = "crs_completion_test";
+    const moduleId = "mod_completion_test";
+    const lessonId1 = "lsn_completion_1";
+    const lessonId2 = "lsn_completion_2";
+    await db.insert(courses).values({
+      id: courseId,
+      topic: "Completion Test Topic",
+      createdAt: new Date().toISOString(),
+      volatilityTier: "medium",
+      status: "complete",
+    });
+    await db.insert(modules).values({ id: moduleId, courseId, title: "M", description: "d", order: 0, prerequisiteOf: [] });
+    for (const lessonId of [lessonId1, lessonId2]) {
+      await db.insert(lessons).values({
+        id: lessonId,
+        moduleId,
+        title: `Lesson ${lessonId}`,
+        description: "d",
+        estimatedDuration: "5 min",
+        layers: {
+          intuition: { text: "t", source_ids: [] },
+          mechanics: { text: "t", source_ids: [] },
+          formal: { text: "t", source_ids: [] },
+          application: { text: "t", source_ids: [] },
+          frontier: { text: "t", source_ids: [] },
+        },
+        sourceRefs: [],
+        sourceStatus: "ok",
+      });
+    }
+    return { courseId, lessonId1, lessonId2 };
+  }
+
+  async function insertQuizResult(db: TeacherDb, lessonId: string, tier: (typeof ALL_QUIZ_TIERS)[number]): Promise<void> {
+    await db.insert(quizResults).values({
+      id: `qr_${lessonId}_${tier}`,
+      lessonId,
+      tier,
+      score: 0.9,
+      date: new Date().toISOString(),
+    });
+  }
+
+  it("returns null and leaves completedAt untouched when only one lesson has full tier coverage", async () => {
+    const db = await getDb(":memory:");
+    const { courseId, lessonId1 } = await seedTwoLessonCourse(db);
+    for (const tier of ALL_QUIZ_TIERS) await insertQuizResult(db, lessonId1, tier);
+
+    const result = await checkAndMarkCourseCompletion(lessonId1, db);
+    expect(result).toBeNull();
+
+    const [course] = await db.select().from(courses).where(eq(courses.id, courseId));
+    expect(course!.completedAt).toBeNull();
+  });
+
+  it("returns null when a lesson has some but not all three tiers covered", async () => {
+    const db = await getDb(":memory:");
+    const { lessonId1, lessonId2 } = await seedTwoLessonCourse(db);
+    for (const tier of ALL_QUIZ_TIERS) await insertQuizResult(db, lessonId1, tier);
+    await insertQuizResult(db, lessonId2, "recall");
+    await insertQuizResult(db, lessonId2, "application"); // missing "transfer"
+
+    expect(await checkAndMarkCourseCompletion(lessonId2, db)).toBeNull();
+  });
+
+  it("returns the course id and sets completedAt once every lesson has all three tiers covered", async () => {
+    const db = await getDb(":memory:");
+    const { courseId, lessonId1, lessonId2 } = await seedTwoLessonCourse(db);
+    for (const lessonId of [lessonId1, lessonId2]) {
+      for (const tier of ALL_QUIZ_TIERS) await insertQuizResult(db, lessonId, tier);
+    }
+
+    const result = await checkAndMarkCourseCompletion(lessonId2, db);
+    expect(result).toBe(courseId);
+
+    const [course] = await db.select().from(courses).where(eq(courses.id, courseId));
+    expect(course!.completedAt).not.toBeNull();
+  });
+
+  it("does not re-stamp or re-fire an already-completed course", async () => {
+    const db = await getDb(":memory:");
+    const { courseId, lessonId1, lessonId2 } = await seedTwoLessonCourse(db);
+    for (const lessonId of [lessonId1, lessonId2]) {
+      for (const tier of ALL_QUIZ_TIERS) await insertQuizResult(db, lessonId, tier);
+    }
+    const first = await checkAndMarkCourseCompletion(lessonId1, db);
+    expect(first).toBe(courseId);
+
+    const second = await checkAndMarkCourseCompletion(lessonId1, db);
+    expect(second).toBeNull();
+  });
+
+  it("scoreAndRecordQuiz surfaces courseCompleted only on the call that actually flips it", async () => {
+    const db = await getDb(":memory:");
+    const { lessonId1, lessonId2 } = await seedTwoLessonCourse(db);
+    // Pre-seed lesson 2 with full tier coverage so lesson 1's quiz is the one that completes the course.
+    for (const tier of ALL_QUIZ_TIERS) await insertQuizResult(db, lessonId2, tier);
+
+    const questions: QuizQuestion[] = ALL_QUIZ_TIERS.map((tier) => ({
+      id: `q-${tier}`,
+      tier,
+      type: "multiple_choice",
+      prompt: "p",
+      options: ["a", "b"],
+      correctOptionIndex: 0,
+    }));
+    const answers: QuizAnswer[] = questions.map((q) => ({ questionId: q.id, answer: 0 }));
+
+    const result = await scoreAndRecordQuiz(lessonId1, questions, answers, {
+      db,
+      orchestratorRun: (async () => {
+        throw new Error("should not be called — no free_text questions in this test");
+      }) as never,
+      writeMasteryUpdate: async () => {},
+    });
+
+    expect(result.courseCompleted).toBeDefined();
   });
 });

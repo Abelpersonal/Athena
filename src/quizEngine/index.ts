@@ -4,7 +4,7 @@ import { run as orchestratorRun } from "../orchestrator/index.js";
 import type { QuizQuestionsOutput } from "../orchestrator/templates/generateRecallQuestions.js";
 import type { ScoreFreeTextAnswerOutput } from "../orchestrator/templates/scoreFreeTextAnswer.js";
 import { getDb, type TeacherDb } from "../db/client.js";
-import { lessons, quizResults, masteryState } from "../db/schema.js";
+import { lessons, modules, courses, quizResults, masteryState } from "../db/schema.js";
 import { writeMasteryUpdate as writeMasteryUpdateDefault } from "../memoryGraph/index.js";
 
 export type OrchestratorRunFn = typeof orchestratorRun;
@@ -57,6 +57,13 @@ export interface QuizSessionResult {
   /** [] or [lessonId] under the current concept_node_id = lesson_id granularity — see README. */
   weakConceptNodes: string[];
   masteryState: { conceptNodeId: string; knowledgeScore: number | null; experienceScore: number | null; lastUpdated: string };
+  /**
+   * Phase 6: set to the course id ONLY when THIS quiz session is what just flipped
+   * courses.completedAt from null — i.e. every lesson in the course now has a QuizResult across
+   * all three tiers, and it didn't before this session. undefined otherwise (course already
+   * complete, or still incomplete). See checkAndMarkCourseCompletion below.
+   */
+  courseCompleted?: string;
 }
 
 /** 0-1 continuous score scale for both knowledgeScore and experienceScore (resolved default, see README). */
@@ -140,6 +147,43 @@ export async function generateQuizQuestions(
 }
 
 /**
+ * Phase 6: the completion trigger. Default: a course is complete once every lesson under it has
+ * at least one QuizResult across all three tiers (recall/application/transfer) — checked after
+ * each quiz submission (called from scoreAndRecordQuiz below), not on a manual flag. Returns the
+ * course id ONLY when this call is what just flipped it (courses.completedAt was null and is now
+ * set) — an already-complete course, or one still missing tier coverage on some lesson, returns
+ * null. This is what actually fires the Continuous Learning Agent's trigger (see
+ * src/continuousLearning/index.ts) — `npm run harness -- suggest <course_id>` is still a manual
+ * invocation in v1 (no Motivation Layer/notifications yet — see the Phase 6 scope boundary), but
+ * the trigger condition itself is real, not a stub.
+ */
+export async function checkAndMarkCourseCompletion(lessonId: string, db: TeacherDb): Promise<string | null> {
+  const [lesson] = await db.select().from(lessons).where(eq(lessons.id, lessonId));
+  if (!lesson) return null;
+  const [module] = await db.select().from(modules).where(eq(modules.id, lesson.moduleId));
+  if (!module) return null;
+  const [course] = await db.select().from(courses).where(eq(courses.id, module.courseId));
+  if (!course || course.completedAt !== null) return null;
+
+  const courseModules = await db.select().from(modules).where(eq(modules.courseId, course.id));
+  const courseLessons: (typeof lessons.$inferSelect)[] = [];
+  for (const m of courseModules) {
+    courseLessons.push(...(await db.select().from(lessons).where(eq(lessons.moduleId, m.id))));
+  }
+  if (courseLessons.length === 0) return null;
+
+  for (const l of courseLessons) {
+    const rows = await db.select().from(quizResults).where(eq(quizResults.lessonId, l.id));
+    const tiersCovered = new Set(rows.map((r) => r.tier));
+    if (!ALL_QUIZ_TIERS.every((tier) => tiersCovered.has(tier))) return null;
+  }
+
+  const now = new Date().toISOString();
+  await db.update(courses).set({ completedAt: now }).where(eq(courses.id, course.id));
+  return course.id;
+}
+
+/**
  * Quiz Engine steps 3-5: score every answer — objective questions in code,
  * free-text questions via a semantic (not keyword-match) Orchestrator call —
  * write one QuizResult row per tier tested, update
@@ -218,5 +262,18 @@ export async function scoreAndRecordQuiz(
     );
   }
 
-  return { lessonId, tierScores, overallScore, questionResults, weakConceptNodes, masteryState: updatedMastery! };
+  const courseCompleted = (await checkAndMarkCourseCompletion(lessonId, db)) ?? undefined;
+  if (courseCompleted) {
+    onProgress?.(`Course ${courseCompleted} marked complete — every lesson now has quiz results across all three tiers.`);
+  }
+
+  return {
+    lessonId,
+    tierScores,
+    overallScore,
+    questionResults,
+    weakConceptNodes,
+    masteryState: updatedMastery!,
+    ...(courseCompleted ? { courseCompleted } : {}),
+  };
 }

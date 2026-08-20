@@ -8,6 +8,7 @@
     "harness": "tsx src/harness/cli.ts",
     "inspect": "tsx src/harness/inspect.ts",
     "inspect-graph": "tsx src/harness/inspectGraph.ts",
+    "knowledge-update": "tsx src/knowledgeUpdate/cli.ts",
     "db:generate": "drizzle-kit generate",
     "test": "vitest run",
     "test:watch": "vitest",

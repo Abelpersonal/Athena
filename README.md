@@ -178,7 +178,9 @@ Teacher's own `.env` (repo root):
 | `QUIZ_WEAK_CONCEPT_THRESHOLD` | No | `0.6` | Below this `knowledge_score`, a concept node is surfaced in `weakConceptNodes` (Phase 4; not load-bearing yet — see "The Quiz/Assessment Engine" below). |
 | `PRACTICE_ESCALATION_CAP` | No | `3` | Max attempts per module before the Practice Engine stops auto-generating harder variants (the cap'th attempt, and every attempt after it, stays at `novel_unguided`). |
 | `PATH_HIGH_SCORE_THRESHOLD` | No | `0.75` | Overlap detection (Phase 5): `knowledge_score` at or above this counts as "mastered, high score." |
-| `PATH_RECHECK_WINDOW_DAYS_FAST` / `_MEDIUM` / `_SLOW` / `_MIXED` | No | `30` / `90` / `180` / `90` | Overlap detection (Phase 5): a matched course's mastery is "fresh" within this many days (by its volatility tier) — past it, a quick_refresh_check LLM call runs instead of reusing blindly. |
+| `RECHECK_INTERVAL_DAYS_FAST` / `_MEDIUM` / `_SLOW` / `_MIXED` | No | `14` / `60` / `180` / `60` | Phase 6's formalized recheck interval (`getRecheckIntervalDays`, `src/shared/recheckInterval.ts`), shared by Phase 5's overlap detection AND Phase 6's Knowledge Update Agent due-topic selection. Renamed from Phase 5's stopgap `PATH_RECHECK_WINDOW_DAYS_*` (old defaults 30/90/180/90) now that the concept is no longer Phase-5-specific. |
+| `DIVERSITY_WINDOW_N` | No | `5` | Continuous Learning Agent (Phase 6): how many recent completed courses' domains to check for clustering. |
+| `DIVERSITY_CLUSTER_THRESHOLD` | No | `0.6` | Continuous Learning Agent (Phase 6): the top domain's share (of the diversity window) at/above which the branch suggestion is biased toward diversity. |
 
 `mcp_server/.env` (separate file, the Graphiti service's own config — not read by Teacher's Node
 process at all):
@@ -240,6 +242,22 @@ npm run harness -- practice <module_id>
 # MasteryState/the Memory Graph, prints the annotated roadmap, then loops letting you pick a
 # generatable pending/delta_needed topic to generate next (looping back to the roadmap after each).
 npm run harness -- goal "<input>"
+
+# Phase 6: the Continuous Learning Agent — only runs on a course already marked complete
+# (courses.completedAt set by real quiz activity, see "Completion trigger" below). Verifies every
+# book candidate via Open Library/Gutenberg before persisting it; prints a deepen + a branch
+# next-topic suggestion (never persisted — recomputed fresh every run).
+npm run harness -- suggest <course_id>
+npm run harness -- suggest --dry-run <course_id>
+
+# Phase 6: the "what's new" digest — reads whatever `npm run knowledge-update` has already written.
+npm run harness -- whats-new
+npm run harness -- whats-new --include-minor
+
+# Phase 6: the Knowledge Update Agent's standalone scheduled-job script (see its own section below
+# for the full writeup and a crontab wiring example) — NOT a harness subcommand, its own npm script.
+npm run knowledge-update
+npm run knowledge-update -- --dry-run
 ```
 
 The Phase 1 form prints a structured, schema-checked `summarize_text` result plus the JSONL log
@@ -1414,6 +1432,376 @@ list in "The real-run blocker" above applies unchanged.
   scope boundary (see the kickoff prompt): adding source diversity and proving the multi-pass
   synthesis loop are separable problems, and conflating them would have made it harder to tell
   whether a weak result was a synthesis problem or a sourcing problem.
+
+## Phase 6: the Continuous Learning Agent and the Knowledge Update Agent
+
+Phases 1-5 generate, persist, test, and roadmap learning content. Phase 6 adds the two agents that
+make the system feel alive after a course is done, rather than static: the **Continuous Learning
+Agent** (`src/continuousLearning/`, what should you learn next, and what books are worth reading)
+and the **Knowledge Update Agent** (`src/knowledgeUpdate/`, does anything you already learned need
+revisiting because the world changed). Both are framed, per the PRD, as encouraging continued
+engagement rather than manipulating it — no artificial urgency, no dark patterns; `generate_next_
+topic_suggestions`'s system prompt says this explicitly. No Dashboard, no push notifications, no
+Motivation/Engagement Layer UI (Phase 9) — both agents surface their output through the CLI harness
+(`npm run harness -- suggest`/`whats-new`), matching the PRD's own stated v1 delivery model
+("pull-based... push notifications are a later upgrade").
+
+### Data model additions
+
+The last two of PRD Section 7's deferred tables, plus one original addition (`src/db/schema.ts`):
+
+- **`Book`**: `id`, `title`, `author`, `related_topic_id`, `status` (`suggested`\|`reading`\|`read`).
+  `related_topic_id` references **`courses.id`**, not a standalone "Topic" entity — the PRD's data
+  model has no persisted Topic table (Phase 5 hit the identical gap for `Path`; see "The Path data
+  model" above), and a completed course is the real anchor a recommendation is generated FROM,
+  whether that course was built standalone or via a Path. Two fields go beyond the PRD's literal 5
+  columns, same spirit as Phase 5's `goalContext`: `category` (`core`\|`optional_deep_dive`\|
+  `primary_source`, the ranking the PRD's own step asks for) and `openLibraryWorkId`/`gutenbergUrl`
+  — the verified-availability EVIDENCE that makes "not a hallucinated title" a checkable guarantee,
+  not just a hope. `status` transitions beyond `suggested` are defined but not driven by any code
+  path yet in v1 — same "reserved, not assigned yet" status as `PathTopic.status`'s `mastered` value
+  (Phase 5).
+- **`UpdateEvent`**: `id`, `topic_id` (also → `courses.id`, same reasoning), `detected_at`,
+  `severity` (`minor`\|`moderate`\|`major` — `"none"` is a valid model output during classification
+  but is never persisted as an event; nothing actually changed, so there's nothing to log),
+  `delta_summary`, `superseded_fact_ref` (the old Graphiti fact edge's uuid, recovered via a
+  best-effort text match against `getTopicHistory()`'s real fact strings — null when no confident
+  match is found, never guessed).
+- **`LessonUpdate`** (an original addition, not a literal PRD table — the PRD's storage decision for
+  major deltas needed *some* table, and the PRD's own Section 7 doesn't name one): `id`, `lesson_id`,
+  `update_event_id`, `title`, `what_changed`, `updated_guidance`, `created_at`. See "'Update lesson'
+  storage" below.
+- **`courses.completed_at`** (nullable timestamp) and **`courses.last_checked`** (nullable
+  timestamp) — see "Completion trigger" and "Recheck interval" below.
+
+### Deviation: course completion is `completed_at`, not a repurposed `status` value
+
+`courses.status` (`"building"`\|`"complete"`) already means Phase 3's content-pipeline signal — has
+the Material Aggregator finished linking sources? — a completely different concept from "did the
+LEARNER finish this course." The PRD's kickoff prompt for this phase says "flip the Course.status
+field to completed" without accounting for `status` already carrying that unrelated meaning;
+reusing it would conflate the two and break every existing `status: "complete"` check across
+Phases 3-5. `completedAt` is a separate, additive nullable column instead — null until the
+completion trigger fires, non-null (a real timestamp, more informative than a bare boolean) after.
+
+### Completion trigger
+
+**Default, per the PRD's resolved answer**: a course is complete once every lesson under it has at
+least one `QuizResult` across all three tiers (`recall`/`application`/`transfer`). This is checked
+in `quizEngine.checkAndMarkCourseCompletion(lessonId, db)`, called at the end of
+`scoreAndRecordQuiz()` (`src/quizEngine/index.ts`) right after the `QuizResult` insert — the "small
+addition to Phase 4's quiz-write step" the phase asked for. It walks every lesson under the quizzed
+lesson's course, checks each has `QuizResult` rows covering all of `ALL_QUIZ_TIERS`, and — only if
+every lesson qualifies AND `completedAt` was still null — sets it to `now` and returns the course
+id; every other case (partial coverage, already complete, unknown lesson) returns `null` without
+touching the row. `scoreAndRecordQuiz()`'s result surfaces this as `courseCompleted` (the course id,
+present ONLY on the call that actually flipped it) — this is the real trigger condition, not a
+stub; `npm run harness -- suggest <course_id>` is still a manual invocation in v1 since there's no
+Motivation Layer/notification system yet to auto-fire it (see the scope boundary above).
+`tests/quizEngine.test.ts`'s "checkAndMarkCourseCompletion" suite covers partial coverage, full
+coverage, the already-complete no-op case, and `scoreAndRecordQuiz`'s `courseCompleted` field
+directly.
+
+### New MCP integrations for book recommendations
+
+Following the exact same swappable-adapter pattern as Phase 1's `TavilyMCPSearchProvider`
+(`src/mcp/webSearch.ts`) — a thin interface calling code depends on, MCP protocol details never
+leaking past the adapter class:
+
+- **`src/mcp/openLibrary.ts`** — `OpenLibraryMCPProvider`, over `@cyanheads/openlibrary-mcp-server`
+  (`npx -y @cyanheads/openlibrary-mcp-server@latest`, stdio, no API key — Open Library is a free,
+  public catalog). Uses `openlibrary_search_books`. Its input (`title`/`author`/`limit`) and output
+  shape (`works[]` with `work_id`/`author_names`/`edition_count`/`first_publish_year` — the MCP
+  server's own NORMALIZED shape, notably different from the raw Open Library search API's
+  `docs[]`/`key`/`author_name` shape) were read directly from the real tool source
+  (`github.com/cyanheads/openlibrary-mcp-server`'s `openlibrary-search-books.tool.ts`), not guessed
+  — and then confirmed against a real, live call (see "Definition of done" below): searching "Thinking,
+  Fast and Slow" by Daniel Kahneman genuinely returned `work_id: "OL15992072W"`,
+  `edition_count: 35`, `first_publish_year: 2011`.
+- **`src/mcp/gutenberg.ts`** — `GutenbergMCPProvider`, over `@cyanheads/gutenberg-mcp-server` (same
+  launch pattern, no API key — Project Gutenberg is public domain). Uses `gutenberg_search_books`
+  (`query`/`topic`/`languages`/`sort`/`ids`/`page` input, `books[].has_plain_text` output — again
+  read from real source, `gutenberg-search-books.tool.ts`), confirming legitimate free/open
+  full-text availability where it exists, per the PRD's copyright constraint (link/summarize, never
+  download full copyrighted text — `gutenberg_get_text`, the one tool that would fetch actual book
+  content, is deliberately never called anywhere in this codebase). Confirmed live: "Pride and
+  Prejudice" by Jane Austen genuinely resolves to Gutenberg id 1342
+  (`https://www.gutenberg.org/ebooks/1342`); "Thinking, Fast and Slow" (a real, still-copyrighted
+  book) correctly resolves to no match.
+
+Both were chosen over their alternatives (`8enSmith/mcp-open-library` for Open Library) because
+they share one author/convention (`cyanheads`) and the Open Library one also resolves cover images
+(`openlibrary_get_cover_url`, not used yet — see "Documented gaps" below) if a future phase wants
+them.
+
+### Deliverable 1: the Continuous Learning Agent (`src/continuousLearning/`)
+
+1. **`getCourseCompletionContext(courseId, options)`** — `[code]`: loads the course row, its
+   lessons, and `getTopicHistory(topic)` (Phase 3.5's Memory Graph read path — "full learning
+   history"). Doubles as the trigger guard: throws `ContinuousLearningError` when
+   `course.completedAt` is null — "course marked complete, not mid-course" is enforced here, not
+   just documented, so this agent can never run against a partial course even called directly.
+2. **`generateBookRecommendations(courseId, context, options)`** — `[LLM]` `generate_book_
+   candidates` identifies 3-6 candidate titles (foundational + current), each ranked `core`\|
+   `optional_deep_dive`\|`primary_source` in the SAME call (the categories are naturally coupled to
+   candidate identification, same pattern as `decompose_topic` returning prerequisites+subtopics
+   together) → `[MCP]` each candidate is verified via Open Library (a loose title match against real
+   search results — no match, no persistence) and checked against Gutenberg for legitimate free
+   full-text → `[code]` only VERIFIED candidates are persisted to `Book` (`status: "suggested"`); an
+   unverifiable title is returned in a separate `rejected` list (for harness display) and NEVER
+   reaches the table. This is what makes "not hallucinated titles" a checked guarantee rather than
+   a hope — `tests/continuousLearning.test.ts` proves a model-invented, unverifiable title is
+   dropped while a verified one persists with its real `openLibraryWorkId`.
+3. **`generateNextTopicSuggestions(courseId, context, options)`** — `[code]`
+   `getCrossCourseConnections(topic)` (new Memory Graph read, see below) plus the diversity check
+   (next item) feed into one `[LLM]` `generate_next_topic_suggestions` call producing BOTH a
+   `deepen` suggestion (natural next step, same domain) and a `branch` suggestion (adjacent/novel
+   domain, preferring a real cross-course connection when one exists) — never persisted (see
+   "Statelessness decision" below), print-only.
+4. **Diversity check**: `getRecentCourseDomains(options)` pulls the last `N` (default 5, `DIVERSITY_
+   WINDOW_N`) *completed* courses' domains — a path-linked course reads its real `PathDomain`
+   (Phase 5); a standalone course gets a lightweight `infer_course_domain` `[LLM]` tag, computed
+   fresh every call, never persisted (same statelessness philosophy as the suggestions themselves).
+   `isDomainClusterNarrow(domains, threshold, minSample)` is a PURE function (no DB, no LLM) — narrow
+   when at least `minSample` (default 3, avoids false-positiving on a fresh install with too little
+   data) domains are available and the single most common domain's share is `>= threshold` (default
+   0.6, `DIVERSITY_CLUSTER_THRESHOLD`). When narrow, `generate_next_topic_suggestions`'s prompt is
+   told the recent domains explicitly and instructed to treat a genuinely different domain for
+   `branch` as a HARD constraint, not a soft preference. `tests/continuousLearning.test.ts` proves
+   both the pure threshold boundaries and that a real narrow cluster (3 extra completed courses,
+   same inferred domain) flips `diversityBiasNeeded` through to the actual LLM call.
+5. **`getCrossCourseConnections(topic)`** (new `src/memoryGraph/index.ts` read method) — best-effort,
+   deliberately grounded in `writeTopic()`'s own known fact-text format
+   (`"${topic}" requires prior knowledge of "${prerequisite}".`) via regex extraction, the identical
+   "not guessed, read straight off what this file actually writes" approach
+   `extractCourseIdsFromHistory()` (Phase 5, `src/pathPlanner/overlap.ts`) already uses for course
+   ids. Graphiti's MCP server exposes no generic neighbor-traversal tool (only text/semantic search
+   via `search_nodes`/`search_memory_facts` — confirmed from the real tool list, see below), so this
+   can't be more precise than "topics whose `REQUIRES_PREREQUISITE` fact text mentions this topic by
+   name," in either direction. Never throws — degrades to `{connectedTopics: [], error}`, same
+   pattern as `getTopicHistory`.
+6. **Statelessness decision**: `Suggestion` records are deliberately NOT persisted — topic
+   suggestions are recomputed fresh every `suggest` run. There's no Dashboard yet to make stale
+   suggestions a real problem, and inventing a `Suggestion` table/lifecycle now would be designing
+   ahead of an actual consumer — a documented v1 simplification, not an oversight. Book candidates
+   ARE persisted (`status: "suggested"`), per the phase's own explicit instruction.
+
+### Deliverable 2: the Knowledge Update Agent (`src/knowledgeUpdate/`)
+
+A **standalone script** (`npm run knowledge-update`, `src/knowledgeUpdate/cli.ts`) — run manually or
+via an external scheduler, deliberately NOT a persistent daemon inside the app, per the PRD's "no
+heavy job-queue infra" guidance. See "Wiring to cron" below.
+
+1. **`getDueTopics(options)`** — `[code]`: a course is due when `last_checked` is null (never
+   checked — always due) or older than `getRecheckIntervalDays(volatilityTier)` (see "Recheck
+   interval, formalized" below).
+2. Per due topic, **`checkTopicForUpdates(topic, options)`**:
+   - **a. `[LLM]` `generate_recheck_queries`** — a LIGHTER version of Phase 2's
+     `generate_search_queries`: 1-3 targeted "what's changed" queries (given a summary of what's
+     already known), not the full multi-pass (initial + contention) set a fresh course build uses.
+   - **b. `[MCP]`** `webSearch()` + `fetchAndClean()` — Phase 2's own adapters
+     (`src/mcp/webSearch.ts`, `src/extraction/fetchAndClean.ts`), reused DIRECTLY, not wrapped in a
+     full `researchPass()` — this is a targeted recheck, not a re-research.
+   - **c. `[LLM]` `compare_findings_to_facts`** — the severity classifier, the core judgment call of
+     this whole agent. Compares fresh findings against the topic's `getTopicHistory()` facts and
+     classifies each REAL delta (`"none"` deltas — a finding that just restates an existing fact —
+     are excluded from the output entirely). The system prompt embeds the PRD's rubric with
+     concrete anchors, verbatim: **minor** = wording/detail/citation changes that don't affect the
+     substance; **moderate** = a meaningfully updated fact, figure, statistic, or recommended
+     method; **major** = a core claim reversed, deprecated, or superseded entirely. Every delta also
+     names `relatedLessonId` — validated (`validateExtra`,
+     `createCompareFindingsToFactsValidator`) against the due course's real lesson id set, the same
+     pattern `createDecomposeGoalIntoPathValidator` (Phase 5) uses for tempId references. This
+     exists because Memory Graph facts don't retain which lesson/subtopic they came from —
+     `search_memory_facts` returns edge records, and the subtopic id `writeSubtopicFacts` embeds
+     lives only in the originating EPISODE's `source_description`, which that tool doesn't return —
+     so rather than solving that correlation problem, the model is handed the course's real lesson
+     list and picks the best match directly, grounded and checkable.
+   - **d. `[code]`** writes one `UpdateEvent` per real delta. **Only moderate/major deltas trigger
+     real graph supersession** (`memoryGraph.supersedeFact`, below) — a documented choice: a minor
+     wording-only difference isn't worth invalidating a stable fact edge over. `major` additionally
+     runs `[LLM]` `generate_update_lesson` and persists a `LessonUpdate` row (see below).
+3. **`[code]`** display routing (no separate write — this is what reading `UpdateEvent` back by
+   severity means): **minor** → silent log only (console output, nothing else); **moderate** →
+   included in the `whats-new` digest; **major** → digest-flagged prominently, WITH the generated
+   `LessonUpdate` content attached.
+4. **`[code]`** `courses.lastChecked = now`, written per topic checked regardless of outcome — this
+   alone is what makes a second immediate run a genuine no-op (nothing will be due again until the
+   interval elapses), confirmed for real below, not just in tests.
+
+### Recheck interval, formalized
+
+Phase 5 approximated this as a stopgap (30/90/180/90 days for fast/medium/slow/mixed) while waiting
+for this phase. **Formalized now**: `getRecheckIntervalDays(tier)`
+(`src/shared/recheckInterval.ts`) — a single exported function, defaults **fast=14, medium=60,
+slow=180** per the PRD's resolved answer (`mixed` wasn't specified by the PRD; defaults to medium's
+value as a reasonable middle ground, independently configurable like every other tier). Lives in
+`src/shared/` (alongside `src/shared/ids.ts`), not inside either phase's own module — Phase 5's
+`src/pathPlanner/overlap.ts` now imports and calls it instead of its own copy (its
+`DEFAULT_RECHECK_WINDOW_DAYS` export is kept, now just re-exporting the shared module's values, so
+existing import paths/tests didn't need to change beyond updating the expected numbers), which is
+what actually satisfies "go back and update Phase 5's overlap-detection code to use this" — verified
+by `tests/pathPlannerOverlap.test.ts`'s updated threshold assertion. Env vars renamed
+`PATH_RECHECK_WINDOW_DAYS_*` → `RECHECK_INTERVAL_DAYS_*` (documented rename below) since the concept
+is no longer Phase-5-specific.
+
+### Graphiti fact supersession — confirmed from real source, not guessed
+
+The one piece of this phase that has to get Graphiti's actual temporal semantics right (`memoryGraph.
+supersedeFact(topic, oldClaim, newClaim)`, `src/memoryGraph/index.ts`), confirmed by reading
+`getzep/graphiti`'s real source directly (`graphiti_core/graphiti.py`'s `add_triplet` method →
+`resolve_extracted_edge` → `resolve_edge_contradictions` in
+`graphiti_core/utils/maintenance/edge_operations.py`), the same diligence the existing Memory Graph
+client already applied to the MCP transport: calling `add_triplet` resolves the source/target nodes,
+then searches (a) existing edges between that SAME node pair and (b) semantically similar existing
+facts more broadly; when it finds a contradiction, it marks the OLD edge's `invalid_at`/`expired_at`
+while persisting the new edge alongside it — the old edge is **never deleted**, matching "supersede,
+don't delete-and-reappend" exactly. `delete_entity_edge` (the MCP server's only other edge-mutation
+tool — a hard delete by uuid) is deliberately never used for this.
+
+`supersedeFact` reuses the SAME synthetic target node name (`"${topic} — current facts"`) on EVERY
+call for a given topic, so search (a) — the precise, node-pair-scoped candidate search — reliably
+finds every prior `HAS_FACT` edge for that topic as an invalidation candidate, rather than relying
+solely on the broader semantic-similarity search (b). `oldClaim` isn't threaded into the
+`add_triplet` call as a lookup key (Graphiti finds the old edge by content, not by an id the caller
+supplies) — it's folded into the new fact's text instead, giving Graphiti's semantic search a
+clearer contradiction signal and leaving a self-documenting audit trail in the graph itself.
+`tests/memoryGraph.test.ts`'s `supersedeFact` suite confirms the exact call shape (tool name
+`add_triplet`, the stable target node, both claims present, `delete_entity_edge` never called).
+
+### "Update lesson" storage
+
+Per the PRD's resolved decision: a major delta's generated content is stored as a small, ADDITIVE
+`LessonUpdate` record (`lesson_id` + `update_event_id` + `title`/`what_changed`/`updated_guidance`)
+linked to the ORIGINAL lesson — never a rewrite of the original's five-layer content. The original
+lesson stays intact as a historical record; the `LessonUpdate` is what's actually new. `generate_
+update_lesson`'s system prompt explicitly frames this as a short, targeted delta ("NOT a full
+re-teach"), assuming the reader already took the original lesson.
+
+### Diversity window (N)
+
+Default 5 (last 5 completed courses), per the PRD's resolved default — configurable via
+`DIVERSITY_WINDOW_N`.
+
+### Deliverable 3: extending the test harness
+
+```bash
+# Phase 6: the Continuous Learning Agent, real APIs by default — runs on a course already marked
+# complete (courses.completedAt set, via real quiz activity, not a manual flag). Prints verified
+# book recommendations (an unverifiable title is dropped, never printed as a real suggestion) plus
+# a deepen and a branch next-topic suggestion.
+npm run harness -- suggest <course_id>
+npm run harness -- suggest --dry-run <course_id>   # mocked LLM + both new MCP providers
+
+# Phase 6: the "what's new" digest — pulls and prints whatever `npm run knowledge-update` has
+# already written. Major items flagged prominently (with their generated update-lesson content),
+# moderate items listed, minor items counted only unless --include-minor is passed.
+npm run harness -- whats-new
+npm run harness -- whats-new --include-minor
+
+# Phase 6: the Knowledge Update Agent's standalone scheduled-job script — idempotent (see above).
+npm run knowledge-update
+npm run knowledge-update -- --dry-run   # mocked LLM/search/extraction, isolated data/teacher.dry-run.db
+```
+
+**Wiring `npm run knowledge-update` to a real cron entry** (actual OS-level scheduling is outside
+this repo's concern, per the PRD — this is a documented example, not something automated here):
+
+```cron
+# Run the Knowledge Update Agent daily at 3am
+0 3 * * * cd /path/to/teacher && npm run knowledge-update >> logs/knowledge-update.log 2>&1
+```
+
+### Definition of done — Phase 6
+
+**Real, live-confirmed MCP integrations** (no API key, no Docker needed for either): the smoke test
+quoted under "New MCP integrations" above ran against the REAL `@cyanheads/openlibrary-mcp-server`
+and `@cyanheads/gutenberg-mcp-server` packages via `npx` — a real search for "Thinking, Fast and
+Slow" by Daniel Kahneman returned genuine Open Library data (`OL15992072W`, 35 editions, first
+published 2011), a real Gutenberg check for "Pride and Prejudice" correctly resolved to Gutenberg id
+1342, and a real Gutenberg check for the still-copyrighted "Thinking, Fast and Slow" correctly
+returned no match — both the "verified" and "not available" branches are real, not assumed.
+
+**Real completion trigger, real Gemini calls, partially blocked by the exact wall Phase 2/3/5 already
+hit**: a `build --dry-run` course ("Special Relativity," 3 lessons) was quizzed for real —
+`generateQuizQuestions`/`scoreAndRecordQuiz`, real `GEMINI_API_KEY`, no mocking — across all three
+tiers for 2 of its 3 lessons, including genuinely discriminating real semantic free-text scoring
+(a deliberately generic "thoughtful answer" scored 0.5, not a blind 1.0 — proof the real scorer is
+actually judging content, consistent with Phase 4's own documented evidence). The third lesson's
+quiz hit Gemini's free-tier **daily** cap (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`,
+`quotaValue: 20`) mid-session — confirmed genuinely exhausted (not a transient per-minute limit,
+which was hit and successfully waited out earlier in the same run) by the error's own explicit
+quota-metric name. This blocks a real end-to-end demonstration of the THIRD lesson's completion
+and a real (non-`--dry-run`) `suggest` run in the same session `GEMINI_API_KEY` was exhausted under.
+**Every piece is still verified independently**, matching Phase 5's own precedent for this exact
+situation:
+
+- **Completion trigger, both branches, against real persistence**: `tests/quizEngine.test.ts`'s
+  `checkAndMarkCourseCompletion` suite proves partial tier coverage never flips `completedAt`, full
+  coverage across every lesson does, an already-complete course isn't re-stamped, and
+  `scoreAndRecordQuiz`'s `courseCompleted` field is present ONLY on the call that actually
+  triggers it — plus the REAL evidence above that the underlying mechanism (real quiz generation +
+  real semantic scoring + real persisted `QuizResult`/`MasteryState` rows) genuinely works against
+  live Gemini responses for 2 of 3 lessons.
+- **`suggest`, demonstrated deterministically**: `npm run harness -- suggest --dry-run` (against
+  the same course, `completedAt` set) shows both real branches live — a verified candidate persisted
+  with its `openLibraryWorkId`/`gutenbergUrl`, and an unverifiable candidate dropped with a stated
+  reason — plus both a `deepen` and a `branch` suggestion printed. `tests/continuousLearning.test.ts`
+  independently proves the same book-verification filtering and the diversity-bias-kicking-in case
+  (3 extra completed courses clustering in one inferred domain → `diversityBiasApplied: true`,
+  threaded into the real LLM call context) against real persistence, not mocks reimplementing the
+  logic.
+- **`knowledge-update`, a real run demonstrating all three severities and real idempotency**:
+  `npm run knowledge-update -- --dry-run` (real code, mocked LLM/search — the same convention `build
+  --dry-run` established) genuinely classified deltas at all three severities in one run (2 major, 2
+  moderate, 2 minor across 2 due topics) and printed the routing correctly — minor silent, moderate
+  listed, major flagged with generated `LessonUpdate` content (confirmed via a real subsequent
+  `npm run harness -- whats-new` / `--include-minor` run reading it back). A real, unmocked SECOND
+  `knowledge-update -- --dry-run` run immediately after found `0` due topics — genuine idempotency,
+  not asserted only in `tests/knowledgeUpdate.test.ts` (which independently covers the same
+  interval-boundary and no-op logic with an injected clock).
+- **Severity classification's three branches + `supersedeFact`'s call shape**: `tests/
+  knowledgeUpdate.test.ts` mocks `compare_findings_to_facts` directly to hit minor (UpdateEvent only,
+  `supersedeFact` NOT called), moderate (UpdateEvent + `supersedeFact` called, no update lesson), and
+  major (UpdateEvent + `supersedeFact` + a real persisted `LessonUpdate` linked to the correct
+  lesson) as three genuinely separate assertions, plus a `"none"`-severity delta that persists
+  nothing at all. `tests/memoryGraph.test.ts`'s `supersedeFact` suite confirms the exact `add_triplet`
+  call shape (topic-scoped stable target node, both claims present, `delete_entity_edge` never
+  called) independently of the graph actually being reachable.
+- **Fact supersession's real Graphiti semantics**: NOT demonstrated against a live graph — this
+  environment has no Docker installed (see "The Docker verification gap" above; unchanged since
+  Phase 3.5/5), so `inspect-graph` can't confirm a real `invalid_at` timestamp on a real old edge.
+  What IS verified: the call shape is correct per Graphiti's actual source (see above, cited not
+  guessed) and `supersedeFact` is exercised for real, end-to-end, in the `knowledge-update --dry-run`
+  run above (degrading to a logged connection error exactly as designed — never silently skipped,
+  never crashing the run). This is the same category of gap as Phase 3.5/5's Memory Graph writes —
+  unverified-live but not unverified-by-design.
+- Recheck interval formalization: `tests/recheckInterval.test.ts` covers `getRecheckIntervalDays`'s
+  defaults/overrides directly; `tests/pathPlannerOverlap.test.ts`'s updated assertion confirms Phase
+  5 now reads the same shared values (14/60/180/60), not a drifted copy.
+- All Phase 1-5 tests still pass; 196 tests total (`npm test`) — 165 from Phases 1-5 + 31 new for
+  Phase 6 (`tests/continuousLearning.test.ts`, `tests/knowledgeUpdate.test.ts`,
+  `tests/recheckInterval.test.ts`, plus additions to `tests/quizEngine.test.ts` and
+  `tests/memoryGraph.test.ts`).
+- `npm run typecheck` clean.
+
+**What would still be worth doing once the Gemini quota resets or billing is enabled**: the third
+lesson's real quiz completion and a fully real (non-`--dry-run`) `suggest` run against it — the exact
+same "Options to actually close these out" list in "The real-run blocker" below applies unchanged,
+plus a real Docker/Graphiti setup to close "The Docker verification gap" for `supersedeFact`
+specifically.
+
+### Documented gaps
+
+- **Book cover images** (`openlibrary_get_cover_url`) — the Open Library MCP server supports
+  resolving cover images, per the PRD's own suggestion, but nothing in this phase's CLI-only output
+  needs one yet. Left for whichever future phase actually renders a book recommendation visually.
+- **`superseded_fact_ref` is best-effort, not guaranteed.** It's recovered by text-matching the
+  LLM's `existingFactSummary` paraphrase against the real fact strings `getTopicHistory()` returned
+  — when no confident match is found (a genuinely new observation not tied to one specific prior
+  fact, or a paraphrase too loose to match), it's `null`. This doesn't affect `supersedeFact`'s own
+  correctness (which finds the edge to invalidate by content, via Graphiti's own contradiction
+  search, not via this id) — it only affects the DB record's own traceability.
 
 ## LLM provider swap (added mid-Phase-2, not in the original kickoff prompt)
 

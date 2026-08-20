@@ -3,8 +3,10 @@ import type { RestructureLayersOutput } from "../orchestrator/templates/restruct
 
 /**
  * Phase 3's slice of the PRD's data model (Section 7), plus Phase 4's
- * QuizResult / PracticeAttempt / MasteryState. Book and UpdateEvent belong
- * to later phases and are deliberately not modeled here yet.
+ * QuizResult / PracticeAttempt / MasteryState, Phase 5's Path / PathDomain /
+ * PathTopic, and Phase 6's Book / UpdateEvent (the PRD's last two deferred
+ * tables) plus LessonUpdate (an original addition — see README, "'Update
+ * lesson' storage").
  */
 
 export const courses = sqliteTable("courses", {
@@ -23,6 +25,22 @@ export const courses = sqliteTable("courses", {
    * DIFFERENT goal's angle" (a different non-null value) — see src/pathPlanner/overlap.ts.
    */
   goalContext: text("goal_context"),
+  /**
+   * Phase 6: when the LEARNER finished this course (every lesson has a QuizResult across all
+   * three tiers — see quizEngine.checkAndMarkCourseCompletion), not when content-generation
+   * finished. Deliberately a SEPARATE column from `status` above: `status` ("building"/"complete")
+   * is Phase 3's content-pipeline signal (has the Material Aggregator finished linking sources?) —
+   * a completely different concept from "did the learner actually finish it," and conflating the
+   * two would break every existing `status: "complete"` check across Phases 3-5. Null until the
+   * completion trigger fires; this is what the Continuous Learning Agent gates on.
+   */
+  completedAt: text("completed_at"),
+  /**
+   * Phase 6: last time the Knowledge Update Agent checked this course for staleness — null means
+   * "never checked" (always due). Compared against getRecheckIntervalDays(volatilityTier)
+   * (src/shared/recheckInterval.ts) to select due topics.
+   */
+  lastChecked: text("last_checked"),
 });
 
 export const modules = sqliteTable("modules", {
@@ -180,4 +198,74 @@ export const pathTopics = sqliteTable("path_topics", {
   status: text("status", { enum: ["pending", "linked_existing", "delta_needed", "in_progress", "mastered"] })
     .notNull()
     .default("pending"),
+});
+
+/**
+ * Phase 6: the Continuous Learning Agent's book recommendations. `relatedTopicId` references
+ * `courses.id`, not a standalone "Topic" entity — the PRD's data model has no persisted Topic
+ * table (Phase 5 hit the same gap for Path; see "The Path data model" in the README), and a
+ * completed course is the real anchor a recommendation is generated FROM, whether that course was
+ * built standalone or via a Path. `category`/`openLibraryWorkId`/`gutenbergUrl` are additive beyond
+ * the PRD's literal 5 columns (id/title/author/related_topic_id/status) — `category` is the
+ * core/optional_deep_dive/primary_source ranking the PRD's own step asks for, and the two id/url
+ * fields are the verified-availability EVIDENCE that makes a suggestion real rather than a
+ * hallucinated title (see generateBookRecommendations, src/continuousLearning/index.ts). `status`
+ * transitions beyond "suggested" (reading/read) are defined per the PRD but not driven by any code
+ * path yet — same "reserved, not assigned yet" status as PathTopic.status "mastered" (Phase 5).
+ */
+export const books = sqliteTable("books", {
+  id: text("id").primaryKey(),
+  title: text("title").notNull(),
+  author: text("author").notNull(),
+  relatedTopicId: text("related_topic_id")
+    .notNull()
+    .references(() => courses.id),
+  status: text("status", { enum: ["suggested", "reading", "read"] }).notNull().default("suggested"),
+  category: text("category", { enum: ["core", "optional_deep_dive", "primary_source"] }).notNull(),
+  /** Open Library work id (e.g. "OL12345W") — evidence a real, current edition was verified to exist. */
+  openLibraryWorkId: text("open_library_work_id"),
+  /** Set only when Gutenberg confirmed a legitimate free/open full text exists — null otherwise (most books). */
+  gutenbergUrl: text("gutenberg_url"),
+  createdAt: text("created_at").notNull(),
+});
+
+/**
+ * Phase 6: the Knowledge Update Agent's detected deltas. `topicId` references `courses.id` (same
+ * "Topic has no persisted entity" reasoning as `books.relatedTopicId` above). `severity` omits
+ * "none" deliberately — a `compare_findings_to_facts` delta classified "none" means nothing
+ * actually changed, so it's never persisted as an event at all (see
+ * src/knowledgeUpdate/index.ts). `supersededFactRef` is the OLD Graphiti fact edge's uuid, when
+ * one was identified — null for a delta that doesn't map to one specific prior fact.
+ */
+export const updateEvents = sqliteTable("update_events", {
+  id: text("id").primaryKey(),
+  topicId: text("topic_id")
+    .notNull()
+    .references(() => courses.id),
+  detectedAt: text("detected_at").notNull(),
+  severity: text("severity", { enum: ["minor", "moderate", "major"] }).notNull(),
+  deltaSummary: text("delta_summary").notNull(),
+  supersededFactRef: text("superseded_fact_ref"),
+});
+
+/**
+ * Phase 6: a major-delta "update lesson" — a small DELTA ADDENDUM linked to the original Lesson
+ * and the UpdateEvent that triggered it, per the PRD's resolved storage decision. The original
+ * lesson's `layers` (src/db/schema.ts's `lessons` table) are never rewritten or touched; this is a
+ * separate, additive record so the original stays intact as a historical record while the delta is
+ * what's actually new. Deliberately lighter than the original lesson's five-layer structure (see
+ * generate_update_lesson, src/orchestrator/templates/) — a full re-teach isn't the point here.
+ */
+export const lessonUpdates = sqliteTable("lesson_updates", {
+  id: text("id").primaryKey(),
+  lessonId: text("lesson_id")
+    .notNull()
+    .references(() => lessons.id),
+  updateEventId: text("update_event_id")
+    .notNull()
+    .references(() => updateEvents.id),
+  title: text("title").notNull(),
+  whatChanged: text("what_changed").notNull(),
+  updatedGuidance: text("updated_guidance").notNull(),
+  createdAt: text("created_at").notNull(),
 });

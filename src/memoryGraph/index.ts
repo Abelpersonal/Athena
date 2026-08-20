@@ -188,6 +188,96 @@ export async function writeMasteryUpdate(
   }
 }
 
+export interface CrossCourseConnectionsResult {
+  connectedTopics: string[];
+  /** Set when the graph couldn't be reached or a call failed — connectedTopics is empty in that case, not partial. */
+  error?: string;
+}
+
+const REQUIRES_PREREQUISITE_PATTERN = /"([^"]+)"\s+requires prior knowledge of\s+"([^"]+)"/gi;
+
+/**
+ * Phase 6: a small, additive read method for the Continuous Learning Agent's next-topic
+ * suggestions (Deliverable 1, step 2's "cross-course graph connections"). Best-effort and
+ * deliberately grounded in writeTopic()'s own known fact-text format above
+ * (`"${topic}" requires prior knowledge of "${prerequisite}".`) via regex extraction — the same
+ * "not guessed, read straight off what this file actually writes" approach
+ * extractCourseIdsFromHistory() (src/pathPlanner/overlap.ts) already uses for course ids. Graphiti's
+ * MCP server exposes no generic neighbor-traversal tool (only text/semantic search — see
+ * search_memory_facts below and the README), so this can't be more precise than "topics whose
+ * REQUIRES_PREREQUISITE fact text mentions this topic by name" in either direction. Never throws —
+ * a connection failure comes back as `{ connectedTopics: [], error }`, same degrade-on-failure
+ * pattern as getTopicHistory().
+ */
+export async function getCrossCourseConnections(
+  topic: string,
+  client: GraphitiMCPClient = getDefaultClient()
+): Promise<CrossCourseConnectionsResult> {
+  try {
+    const factResult = await client.callTool<GraphitiFactSearchResponse>("search_memory_facts", {
+      query: topic,
+      max_facts: 30,
+    });
+    const normalizedTopic = topic.trim().toLowerCase();
+    const connected = new Set<string>();
+    for (const { fact } of factResult.facts) {
+      for (const match of fact.matchAll(REQUIRES_PREREQUISITE_PATTERN)) {
+        const [, a, b] = match;
+        if (!a || !b) continue;
+        if (a.trim().toLowerCase() === normalizedTopic) connected.add(b.trim());
+        else if (b.trim().toLowerCase() === normalizedTopic) connected.add(a.trim());
+      }
+    }
+    return { connectedTopics: [...connected] };
+  } catch (error) {
+    const message = (error as Error).message;
+    console.error(`[memory-graph] getCrossCourseConnections("${topic}") failed: ${message}`);
+    return { connectedTopics: [], error: message };
+  }
+}
+
+/**
+ * Phase 6: the Knowledge Update Agent's fact-supersession write (Deliverable 2, step 2d) — the one
+ * piece of this phase that has to get Graphiti's actual temporal semantics right, confirmed against
+ * getzep/graphiti's real source (graphiti_core/graphiti.py's add_triplet -> resolve_extracted_edge
+ * -> resolve_edge_contradictions in graphiti_core/utils/maintenance/edge_operations.py), not
+ * guessed: add_triplet resolves the source/target nodes, searches (a) existing edges between that
+ * SAME node pair and (b) semantically similar existing facts, and — when it finds a contradiction —
+ * marks the OLD edge's invalid_at/expired_at while persisting the new edge alongside it. The old
+ * edge is never deleted, matching "mark-superseded, not delete-and-reappend" exactly. This
+ * deliberately reuses the SAME synthetic target node name ("${topic} — current facts") on every
+ * call for a given topic, so search (a) — the precise, node-pair-scoped candidate search — reliably
+ * finds every prior HAS_FACT edge for this topic as an invalidation candidate, rather than relying
+ * solely on the broader semantic-similarity search (b). `delete_entity_edge` (the MCP server's only
+ * other edge-mutation tool, a hard delete by uuid) is deliberately never used here.
+ *
+ * `oldClaim` isn't threaded into the add_triplet call itself (Graphiti's own contradiction search
+ * is what finds and invalidates the old edge, by content, not by an id the caller supplies) — it's
+ * still a required parameter because the caller (compare_findings_to_facts' output, see
+ * src/knowledgeUpdate/index.ts) already knows which specific prior fact this supersedes, and
+ * folding both claims into the new fact's text gives Graphiti's semantic search a clearer signal
+ * plus a self-documenting audit trail in the graph itself.
+ */
+export async function supersedeFact(
+  topic: string,
+  oldClaim: string,
+  newClaim: string,
+  client: GraphitiMCPClient = getDefaultClient()
+): Promise<void> {
+  try {
+    await client.callTool("add_triplet", {
+      source_node_name: topic,
+      edge_name: "HAS_FACT",
+      fact: `${newClaim} (supersedes: "${oldClaim}")`,
+      target_node_name: `${topic} — current facts`,
+    });
+  } catch (error) {
+    console.error(
+      `[memory-graph] Failed to supersede a fact for "${topic}" (old: "${oldClaim.slice(0, 60)}...", new: "${newClaim.slice(0, 60)}..."): ${(error as Error).message}`
+    );
+  }
+}
+
 /** Closes the default client's MCP connection (call before process exit). */
 export async function closeMemoryGraph(): Promise<void> {
   if (defaultClient) {

@@ -48,6 +48,12 @@ import {
   PathPlannerError,
   type PathTopicRoadmapEntry,
 } from "../pathPlanner/index.js";
+import { runContinuousLearningAgent, ContinuousLearningError } from "../continuousLearning/index.js";
+import { getWhatsNewDigest } from "../knowledgeUpdate/index.js";
+import { closeOpenLibrary } from "../mcp/openLibrary.js";
+import { closeGutenberg } from "../mcp/gutenberg.js";
+import { closeMemoryGraph } from "../memoryGraph/index.js";
+import { createMockOpenLibraryProvider, createMockGutenbergProvider } from "./mocks.js";
 
 /**
  * Debugging CLI across Phases 1-6. Modes:
@@ -64,6 +70,16 @@ import {
  *                                                      unchanged, a goal classification decomposes into a cross-domain roadmap, runs
  *                                                      overlap detection, prints the annotated roadmap, then loops letting the user
  *                                                      pick a generatable pending/delta_needed topic to generate next
+ *   npm run harness -- suggest [--dry-run] <course_id> Phase 6: Continuous Learning Agent — runs on a course already marked complete
+ *                                                      (courses.completedAt set, via real quiz activity — see quizEngine's completion
+ *                                                      trigger). Prints verified book recommendations (Open Library/Gutenberg-checked;
+ *                                                      an unverifiable title is dropped, never printed as a real suggestion) plus a
+ *                                                      deepen and a branch next-topic suggestion. --dry-run mocks the LLM and both new
+ *                                                      MCP providers, same convention as build --dry-run.
+ *   npm run harness -- whats-new [--include-minor]     Phase 6: Knowledge Update Agent digest — prints major deltas prominently (with
+ *                                                      their generated update-lesson content), moderate deltas listed, minor deltas
+ *                                                      counted only unless --include-minor is passed. Reads whatever
+ *                                                      `npm run knowledge-update` has already written; run that first to populate it.
  *
  * quiz/practice have no --dry-run mode (unlike research/build) — they operate on
  * lesson/module content that must already be persisted (from a prior research/build
@@ -93,6 +109,14 @@ async function main(): Promise<void> {
   }
   if (args[0] === "goal") {
     await runGoalCommand(args.slice(1));
+    return;
+  }
+  if (args[0] === "suggest") {
+    await runSuggestCommand(args.slice(1));
+    return;
+  }
+  if (args[0] === "whats-new") {
+    await runWhatsNewCommand(args.slice(1));
     return;
   }
 
@@ -631,6 +655,118 @@ async function runGoalCommand(args: string[]): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 6: suggest [--dry-run] <course_id>
+// ---------------------------------------------------------------------------
+
+async function runSuggestCommand(args: string[]): Promise<void> {
+  const dryRun = args.includes("--dry-run");
+  const courseId = args.filter((a) => a !== "--dry-run")[0];
+  if (!courseId) {
+    console.error("Usage: npm run harness -- suggest [--dry-run] <course_id>");
+    process.exitCode = 1;
+    return;
+  }
+
+  resetDbCache();
+  const db = await getDb(dryRun ? path.join(process.cwd(), "data", "teacher.dry-run.db") : undefined);
+  const onProgress = (message: string) => console.log(`[suggest-harness] ${message}`);
+
+  let result: Awaited<ReturnType<typeof runContinuousLearningAgent>>;
+  try {
+    result = await runContinuousLearningAgent(courseId, {
+      db,
+      onProgress,
+      ...(dryRun
+        ? {
+            orchestratorRun: createMockOrchestratorRun(),
+            searchOpenLibrary: createMockOpenLibraryProvider(),
+            checkGutenberg: createMockGutenbergProvider(),
+          }
+        : {}),
+    });
+  } catch (error) {
+    if (error instanceof ContinuousLearningError) {
+      console.error(`\n[suggest-harness] ${error.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
+  }
+
+  console.log(`\n[suggest-harness] Suggestions for "${result.course.topic}" (course: ${result.course.id}):`);
+
+  console.log(`\nBook recommendations (${result.books.persisted.length} verified & persisted):`);
+  for (const b of result.books.persisted) {
+    console.log(`  [${b.category}] "${b.title}" by ${b.author}${b.gutenbergUrl ? ` — free text: ${b.gutenbergUrl}` : ""}`);
+    console.log(`    ${b.rationale}`);
+  }
+  if (result.books.rejected.length > 0) {
+    console.log(`\n  (${result.books.rejected.length} candidate(s) could not be verified and were dropped:)`);
+    for (const r of result.books.rejected) {
+      console.log(`  - "${r.title}" by ${r.author}: ${r.reason}`);
+    }
+  }
+
+  const s = result.topicSuggestions;
+  console.log(`\nNext topic — deepen (same domain): ${s.deepen.topicName}`);
+  console.log(`  ${s.deepen.description}`);
+  console.log(`  Why: ${s.deepen.rationale}`);
+  console.log(`\nNext topic — branch (${s.branch.domain}): ${s.branch.topicName}`);
+  console.log(`  ${s.branch.description}`);
+  console.log(`  Why: ${s.branch.rationale}`);
+  if (s.diversityBiasApplied) {
+    console.log(`\n  (Diversity bias applied — recent completed courses clustered in: ${s.recentDomains.join(", ")})`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: whats-new [--include-minor]
+// ---------------------------------------------------------------------------
+
+async function runWhatsNewCommand(args: string[]): Promise<void> {
+  const includeMinor = args.includes("--include-minor");
+  const db = await getDb();
+  const digest = await getWhatsNewDigest({ db });
+
+  console.log("\n[whats-new] What's new since your courses were last checked:\n");
+
+  if (digest.major.length > 0) {
+    console.log(`=== MAJOR (${digest.major.length}) ===`);
+    for (const item of digest.major) {
+      console.log(`\n[${item.topicName}] ${item.deltaSummary}`);
+      if (item.lessonUpdate) {
+        console.log(`  Update lesson: ${item.lessonUpdate.title}`);
+        console.log(`  What changed: ${item.lessonUpdate.whatChanged}`);
+        console.log(`  Updated guidance: ${item.lessonUpdate.updatedGuidance}`);
+      }
+    }
+    console.log("");
+  }
+
+  if (digest.moderate.length > 0) {
+    console.log(`=== Moderate (${digest.moderate.length}) ===`);
+    for (const item of digest.moderate) {
+      console.log(`  [${item.topicName}] ${item.deltaSummary}`);
+    }
+    console.log("");
+  }
+
+  if (includeMinor && digest.minor.length > 0) {
+    console.log(`=== Minor (${digest.minor.length}) ===`);
+    for (const item of digest.minor) {
+      console.log(`  [${item.topicName}] ${item.deltaSummary}`);
+    }
+    console.log("");
+  } else if (digest.minor.length > 0) {
+    console.log(`(${digest.minor.length} minor item(s) not shown — pass --include-minor to see them.)`);
+  }
+
+  if (digest.major.length === 0 && digest.moderate.length === 0 && digest.minor.length === 0) {
+    console.log("Nothing new — run `npm run knowledge-update` to check for updates.");
+  }
+}
+
 main()
   .catch((error) => {
     console.error("[harness] Failed:", error);
@@ -638,4 +774,7 @@ main()
   })
   .finally(async () => {
     await closeWebSearch();
+    await closeMemoryGraph();
+    await closeOpenLibrary();
+    await closeGutenberg();
   });
