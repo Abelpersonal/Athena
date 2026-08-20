@@ -15,6 +15,13 @@
       "when": 1787128013354,
       "tag": "0001_lethal_morgan_stark",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1787144896770,
+      "tag": "0002_puzzling_mimic",
+      "breakpoints": true
     }
   ]
 }

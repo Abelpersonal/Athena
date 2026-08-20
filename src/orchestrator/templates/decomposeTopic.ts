@@ -18,6 +18,8 @@ export type DecomposeTopicOutput = z.infer<typeof DecomposeTopicOutputSchema>;
 export interface DecomposeTopicContext {
   topic: string;
   diagnosticAnswers?: string[];
+  /** Phase 5: optional goal/domain framing (e.g. "for becoming a full-stack quant, Math domain") that biases which subtopics/emphasis get pulled out — fundamentals are still covered rigorously, just differently emphasized. Absent for every standalone Phase 1-4 call, so behavior there is unchanged. */
+  goalContext?: string;
 }
 
 registerTemplate<DecomposeTopicContext, DecomposeTopicOutput>({
@@ -31,6 +33,11 @@ registerTemplate<DecomposeTopicContext, DecomposeTopicOutput>({
     "(multiple search passes, a full explanation with intuition/mechanics/formal/application/frontier layers).",
     "Don't split so finely that subtopics are trivial, and don't leave them so broad that one subtopic is really several.",
     "",
+    "If goal context is given below, let it bias WHICH subtopics you pull out and how you frame/emphasize them",
+    "(e.g. weight toward the applications and angles that goal actually needs) — but every fundamental a learner",
+    "genuinely needs to understand the topic must still be covered rigorously. Goal context changes emphasis,",
+    "never depth or rigor.",
+    "",
     "Respond with ONLY a JSON object of this exact shape — no prose, no markdown code fences:",
     '{"prerequisites": string[], "subtopics": [{"title": string, "description": string}]}',
     '"description" is 1-2 sentences on what that subtopic covers and why it matters to the overall topic.',
@@ -42,6 +49,12 @@ registerTemplate<DecomposeTopicContext, DecomposeTopicOutput>({
         "",
         "The learner answered some diagnostic questions — use these to calibrate depth and starting point:",
         ...context.diagnosticAnswers.map((a, i) => `${i + 1}. ${a}`)
+      );
+    }
+    if (context.goalContext) {
+      lines.push(
+        "",
+        `Goal context (bias emphasis, not rigor): ${context.goalContext}`
       );
     }
     return lines.join("\n");

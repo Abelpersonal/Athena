@@ -175,6 +175,7 @@ export async function buildCourse(course: CourseJson, options: BuildCourseOption
       createdAt: course.generatedAt,
       volatilityTier: deriveCourseVolatility(course),
       status: "building",
+      goalContext: course.goalContext ?? null,
     });
     for (const row of moduleRows) await tx.insert(modules).values(row);
     for (const row of lessonRows) await tx.insert(lessons).values(row);

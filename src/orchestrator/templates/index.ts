@@ -25,6 +25,10 @@ import "./generateDebatePrompt.js";
 import "./dialogueTurn.js";
 import "./critiquePracticeAttempt.js";
 import "./generateReflectionPrompt.js";
+import "./classifyTopicOrGoal.js";
+import "./decomposeGoalIntoPath.js";
+import "./determineCrossDomainDependencies.js";
+import "./quickRefreshCheck.js";
 
 export * from "./registry.js";
 export * from "./summarizeText.js";
@@ -50,3 +54,7 @@ export * from "./generateDebatePrompt.js";
 export * from "./dialogueTurn.js";
 export * from "./critiquePracticeAttempt.js";
 export * from "./generateReflectionPrompt.js";
+export * from "./classifyTopicOrGoal.js";
+export * from "./decomposeGoalIntoPath.js";
+export * from "./determineCrossDomainDependencies.js";
+export * from "./quickRefreshCheck.js";

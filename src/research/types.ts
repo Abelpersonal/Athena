@@ -46,4 +46,6 @@ export interface CourseJson {
   prerequisites: string[];
   subtopics: SubtopicResult[];
   generatedAt: string;
+  /** Phase 5: the goal/domain framing this run was biased toward, when runResearchPipeline() was called with a goalContext option — undefined for every standalone Phase 1-4 call. Threaded through to buildCourse() -> courses.goalContext. */
+  goalContext?: string;
 }

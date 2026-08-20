@@ -140,6 +140,57 @@ describe("runResearchPipeline", () => {
     expect(course.prerequisites).toEqual(["prereq A"]);
   });
 
+  describe("goalContext (Phase 5 additive option)", () => {
+    it("threads goalContext into decompose_topic and synthesize_subtopic when provided, and sets it on the returned CourseJson", async () => {
+      const calls: Array<{ taskType: string; context: Record<string, unknown> }> = [];
+      const inner = makeOrchestratorMock({ subtopics: [{ title: "Linear Regression", description: "d" }] });
+      const orchestratorRun: OrchestratorRunFn = async (taskType, context, callingModule, options) => {
+        calls.push({ taskType, context });
+        return inner(taskType, context, callingModule, options);
+      };
+
+      const goalContext = 'Goal: "become a full-stack quant". Domain: "Math".';
+      const course = await runResearchPipeline("Linear Algebra", {
+        orchestratorRun,
+        searchProvider: fakeSearchProvider(),
+        fetchAndClean: fakeFetchAndClean,
+        goalContext,
+      });
+
+      const decomposeCall = calls.find((c) => c.taskType === "decompose_topic")!;
+      expect(decomposeCall.context.goalContext).toBe(goalContext);
+      const synthesizeCall = calls.find((c) => c.taskType === "synthesize_subtopic")!;
+      expect(synthesizeCall.context.goalContext).toBe(goalContext);
+
+      // Deliberately NOT threaded into every call — only decompose_topic and synthesize_subtopic, per the PRD's additive scope.
+      const searchQueryCall = calls.find((c) => c.taskType === "generate_search_queries")!;
+      expect(searchQueryCall.context.goalContext).toBeUndefined();
+
+      expect(course.goalContext).toBe(goalContext);
+    });
+
+    it("leaves goalContext absent everywhere when the option is omitted — every standalone Phase 1-4 call is unaffected", async () => {
+      const calls: Array<{ taskType: string; context: Record<string, unknown> }> = [];
+      const inner = makeOrchestratorMock({ subtopics: [{ title: "Linear Regression", description: "d" }] });
+      const orchestratorRun: OrchestratorRunFn = async (taskType, context, callingModule, options) => {
+        calls.push({ taskType, context });
+        return inner(taskType, context, callingModule, options);
+      };
+
+      const course = await runResearchPipeline("Linear Algebra", {
+        orchestratorRun,
+        searchProvider: fakeSearchProvider(),
+        fetchAndClean: fakeFetchAndClean,
+      });
+
+      const decomposeCall = calls.find((c) => c.taskType === "decompose_topic")!;
+      expect(decomposeCall.context.goalContext).toBeUndefined();
+      const synthesizeCall = calls.find((c) => c.taskType === "synthesize_subtopic")!;
+      expect(synthesizeCall.context.goalContext).toBeUndefined();
+      expect(course.goalContext).toBeUndefined();
+    });
+  });
+
   it("retries a subtopic that fails its first depth audit and marks it passed after a successful retry", async () => {
     const orchestratorRun = makeOrchestratorMock({
       subtopics: [{ title: "Failing Then Passing", description: "d" }],

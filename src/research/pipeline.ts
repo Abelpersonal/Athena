@@ -36,6 +36,15 @@ export interface RunResearchPipelineOptions {
   maxAuditRetries?: number;
   maxSourcesPerPass?: number;
   minExtractionConfidence?: number;
+  /**
+   * Phase 5 additive option: optional goal/domain framing (e.g. "for becoming a full-stack
+   * quant, Math domain: prerequisite for portfolio optimization") threaded into decompose_topic
+   * and synthesize_subtopic's prompts as extra framing — it biases emphasis, never depth;
+   * fundamentals are still covered rigorously either way. Absent (the default) for every
+   * standalone call from Phases 1-4, so their behavior is completely unchanged. See README,
+   * "Goal-scoped depth (Phase 5's additive researchAgent option)".
+   */
+  goalContext?: string;
   /** Injectable for tests and the harness's --dry-run mode. Default: the real Tavily MCP provider. */
   searchProvider?: SearchProvider;
   /** Injectable for tests and the harness's --dry-run mode. Default: the real orchestrator.run(). */
@@ -94,7 +103,7 @@ export async function runResearchPipeline(
   deps.onProgress?.(`Decomposing topic: "${topic}"...`);
   const decompose = await deps.orchestratorRun<DecomposeTopicOutput>(
     "decompose_topic",
-    { topic, diagnosticAnswers: options.diagnosticAnswers ?? [] },
+    { topic, diagnosticAnswers: options.diagnosticAnswers ?? [], goalContext: options.goalContext },
     "research-agent"
   );
   const { prerequisites, subtopics: rawSubtopics } = decompose.data;
@@ -120,12 +129,19 @@ export async function runResearchPipeline(
         topic,
         prerequisites,
         maxAuditRetries,
+        goalContext: options.goalContext,
         deps,
       })
     );
   }
 
-  return { topic, prerequisites, subtopics, generatedAt: new Date().toISOString() };
+  return {
+    topic,
+    prerequisites,
+    subtopics,
+    generatedAt: new Date().toISOString(),
+    ...(options.goalContext ? { goalContext: options.goalContext } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +155,7 @@ interface ProcessSubtopicInput {
   topic: string;
   prerequisites: string[];
   maxAuditRetries: number;
+  goalContext?: string;
   deps: ResolvedDeps;
 }
 
@@ -160,6 +177,7 @@ async function processSubtopic(input: ProcessSubtopicInput): Promise<SubtopicRes
       subtopicTitle: input.title,
       subtopicDescription: input.description,
       gapInstruction,
+      goalContext: input.goalContext,
       deps: input.deps,
     });
 
@@ -210,6 +228,8 @@ interface ResearchPassInput {
   subtopicTitle: string;
   subtopicDescription: string;
   gapInstruction?: string;
+  /** Threaded only into synthesize_subtopic (see researchPass below) — not into the search-query/extraction calls in gatherSources(), per the PRD's additive-option scope. */
+  goalContext?: string;
   deps: ResolvedDeps;
 }
 
@@ -335,6 +355,7 @@ async function researchPass(input: ResearchPassInput): Promise<ResearchPassResul
       contentionMaterial: contentionSources.map(toSourceExcerpt),
       validSourceIds: [...allValidIds],
       gapInstruction,
+      goalContext: input.goalContext,
     },
     "research-agent",
     { validateExtra: createCitationValidator(allValidIds, extractSynthesisCitations) }

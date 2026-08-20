@@ -1,4 +1,4 @@
-# Teacher — Orchestrator, Search, the Research Agent, Course Persistence, the Memory Graph, and Quiz/Practice Engines
+# Teacher — Orchestrator, Search, the Research Agent, Course Persistence, the Memory Graph, Quiz/Practice Engines, and the Goal Planner
 
 Backend-first plumbing for a personal, single-user AI learning platform.
 
@@ -32,17 +32,28 @@ Backend-first plumbing for a personal, single-user AI learning platform.
   the new `MasteryState` table — SQLite for queryable current state, and the Memory Graph for a
   dated history of how each concept node's score changed — see "Phase 4" below for the full
   writeup, including two documented deviations from the PRD's literal spec.
+- **Phase 5** adds the layer in front of the single-topic pipeline: the **Goal/Career Path
+  Planner** (`src/pathPlanner/`) classifies a raw input as a narrow topic or a broad goal
+  (CLI-confirmed, never applied silently), decomposes a goal into skill domains and topics with a
+  prerequisite order computed ACROSS domains (not just within one), runs overlap detection against
+  Phase 4's `MasteryState` and Phase 3.5's Memory Graph before generating anything, and generates
+  courses **on demand** — one topic at a time, picked by the user, respecting tier order — rather
+  than building the whole roadmap upfront. Introduces an original `Path`/`PathDomain`/`PathTopic`
+  data model (the PRD's Section 7 table has no Path entity, despite section 5.12a requiring one)
+  and one small additive parameter on the Research Agent for goal-scoped depth. See "Phase 5"
+  below for the full writeup, including two documented deviations from the PRD's literal spec.
 
-There is no Mind Map generation (Phase 8), Teaching Engine/voice (Phase 7.5), Continuous
-Learning/Knowledge Update Agents (Phase 6), Goal/Career Path Planner (Phase 5), or frontend here
-yet. **Important caveat, read before relying on the Definition-of-done checklists below:** this
-environment has no Docker installed, so the Memory Graph's Docker Compose setup, live MCP writes,
-and `inspect-graph` output could not be run or verified live here (Phase 3.5's gap, which also
-applies to Phase 4's `MasteryState` Memory Graph mirroring) — see "The Docker verification gap"
-near the end of this README before treating those items as confirmed. This environment also has
-no `TAVILY_API_KEY` configured, so a real (non-mocked) `research`/`build` run — and therefore a
-quiz/practice run grounded in genuinely-researched lesson content — could not be done either; see
-"The real-run blocker" below for how Phase 4 worked around this for its own demonstration.
+There is no Mind Map generation (Phase 8), Teaching Engine/voice (Phase 7.5), or Continuous
+Learning/Knowledge Update Agents (Phase 6) here yet, and no frontend — everything through Phase 5
+is exercised via the CLI harness. **Important caveat, read before relying on the
+Definition-of-done checklists below:** this environment has no Docker installed, so the Memory
+Graph's Docker Compose setup, live MCP writes, and `inspect-graph` output could not be run or
+verified live here (Phase 3.5's gap, which also applies to Phase 4's and Phase 5's `MasteryState`
+Memory Graph mirroring) — see "The Docker verification gap" near the end of this README before
+treating those items as confirmed. This environment also has no `TAVILY_API_KEY` configured, so a
+real (non-mocked) `research`/`build` run — and therefore any course generation that needs real web
+search, including Phase 5's on-demand generation — could not be done either; see "The real-run
+blocker" below for how Phases 4 and 5 worked around this for their own demonstrations.
 
 ## Tech choices
 
@@ -166,6 +177,8 @@ Teacher's own `.env` (repo root):
 | `QUIZ_QUESTIONS_PER_TIER` | No | `2` | Questions generated per requested tier by the Quiz Engine. |
 | `QUIZ_WEAK_CONCEPT_THRESHOLD` | No | `0.6` | Below this `knowledge_score`, a concept node is surfaced in `weakConceptNodes` (Phase 4; not load-bearing yet — see "The Quiz/Assessment Engine" below). |
 | `PRACTICE_ESCALATION_CAP` | No | `3` | Max attempts per module before the Practice Engine stops auto-generating harder variants (the cap'th attempt, and every attempt after it, stays at `novel_unguided`). |
+| `PATH_HIGH_SCORE_THRESHOLD` | No | `0.75` | Overlap detection (Phase 5): `knowledge_score` at or above this counts as "mastered, high score." |
+| `PATH_RECHECK_WINDOW_DAYS_FAST` / `_MEDIUM` / `_SLOW` / `_MIXED` | No | `30` / `90` / `180` / `90` | Overlap detection (Phase 5): a matched course's mastery is "fresh" within this many days (by its volatility tier) — past it, a quick_refresh_check LLM call runs instead of reusing blindly. |
 
 `mcp_server/.env` (separate file, the Graphiti service's own config — not read by Teacher's Node
 process at all):
@@ -220,6 +233,13 @@ npm run harness -- quiz <lesson_id> [recall|application|transfer]
 # submission ended with a line containing only "/done". Then prints the critique, a reflection
 # prompt (captured the same way), and the updated MasteryState.experience_score.
 npm run harness -- practice <module_id>
+
+# Phase 5: classify raw input as a topic or a goal (CLI-confirmed — you can override the model's
+# call), real APIs. A topic classification runs the existing build pipeline unchanged. A goal
+# classification decomposes into a cross-domain roadmap, runs overlap detection against
+# MasteryState/the Memory Graph, prints the annotated roadmap, then loops letting you pick a
+# generatable pending/delta_needed topic to generate next (looping back to the roadmap after each).
+npm run harness -- goal "<input>"
 ```
 
 The Phase 1 form prints a structured, schema-checked `summarize_text` result plus the JSONL log
@@ -358,6 +378,49 @@ npm run typecheck
   module while leaving each lesson's pre-existing `knowledgeScore` untouched, calls the Memory
   Graph mirror once per lesson with `"experience"` type, and reports
   `willEscalateNextAttempt: false` once the cap is reached.
+- `tests/pathPlannerOrdering.test.ts` (Phase 5) — `computeCrossDomainOrder()` unit tests, pure, no
+  LLM involved: a topic in one domain that depends on a topic in a DIFFERENT domain lands at a
+  strictly later tier (the actual cross-domain case this function exists for), topics with no
+  dependency between them share one tier and `parallelGroup` even across domains, a longer
+  dependency chain assigns tiers correctly (including taking the max across multiple
+  dependencies), a genuine cycle throws `PathPlannerError`, and self-referencing/dangling edges are
+  ignored rather than crashing (mirrors `topoSortModules`' tests).
+- `tests/pathPlannerOverlap.test.ts` (Phase 5) — `decideOverlapBranch()` unit tests, pure, hitting
+  every branch directly by constructing candidate objects (no DB, no LLM, no Memory Graph): no
+  matching course, a match below the high-score threshold, a match with no quiz history at all, an
+  angle mismatch taking precedence over recency even when the match is fresh, no mismatch when the
+  candidate has no `goalContext` or a matching one, within-window vs. past-window recency by
+  volatility tier, and a `null` `lastUpdated` treated as infinitely stale.
+  `extractCourseIdsFromHistory()` unit tests (recovers a `course_id` from real Memory Graph episode
+  text shapes, and returns `[]` when none is present). `resolveOverlapForTopic()` integration tests
+  with `findCandidateCourse`/`getExistingLessonTitles` mocked (per the PRD's "mock the Memory Graph
+  query" instruction) hitting all four PRD scenarios end-to-end, including both quick-refresh
+  outcomes as their own distinct case (a mocked `orchestratorRun` returning `stillAccurate: true` vs.
+  `false`) — not just the four `status` values, since two scenarios both resolve to
+  `linked_existing` but via genuinely different code paths.
+- `tests/pathPlanner.test.ts` (Phase 5) — `classifyInput` boundary cases (a clear single-topic
+  input classified `"topic"`, a clear broad input classified `"goal"`, with the raw input verified
+  to reach the Orchestrator call unchanged). `decomposeAndPersistPath` integration test against an
+  in-memory db with a REAL cross-domain dependency in the mocked `determine_cross_domain_dependencies`
+  response (a Programming-domain topic depending on a Math-domain topic) — asserts every persisted
+  `PathTopic` has `course_id: null`/`status: "pending"`, and that the dependent topic's persisted
+  `order` is strictly greater than its cross-domain prerequisite's. `runOverlapDetectionForPath`
+  persists each topic's resolved status/`course_id` and returns the annotated roadmap; an unknown
+  path id throws `PathPlannerError`. `isTopicGeneratable` unit tests covering the tier-gating rule
+  directly: a blocked tier-1 topic, the same topic unblocked once every tier-0 topic is
+  `linked_existing`, same-`parallelGroup` topics never blocking each other even mid-tier, and an
+  already-`linked_existing`/`mastered`/`in_progress` topic never itself being "generatable" again.
+  `generateTopicCourse` (mocked `runResearchPipelineFn`/`buildCourseFn`/`aggregateMaterialsFn`,
+  same dependency-injection pattern as everywhere else): a pending topic's course_id/status update
+  and unmodified topic string, a `delta_needed` topic's narrowly-reframed topic string (asserted to
+  differ from the bare topic name) and `wasDelta: true`, refusing (throwing `PathPlannerError`,
+  with zero pipeline calls made and no DB mutation) to generate a topic blocked by an earlier
+  unfinished tier — the ordering guard enforced directly inside the function, not just left to the
+  harness's own topic-picking UI — and an unknown `PathTopic` id also throwing.
+- `tests/pathPlannerTemplates.test.ts` (Phase 5) — `createDecomposeGoalIntoPathValidator` and
+  `createDetermineCrossDomainDependenciesValidator` unit tests (coverage/uniqueness/unknown-reference/
+  self-dependency rejection), mirroring `courseBuilderTemplates.test.ts`'s pattern for the Phase 3
+  validators.
 
 ## Architecture
 
@@ -391,16 +454,20 @@ src/
     index.ts                # generateQuizQuestions() / scoreAndRecordQuiz() — public API
   practiceEngine/         # Phase 4: the Practice/Experience Engine
     index.ts                # preparePracticeSession() / runDialogueTurn() / critiquePracticeAttempt() / generateReflectionPromptText() / recordPracticeAttempt() — public API
+  pathPlanner/            # Phase 5: the Goal/Career Path Planner
+    index.ts                # classifyInput() / decomposeAndPersistPath() / runOverlapDetectionForPath() / loadPathRoadmap() / isTopicGeneratable() / generateTopicCourse() — public API
+    ordering.ts                # computeCrossDomainOrder() — pure cross-domain topological tiering, no LLM/DB
+    overlap.ts                  # decideOverlapBranch() (pure) + resolveOverlapForTopic() — overlap detection against MasteryState + the Memory Graph
   db/                     # SQLite (node:sqlite) + Drizzle
-    schema.ts                # courses / modules / lessons / sources / quizResults / practiceAttempts / masteryState (Phase 4) tables
+    schema.ts                # courses (+ goal_context, Phase 5) / modules / lessons / sources / quizResults / practiceAttempts / masteryState (Phase 4) / paths / pathDomains / pathTopics (Phase 5) tables
     client.ts                  # getDb() — lazy connect + auto-migrate, sqlite-proxy driver
   shared/
     ids.ts                # slugify() / assignUniqueIds() — shared by pipeline.ts and courseBuilder
   harness/
-    cli.ts               # debugging CLI: Phase 1 demo + `research [--dry-run]` + `build [--dry-run]` + `quiz` + `practice` (Phase 4)
+    cli.ts               # debugging CLI: Phase 1 demo + `research [--dry-run]` + `build [--dry-run]` + `quiz`/`practice` (Phase 4) + `goal` (Phase 5)
     inspect.ts             # `npm run inspect -- <course_id>` — dumps a persisted course from SQLite, incl. QuizResult/PracticeAttempt/MasteryState (Phase 4)
     inspectGraph.ts          # `npm run inspect-graph -- "<topic>"` — dumps Memory Graph history
-    mocks.ts              # canned dependencies for --dry-run (research AND build)
+    mocks.ts              # canned dependencies for --dry-run (research AND build); also reused by Phase 5's on-demand generation demo (see "Definition of done — Phase 5")
 tests/
   orchestrator.test.ts
   providers.test.ts
@@ -414,6 +481,10 @@ tests/
   memoryGraph.test.ts
   quizEngine.test.ts        # Phase 4
   practiceEngine.test.ts    # Phase 4
+  pathPlannerOrdering.test.ts    # Phase 5
+  pathPlannerOverlap.test.ts     # Phase 5
+  pathPlanner.test.ts            # Phase 5
+  pathPlannerTemplates.test.ts   # Phase 5
 drizzle/                 # versioned migration SQL, generated by `npm run db:generate` — committed
 drizzle.config.ts
 mcp_server/              # Docker Compose for Graphiti + FalkorDB (Phase 3.5) — see Setup above
@@ -624,19 +695,22 @@ fabricated citation.
 
 ### The database layer (SQLite + Drizzle)
 
-`src/db/schema.ts` defines Phase 3's four tables plus Phase 4's three — `Book` and `UpdateEvent`
-belong to later phases and aren't modeled yet, so the schema grows incrementally instead of
-drifting ahead of what's built:
+`src/db/schema.ts` defines Phase 3's four tables, Phase 4's three, and Phase 5's three — `Book` and
+`UpdateEvent` belong to later phases and aren't modeled yet, so the schema grows incrementally
+instead of drifting ahead of what's built:
 
 | Table | Columns |
 |---|---|
-| `courses` | `id`, `topic`, `created_at`, `volatility_tier` (`fast`\|`medium`\|`slow`\|`mixed`, aggregated from subtopic tiers), `status` (`building`\|`complete`) |
+| `courses` | `id`, `topic`, `created_at`, `volatility_tier` (`fast`\|`medium`\|`slow`\|`mixed`, aggregated from subtopic tiers), `status` (`building`\|`complete`), `goal_context` (nullable, Phase 5 — see "Goal-scoped depth" below) |
 | `modules` | `id`, `course_id`, `title`, `description`, `order` (DB column `order_index` — sidesteps the SQL reserved word, JS field stays `order`), `prerequisite_of` (JSON array of module ids) |
 | `lessons` | `id`, `module_id`, `title`, `description`, `estimated_duration`, `layers` (JSON — same shape as Phase 2's `RestructureLayersOutput["layers"]`), `source_refs` (JSON array of source ids), `audio_cache_ref` (nullable, unused until the audio-caching phase — the column exists now so the schema doesn't change later), `source_status` (`ok`\|`below_threshold`) |
 | `sources` | `id`, `url`, `type` (`article`\|`pdf`\|`video`\|`other`\|`unreachable`\|`low_confidence`), `extracted_text`, `credibility_score`, `fetched_at` |
 | `quiz_results` (Phase 4) | `id`, `lesson_id`, `tier` (`recall`\|`application`\|`transfer`), `score` (0-1 real), `date` — one row per (lesson, tier) tested in a quiz session, not per question |
 | `practice_attempts` (Phase 4) | `id`, `module_id`, `type` (`project`\|`simulation`\|`debate`), `attempt_number`, `feedback`, `reflection_notes` (nullable), `date` |
 | `mastery_state` (Phase 4) | `concept_node_id` (primary key), `knowledge_score` (0-1 real, nullable), `experience_score` (0-1 real, nullable), `last_updated` — see "The Quiz/Assessment Engine" and "The Practice/Experience Engine" below for how the two score columns are kept independent |
+| `paths` (Phase 5) | `id`, `goal_description`, `created_at`, `status` (`active`\|`completed`) |
+| `path_domains` (Phase 5) | `id`, `path_id`, `name`, `order` (DB column `order_index`, same reserved-word dodge as `modules`) |
+| `path_topics` (Phase 5) | `id`, `path_id`, `domain_id`, `topic_name`, `description`, `order` (a cross-domain topological TIER, not a per-topic unique sequence), `parallel_group`, `course_id` (nullable — null until generated/linked), `status` (`pending`\|`linked_existing`\|`delta_needed`\|`in_progress`\|`mastered`) — this is an **original design filling a real PRD gap**, not a literal spec table; see "The Path data model" below for the full writeup |
 
 `npm run db:generate` (`drizzle-kit generate`) diffs `schema.ts` against `drizzle/`'s migration
 history and writes a new versioned SQL file when the schema changes — run it after editing
@@ -1034,6 +1108,295 @@ text and would likely all classify the same way):
   shape, `"knowledge"`-vs-`"experience"` distinction, graceful degradation).
 - All 108 tests pass (`npm test`), `npm run typecheck` is clean.
 
+## Phase 5: the Goal/Career Path Planner
+
+Phases 1-4 operate on ONE topic at a time: research it, build it into a course, persist it, quiz
+and practice against it. Phase 5 (`src/pathPlanner/`) is the layer in front of that pipeline that
+handles broad goals ("become a full-stack quant," "become financially independent") — decomposing
+them into a multi-course roadmap, checking what's already mastered before generating anything new
+(overlap detection is the actual point of this module, and it's meaningless without real
+`MasteryState` data to check against — which is why the roadmap sequences this phase after Phase 4
+and Phase 3.5, not earlier), and generating courses **on demand** rather than all at once. No
+syllabus-of-syllabi UI (Phase 7), no career-level knowledge graph rendering (Phase 8), no
+Continuous Learning/Knowledge Update Agents (Phase 6 — order between Phase 5 and 6 doesn't
+functionally matter, since neither depends on the other; the roadmap just lists this one first).
+Exercised via the CLI harness, same as every phase so far.
+
+### The Path data model (a documented gap, not a literal PRD table)
+
+The PRD's Section 7 core data model (Course/Module/Lesson/Source/QuizResult/PracticeAttempt/
+MasteryState/Book/UpdateEvent) has no Path entity, even though section 5.12a clearly requires
+persisting one. `paths` / `path_domains` / `path_topics` (`src/db/schema.ts`) are an **original
+design filling that gap** — not a literal spec table — following the shape the prompt sketched:
+
+- **`Path`**: `id`, `goal_description`, `created_at`, `status` (`active`\|`completed`).
+- **`PathDomain`**: `id`, `path_id`, `name`, `order` — a skill domain within the goal (e.g. "Math,"
+  "Programming," "Finance" for "become a full-stack quant"). Domain `order` is purely
+  presentational grouping/display order — the actual cross-domain scheduling constraint lives
+  entirely on `PathTopic.order`/`parallel_group`, not here.
+- **`PathTopic`**: `id`, `path_id`, `domain_id`, `topic_name`, `description`, `order`,
+  `parallel_group`, `course_id` (nullable), `status`
+  (`pending`\|`linked_existing`\|`delta_needed`\|`in_progress`\|`mastered`).
+
+Two design choices worth calling out explicitly, since they're mine, not the PRD's:
+
+- **`order` is a topological TIER across the WHOLE path's cross-domain graph, not a per-topic
+  unique sequence number.** Tier 0 = no prerequisites within the path; tier N = depends on at
+  least one tier-(N-1) topic and nothing later. `parallel_group` is a separate column but is
+  currently derived 1:1 from the tier (every topic at tier N shares one `parallel_group`, literally
+  `"tier_N"`) — it exists as its own field because "which topics form one freely-orderable batch"
+  is the more directly useful thing for a UI/CLI (or a future, finer-grained scheduler) to group
+  by, even though today it's just a formatted version of `order`. See
+  `src/pathPlanner/ordering.ts`.
+- **Topic selection (Deliverable 4) is TIER-gated, not raw-edge-gated.** The schema doesn't persist
+  the raw dependency edges past ordering time (`determine_cross_domain_dependencies`'s output is
+  consumed once, by `computeCrossDomainOrder()`, and then discarded — only the derived
+  `order`/`parallel_group` are persisted). So `isTopicGeneratable()` in `src/pathPlanner/index.ts`
+  gates on "every topic at a strictly lower tier is done," not "every topic this one specifically
+  depends on is done" — a topic can't jump ahead of ANY earlier tier, even a topic in that tier it
+  doesn't technically depend on. This is a deliberate, documented simplification (a full raw-edge
+  gate would need a `path_topic_dependencies` join table this design doesn't have) that still
+  satisfies the PRD's actual requirement ("don't let them jump ahead of a sequential prerequisite
+  that isn't done, but parallel-track topics are freely orderable") — topics in the SAME tier
+  really are mutually parallel by construction (the tiering algorithm guarantees no dependency
+  edge within a tier), which is the part that has to be exactly right.
+- **`status: "mastered"` is reserved, not assigned by anything in Phase 5.** Overlap detection only
+  ever writes `pending`/`linked_existing`/`delta_needed`; on-demand generation transitions
+  `pending`/`delta_needed` → `in_progress` → `linked_existing` (reusing `linked_existing` to mean
+  "this topic now has a ready `course_id`," whether that came from an overlap match OR fresh
+  generation — the harness's own in-memory session tracking, not a DB field, is what distinguishes
+  "just generated this run" for display purposes). `mastered` is left for Phase 6 (the Continuous
+  Learning Agent), which will have real accumulated quiz evidence to promote a topic with once it
+  exists — Phase 5 alone never has grounds to claim a freshly-generated or freshly-linked course
+  has actually been learned yet.
+- **concept_node_id granularity (Phase 4) has one consequence here**: `PathTopic` is module/course-
+  scoped, but `MasteryState` is keyed at `lesson_id` granularity (see Phase 4's own documented
+  simplification). Overlap detection's aggregate score for a candidate course is the AVERAGE
+  `knowledge_score` across that course's scored lessons (see "Overlap detection" below) — a
+  reasonable aggregate given the granularity mismatch, not a precise per-topic signal.
+
+### Deviation: `goalContext` is a small additive Research Agent option, not a rewrite
+
+The PRD's "goal-scoped depth" requirement means the Research Agent needs to accept optional goal
+context that biases emphasis. Rather than rewriting Phase 2, `runResearchPipeline(topic, options)`
+(`src/research/pipeline.ts`) gained one new optional field on its existing options object:
+`goalContext?: string`. When present, it's threaded into exactly two prompts —
+`decompose_topic`'s and `synthesize_subtopic`'s — as extra framing text ("bias emphasis, not
+rigor"); every other call in the pipeline (`generate_search_queries`, `extract_grounded_key_points`,
+`restructure_layers`, `depth_audit_score`, `classify_volatility`) is untouched. When absent (the
+default — every standalone call from Phases 1-4, and every call in Phase 5's own test suite that
+doesn't pass it), behavior is byte-for-byte unchanged; `tests/research.pipeline.test.ts`'s
+"goalContext (Phase 5 additive option)" suite proves both the threading (present in exactly those
+two calls' context, absent everywhere else, and surfaced on the returned `CourseJson.goalContext`)
+and the no-op case (completely absent when the option isn't passed). This stayed a small, additive
+change exactly as scoped — it never needed to touch the Research Agent's core pipeline logic.
+
+`CourseJson.goalContext` flows through `buildCourse()` into `courses.goal_context` (Phase 5's one
+schema addition to an existing table), which is what lets overlap detection later tell "generic
+fundamentals" (`goal_context: null`) apart from "mastered under a DIFFERENT goal's angle" (a
+different non-null value) for the SAME topic.
+
+### Deliverable 1: classification
+
+`classifyInput(input, options)` (`src/pathPlanner/index.ts`) is a thin wrapper around one `[LLM]`
+call (`classify_topic_or_goal`) — it never decides anything by itself. The CLI harness
+(`npm run harness -- goal "<input>"`) always prints the model's classification and reasoning, then
+asks the user to confirm or override before proceeding ("This looks like a big GOAL — build a full
+path, or just one course on the core idea?"); an override is respected exactly like the model's own
+call — a single-topic classification (or override) routes straight into the existing
+`build`/Phase 2→3→3.5 pipeline unchanged (literally: `runGoalCommand` calls `runBuildCommand([input])`),
+a goal classification (or override) continues into decomposition below. Nothing about this decision
+is ever applied silently.
+
+### Deliverable 2: decomposition + cross-domain dependency mapping
+
+`decomposeAndPersistPath(goalDescription, options)` runs both of Deliverable 2's `[LLM]` steps —
+`decompose_goal_into_path` (goal → domains → topics, tempId-referenced like `sequence_modules`'
+module tempIds) and `determine_cross_domain_dependencies` (raw prerequisite EDGES across the WHOLE
+topic set, not just within one domain — explicitly prompted to look for cross-domain edges
+specifically, since that's "the actually hard part" per the PRD) — then turns the raw edges into
+actual scheduling tiers via `computeCrossDomainOrder()` (`src/pathPlanner/ordering.ts`), a pure,
+LLM-free, directly-unit-tested function (`tests/pathPlannerOrdering.test.ts`) generalizing
+`courseBuilder/sequence.ts`'s `topoSortModules()` from one flat order to topological LEVELS: Kahn's
+algorithm, but every node at the same remaining-in-degree-zero round lands in the same tier instead
+of being linearized arbitrarily. Same philosophy as every other multi-step pipeline in this
+codebase: the model reports the raw graph, code computes the aggregate (never trust the model with
+a self-consistent order it could get out of sync with its own edges) — a genuine cycle throws
+`PathPlannerError` rather than silently guessing an order, and self-referencing/dangling edges are
+dropped rather than trusted verbatim.
+
+`decompose_goal_into_path` returning an implausibly large topic count only logs a warning
+(`PATH_TOPIC_COUNT_WARNING_THRESHOLD = 40`) and proceeds — a sanity check, not a hard cap, per the
+PRD ("this is a personal tool, not a system that needs to protect itself from its own user").
+
+`[code]` persists `Path`/`PathDomain`/`PathTopic` rows in one transaction — every `PathTopic` starts
+with `course_id: null`, `status: "pending"`. Overlap detection (below) runs as its own separate
+pass afterward, not folded into this step.
+
+### Deliverable 3: overlap detection
+
+`runOverlapDetectionForPath(pathId, options)` resolves and PERSISTS every `PathTopic`'s status
+before any course generation happens, then returns the annotated roadmap — the CLI harness prints
+it explicitly (domain → tier → status, one line per topic), mirroring the PRD's UX requirement even
+though there's no UI yet; none of these decisions are ever applied silently.
+
+The actual decision (`resolveOverlapForTopic()` / `decideOverlapBranch()`,
+`src/pathPlanner/overlap.ts`) combines Phase 4's `MasteryState` (SQLite — structurally joinable,
+authoritative for "does a course with a matching topic exist, and what's its aggregate mastery")
+with Phase 3.5's `getTopicHistory()` (the Memory Graph — a text search that can recover a candidate
+course id via a DIFFERENTLY-worded course title, using a genuinely real mechanism:
+`writeTopic()`'s episode text literally embeds `course_id: <id>`, so
+`extractCourseIdsFromHistory()` regex-extracts it back out — not guessed, read straight off what
+`memoryGraph/index.ts` actually writes). A course's "aggregate mastery" is the average
+`knowledge_score` across its lessons that have one at all (see the concept_node_id note above); with
+no scored lessons at all, it's treated as `null` (not yet mastered), not zero.
+
+The decision logic itself is a **pure function**, `decideOverlapBranch()` — no DB, no LLM, no I/O —
+so every branch is directly unit-testable by constructing candidate objects
+(`tests/pathPlannerOverlap.test.ts`). Precedence, matching the PRD's bullet order:
+
+1. **No candidate course found at all** → `pending`.
+2. **A candidate exists but its aggregate `knowledge_score` is below the high-score threshold** (or
+   has no quiz history at all) → `pending` ("not yet mastered").
+3. **ANGLE MISMATCH checked before recency** — a candidate that IS high-scoring but was built under
+   a DIFFERENT goal's `goal_context` (a non-null value that doesn't match this path's goal
+   description) → `delta_needed`, `course_id` left `null` (a delta hasn't been generated yet — see
+   Deliverable 4). A candidate with `goal_context: null` (built standalone — generic fundamentals)
+   is never treated as a mismatch; a candidate whose `goal_context` matches (case/whitespace-
+   insensitive) isn't either.
+4. **Angle-compatible and high-scoring, within its volatility tier's recheck window** →
+   `linked_existing`, `course_id` set to the matched course directly (no extra LLM call).
+5. **Angle-compatible, high-scoring, but PAST the recheck window** → one lightweight
+   `quick_refresh_check` `[LLM]` call (explicitly NOT a full re-research — topic, volatility tier,
+   days since last verified, and the course's current lesson titles; defaults toward
+   `stillAccurate: true` unless there's a concrete reason to doubt it, since this check exists
+   specifically to avoid unnecessary re-research) → `linked_existing` if it passes, `pending`
+   ("regenerate") if real gaps surface.
+
+Branches 4 and 5-pass both resolve to the same `status: "linked_existing"`, but
+`resolveOverlapForTopic()`'s `branch` field (`fresh_high_score` vs. `stale_recheck_passed`) keeps
+them distinguishable — `tests/pathPlannerOverlap.test.ts` and the real run below demonstrate both
+as genuinely different code paths, not just two instances of the same outcome.
+
+**Resolved thresholds** (the PRD's open questions, both configurable via env vars — see above):
+
+- **"High score"**: `knowledge_score >= 0.75` (`PATH_HIGH_SCORE_THRESHOLD`) — reusing Phase 4's
+  weak-concept threshold (0.6) inversely, per the PRD's own suggested default.
+- **"Past the volatility recheck window"**: a simple date check (`PATH_RECHECK_WINDOW_DAYS_*`) —
+  30/90/180/90 days for fast/medium/slow/mixed — rather than blocking on Phase 6's Knowledge Update
+  Agent recheck-scheduling logic, which doesn't exist yet. Phase 6 will formalize this later; this
+  is deliberately just a date comparison in the meantime, per the PRD's own resolved default.
+
+### Deliverable 4: on-demand generation
+
+No course content is generated upfront for the whole roadmap — every `PathTopic` persists with
+`course_id: null` until it's individually picked. `isTopicGeneratable(topic, allTopics)`
+(`src/pathPlanner/index.ts`, pure) is the tier-gating guard described above; the CLI harness only
+ever offers generatable topics as choices, and `generateTopicCourse()` re-checks the same guard
+itself (defense in depth) before doing anything, throwing `PathPlannerError` rather than silently
+generating out of order.
+
+Generating a topic runs the EXISTING Phase 2 → 3 → 3.5 pipeline (`runResearchPipeline` →
+`buildCourse` → `aggregateMaterials`, completely unmodified code) with `goalContext` set to this
+path/domain's framing, then updates that `PathTopic`'s `course_id` and `status` (→ `in_progress`
+while running, → `linked_existing` on success).
+
+**Delta course scope** (the PRD's open question, resolved): for a `delta_needed` topic, "narrow"
+is achieved by PROMPT FRAMING, not a structurally separate code path — the topic string handed to
+`runResearchPipeline` is rewritten to explicitly ask for just the emphasis gap ("additional depth
+specifically for the goal X, beyond what's already covered generically... focus tightly on the gap,
+not a full re-teach"), `goalContext` names it a "TARGETED DELTA," and `maxAuditRetries` is set to
+`0` (one pass is enough for a narrow gap). This reuses the Research Agent's existing pipeline
+entirely unchanged in code — which also keeps this well inside the "don't rewrite the Research
+Agent" guardrail from the kickoff prompt — rather than building a separate narrow single-subtopic
+mode. `generateTopicCourse()`'s `wasDelta` return field and `tests/pathPlanner.test.ts` both
+confirm the delta topic string is genuinely reframed (not just the bare topic name).
+
+### Definition of done — Phase 5
+
+**Classification — real, both boundary cases, genuinely confirmed:**
+
+```
+Input: "Photosynthesis"
+-> { classification: 'topic',
+     reasoning: 'Photosynthesis is a specific biological process that can be thoroughly taught
+     as a single, focused subject or course.' }
+
+Input: "become a full-stack quant"
+-> { classification: 'goal',
+     reasoning: 'Becoming a full-stack quant requires mastering several distinct, independent
+     fields including quantitative finance, advanced mathematics, statistical modeling, and
+     software engineering. Because this spans multiple distinct domains rather than a single
+     cohesive subject, it is a broad goal rather than a single topic.' }
+```
+
+Both real calls (`classifyInput()`, real `GEMINI_API_KEY`, no mocking) landed on the obviously
+correct side of the topic/goal boundary with genuinely on-target reasoning — real evidence for the
+DoD's "classification correctly identifies at least one clear single-topic input and one clear goal
+input."
+
+**Blocked, same day, by the exact wall Phase 2/3 already hit** (see "The real-run blocker" above):
+the very next real call, `decompose_goal_into_path` for `"become a full-stack quant"`, hit Gemini's
+`RESOURCE_EXHAUSTED` free-tier daily cap — confirmed genuinely exhausted (not transient) by
+immediately retrying a second, minimal, unrelated `classify_topic_or_goal` call afterward, which
+failed identically. This blocks a real end-to-end demonstration of decomposition, cross-domain
+ordering, overlap detection, and on-demand generation together in one live run — including the
+CLI's interactive classification-override step, since even the one `classify_topic_or_goal` call
+that step needs was no longer available. **Unlike Phase 2/3's still-open items, this isn't left
+purely as a documented gap** — every one of those pieces is instead verified by real, deterministic
+tests exercising the actual production code (not reimplemented test-only logic), which is what
+Phase 3's own Definition-of-done treated as sufficient evidence for its own equally-blocked items:
+
+- **Cross-domain ordering, a real cross-domain dependency, genuinely demonstrated**:
+  `tests/pathPlanner.test.ts`'s `decomposeAndPersistPath` integration test feeds a mocked
+  `determine_cross_domain_dependencies` response where a Programming-domain topic ("NumPy for
+  Linear Algebra") depends on a Math-domain topic ("Linear Algebra") — a genuine cross-domain edge,
+  not a same-domain one — and asserts the PERSISTED `order` reflects it (the Math topic at tier 0,
+  the Programming topic strictly later, on different `parallel_group`s), proving
+  `computeCrossDomainOrder()`'s real tiering algorithm runs correctly against real persistence, not
+  just in isolation. `tests/pathPlannerOrdering.test.ts` additionally proves the algorithm itself
+  handles longer chains, multiple dependencies via max-tier, cycles (`PathPlannerError`), and
+  dangling/self edges (ignored) — all pure, no LLM, no mocking needed at all.
+- **All four overlap-detection scenarios, hit individually, including the two that both resolve to
+  `linked_existing` via different paths**: `tests/pathPlannerOverlap.test.ts`'s
+  `resolveOverlapForTopic` suite constructs a fresh-and-high-scoring candidate (→
+  `linked_existing`/`fresh_high_score`, no extra LLM call), a stale-but-high-scoring candidate with
+  a mocked `quick_refresh_check` returning `stillAccurate: true` (→ `linked_existing`/
+  `stale_recheck_passed`) AND a second copy returning `false` (→ `pending`/`stale_recheck_failed`)
+  — proving both real outcomes of that branch, not just one — an angle-mismatched candidate (→
+  `delta_needed`/`angle_mismatch`, `course_id` deliberately left unlinked) and no candidate at all
+  (→ `pending`/`no_match`). `decideOverlapBranch()`'s own pure unit tests independently re-confirm
+  every threshold edge (exact high-score cutoff, exact recheck-window cutoff per volatility tier,
+  case/whitespace-insensitive angle matching, a `null lastUpdated` treated as infinitely stale).
+- **On-demand generation, the state transition AND the ordering guard, both verified against real
+  persistence**: `tests/pathPlanner.test.ts`'s `generateTopicCourse` suite (mocked
+  `runResearchPipelineFn`/`buildCourseFn`/`aggregateMaterialsFn`, the same DI seam
+  `build --dry-run` uses) confirms a pending topic's `course_id`/`status` update to
+  `linked_existing` with the UNMODIFIED topic string reaching the pipeline, a `delta_needed`
+  topic's topic string genuinely reframed (asserted to differ from the bare topic name and mention
+  "emphasis" — not just a flag saying so) with `wasDelta: true`, and — critically — a topic at a
+  later tier whose earlier tier isn't finished yet is REFUSED (`PathPlannerError`, zero pipeline
+  calls made, zero DB mutation) rather than silently generated out of order. `isTopicGeneratable`'s
+  own pure unit tests separately confirm same-`parallel_group` topics never block each other even
+  mid-tier, and an already-`linked_existing`/`mastered`/`in_progress` topic is never itself
+  re-offered as generatable.
+- **`goalContext` threading, confirmed present exactly where it should be and absent everywhere
+  else**: `tests/research.pipeline.test.ts`'s "goalContext (Phase 5 additive option)" suite
+  confirms `decompose_topic` and `synthesize_subtopic` receive it when passed (and it lands on the
+  returned `CourseJson`), that `generate_search_queries` (an unrelated call in the same pipeline
+  run) never sees it, and that omitting the option leaves every call and the returned `CourseJson`
+  completely unaffected — the "small, additive, no rewrite" guardrail, checked directly rather than
+  just asserted in prose.
+- All 161 tests pass (`npm test`; 108 from Phases 1-4 + 44 new for Phase 5 + 9 in
+  `research.pipeline.test.ts` including the 2 new `goalContext` tests), `npm run typecheck` is
+  clean.
+
+**What would still be worth doing once the quota resets or billing is enabled**: a real
+`npm run harness -- goal "<a genuinely broad goal>"` run all the way through, including a real
+`quick_refresh_check` call and real on-demand generation of at least one topic (needs
+`TAVILY_API_KEY` too, for that last step) — the exact same "Options to actually close these out"
+list in "The real-run blocker" above applies unchanged.
+
 ### Documented gaps
 
 - **No Trafilatura fallback for low-confidence extractions.** `fetchAndClean` returns a
@@ -1181,7 +1544,7 @@ exactly once, with the real gap description in its input) and staying below thre
 one attempt (asserts `source_status: "below_threshold"` and that backfill is *not* retried a
 second time).
 
-### The real-run blocker (Phase 2 and Phase 3, shared cause)
+### The real-run blocker (Phase 2, Phase 3, and now Phase 5 — same cause)
 
 Both phases' remaining open items need the same thing: a full, real (non-mocked) pipeline run.
 That's now blocked by something more specific than "no API key configured" — a real
@@ -1212,6 +1575,20 @@ Options to actually close these two items out, in rough order of preference:
 Once one real run succeeds, closing both items is the same manual check described previously:
 inspect the resulting course (via `output/<slug>.json` for Phase 2's audit-retry evidence, and
 `npm run inspect -- <course_id>` for Phase 3's persisted-record evidence).
+
+**Phase 5 hit the identical wall the same day.** Unlike Phase 2/3's own blocked items, most of
+Phase 5's `[LLM]` steps (classification, decomposition, cross-domain dependency mapping, the
+overlap detection's `quick_refresh_check`) need NO web search at all — only on-demand generation
+does (it's the exact same `runResearchPipeline` call Phase 2/3 use). Real classification calls
+succeeded (see "Definition of done — Phase 5" for the actual output — both a clear single-topic
+and a clear broad-goal input, real reasoning), but the very next real call
+(`decompose_goal_into_path`, attempted right after) hit `RESOURCE_EXHAUSTED` — confirmed the daily
+cap was genuinely exhausted (not a transient hiccup) by immediately retrying a single, minimal
+`classify_topic_or_goal` call afterward, which failed the same way. This tracks: Phase 4's own real
+run in this same session (quiz/practice generation, scoring, critique, two full practice attempts)
+already spent a substantial share of the day's 20-request cap before Phase 5 even started. See
+"Definition of done — Phase 5" for exactly what real evidence exists vs. what's covered by the
+(extensive, deterministic) unit test suite instead.
 
 ### The Docker verification gap (Phase 3.5)
 
@@ -1288,3 +1665,15 @@ real-run blocker above resolved first, since `build` needs real LLM calls too) f
   A module-scoped `PracticeAttempt`'s `experienceScore` update is broadcast to every lesson under
   that module rather than being tracked at a finer grain. See "concept_node_id granularity
   (documented simplification)" above for the full reasoning and its one real consequence.
+- **(Phase 5) `Path`/`PathDomain`/`PathTopic` is an original schema design, not a literal PRD
+  table** — Section 7's data model has no Path entity despite section 5.12a requiring one
+  persisted. Filled the gap in the spirit of the prompt's own sketch, with two of my own added
+  design decisions (a topological-tier `order` shared with `parallel_group`, and tier-gated rather
+  than raw-edge-gated topic selection). See "The Path data model (a documented gap, not a literal
+  PRD table)" above for the full writeup and reasoning.
+- **(Phase 5) `runResearchPipeline()` gained one additive `goalContext?: string` option** rather
+  than the Research Agent being rewritten — threaded into exactly `decompose_topic` and
+  `synthesize_subtopic`'s prompts as extra framing, absent (and therefore a complete no-op) for
+  every standalone Phase 1-4 call. This is exactly the scope the kickoff prompt asked for ("a
+  small, additive change... not a rewrite"); see "Deviation: goalContext is a small additive
+  Research Agent option, not a rewrite" above.

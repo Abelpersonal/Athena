@@ -38,6 +38,16 @@ import {
   type PracticeSession,
   type DialogueHistoryEntry,
 } from "../practiceEngine/index.js";
+import {
+  classifyInput,
+  decomposeAndPersistPath,
+  runOverlapDetectionForPath,
+  loadPathRoadmap,
+  isTopicGeneratable,
+  generateTopicCourse,
+  PathPlannerError,
+  type PathTopicRoadmapEntry,
+} from "../pathPlanner/index.js";
 
 /**
  * Debugging CLI across Phases 1-6. Modes:
@@ -49,6 +59,11 @@ import {
  *   npm run harness -- build --dry-run "<topic>"      same, fully mocked (no API cost, writes to data/teacher.dry-run.db)
  *   npm run harness -- quiz <lesson_id> [tier]        Phase 4: Quiz Engine, real APIs — CLI prompts, prints score + updated mastery state
  *   npm run harness -- practice <module_id>           Phase 4: Practice Engine, real APIs — CLI (multi-turn for simulation/debate), prints critique + reflection + updated experience score
+ *   npm run harness -- goal "<input>"                 Phase 5: Goal Planner, real APIs — classifies topic-vs-goal (CLI-confirmed,
+ *                                                      overridable), a single-topic classification runs the existing build pipeline
+ *                                                      unchanged, a goal classification decomposes into a cross-domain roadmap, runs
+ *                                                      overlap detection, prints the annotated roadmap, then loops letting the user
+ *                                                      pick a generatable pending/delta_needed topic to generate next
  *
  * quiz/practice have no --dry-run mode (unlike research/build) — they operate on
  * lesson/module content that must already be persisted (from a prior research/build
@@ -74,6 +89,10 @@ async function main(): Promise<void> {
   }
   if (args[0] === "practice") {
     await runPracticeCommand(args.slice(1));
+    return;
+  }
+  if (args[0] === "goal") {
+    await runGoalCommand(args.slice(1));
     return;
   }
 
@@ -479,6 +498,134 @@ async function runPracticeCommand(args: string[]): Promise<void> {
         ? "[practice-harness] Next attempt on this module will be generated at a harder difficulty, incorporating this attempt's critique."
         : "[practice-harness] Escalation cap reached — future attempts on this module stay at novel_unguided difficulty."
     );
+  } finally {
+    rl.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: goal "<input>"
+// ---------------------------------------------------------------------------
+
+function printRoadmap(roadmap: PathTopicRoadmapEntry[]): void {
+  const masteredOrLinked = roadmap.filter((t) => t.status === "linked_existing" || t.status === "mastered").length;
+  console.log(
+    `\n[goal-harness] Roadmap (${roadmap.length} topic(s) total, ${masteredOrLinked} already mastered/linked):`
+  );
+  let lastDomain: string | null = null;
+  let lastTier = -1;
+  for (const t of roadmap) {
+    if (t.domainName !== lastDomain) {
+      console.log(`\n  Domain: ${t.domainName}`);
+      lastDomain = t.domainName;
+    }
+    if (t.order !== lastTier) {
+      console.log(`    -- tier ${t.order} (parallel group: ${t.parallelGroup}) --`);
+      lastTier = t.order;
+    }
+    console.log(`    [${t.status}] ${t.topicName}${t.courseId ? ` (course: ${t.courseId})` : ""}`);
+  }
+}
+
+async function runGoalCommand(args: string[]): Promise<void> {
+  const input = args.join(" ").trim();
+  if (!input) {
+    console.error('Usage: npm run harness -- goal "<input>"');
+    process.exitCode = 1;
+    return;
+  }
+
+  const db = await getDb();
+  const onProgress = (message: string) => console.log(`[goal-harness] ${message}`);
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+
+  try {
+    console.log(`\n[goal-harness] Classifying: "${input}"...`);
+    const classification = await classifyInput(input);
+    console.log(`[goal-harness] Model classification: ${classification.classification.toUpperCase()}`);
+    console.log(`[goal-harness] Reasoning: ${classification.reasoning}`);
+
+    const suggestedDefault = classification.classification;
+    const answer = (
+      await rl.question(
+        `\nThis looks like a ${classification.classification === "goal" ? "big GOAL" : "single TOPIC"} — build a full ` +
+          `multi-course path, or just one course on the core idea? [path/topic] (default: ${
+            suggestedDefault === "goal" ? "path" : "topic"
+          }): `
+      )
+    )
+      .trim()
+      .toLowerCase();
+
+    const wantsPath = answer === "path" || answer === "goal" || (answer === "" && suggestedDefault === "goal");
+    if (!wantsPath) {
+      console.log(
+        `\n[goal-harness] Proceeding as a single topic${answer && answer !== suggestedDefault ? " (user override)" : ""} — running the existing build pipeline unchanged.\n`
+      );
+      await runBuildCommand([input]);
+      return;
+    }
+    console.log(
+      `\n[goal-harness] Proceeding as a GOAL${answer && answer !== suggestedDefault ? " (user override)" : ""} — building a multi-domain path.\n`
+    );
+
+    const persisted = await decomposeAndPersistPath(input, { db, onProgress });
+    console.log(
+      `\n[goal-harness] Path ${persisted.pathId}: ${persisted.domainCount} domain(s), ${persisted.topicCount} topic(s).`
+    );
+
+    console.log("\n[goal-harness] Running overlap detection against existing MasteryState/course data...");
+    let roadmap = await runOverlapDetectionForPath(persisted.pathId, { db, onProgress });
+    printRoadmap(roadmap);
+
+    for (;;) {
+      const generatable = roadmap.filter((t) => isTopicGeneratable(t, roadmap));
+      if (generatable.length === 0) {
+        const remaining = roadmap.filter((t) => t.status === "pending" || t.status === "delta_needed");
+        console.log(
+          remaining.length === 0
+            ? "\n[goal-harness] Every topic is linked/mastered — path complete."
+            : "\n[goal-harness] No topic is generatable right now (all remaining ones are waiting on an earlier tier)."
+        );
+        break;
+      }
+
+      console.log("\nGeneratable now:");
+      generatable.forEach((t, i) => console.log(`  ${i + 1}. [${t.domainName}] ${t.topicName} (${t.status})`));
+      const pick = (await rl.question('\nPick a number to generate, or "done" to stop: ')).trim().toLowerCase();
+      if (pick === "done" || pick === "") break;
+
+      const index = Number(pick) - 1;
+      const chosen = generatable[index];
+      if (!chosen) {
+        console.log("Not a valid choice — try again.");
+        continue;
+      }
+
+      try {
+        const result = await generateTopicCourse(chosen.id, { db, onProgress });
+        console.log(
+          `\n[goal-harness] Generated ${result.wasDelta ? "delta " : ""}course ${result.courseId} for "${chosen.topicName}" ` +
+            `(${result.moduleCount} module(s), ${result.lessonCount} lesson(s)).`
+        );
+      } catch (error) {
+        if (error instanceof ResearchPipelineError || error instanceof CourseBuilderError) {
+          console.error(`\n[goal-harness] Generation failed for "${chosen.topicName}": ${error.message}`);
+        } else {
+          throw error;
+        }
+      }
+
+      roadmap = await loadPathRoadmap(persisted.pathId, { db });
+      printRoadmap(roadmap);
+    }
+  } catch (error) {
+    if (error instanceof PathPlannerError) {
+      console.error(`\n[goal-harness] ${error.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
   } finally {
     rl.close();
   }

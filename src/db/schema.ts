@@ -15,6 +15,14 @@ export const courses = sqliteTable("courses", {
   volatilityTier: text("volatility_tier", { enum: ["fast", "medium", "slow", "mixed"] }).notNull(),
   /** "building" until the Material Aggregator finishes linking sources; "complete" after. */
   status: text("status", { enum: ["building", "complete"] }).notNull().default("building"),
+  /**
+   * Phase 5: the goal/domain framing this course was researched under, when it was generated
+   * on-demand from a Path (see runResearchPipeline's additive `goalContext` option) — null for a
+   * course built standalone (every Phase 1-4 call site) or as a plain "linked" match. Overlap
+   * detection reads this back to tell "generic fundamentals" (null) apart from "mastered under a
+   * DIFFERENT goal's angle" (a different non-null value) — see src/pathPlanner/overlap.ts.
+   */
+  goalContext: text("goal_context"),
 });
 
 export const modules = sqliteTable("modules", {
@@ -120,4 +128,56 @@ export const masteryState = sqliteTable("mastery_state", {
   knowledgeScore: real("knowledge_score"),
   experienceScore: real("experience_score"),
   lastUpdated: text("last_updated").notNull(),
+});
+
+/**
+ * Phase 5: Path/PathDomain/PathTopic — the Goal Planner's own data model. The
+ * PRD's Section 7 table has no Path entity even though section 5.12a requires
+ * persisting one, so this is an original design filling that gap (not a
+ * literal PRD table) — documented in full in the README under "The Path data
+ * model (a documented gap, not a literal PRD table)".
+ */
+export const paths = sqliteTable("paths", {
+  id: text("id").primaryKey(),
+  goalDescription: text("goal_description").notNull(),
+  createdAt: text("created_at").notNull(),
+  status: text("status", { enum: ["active", "completed"] }).notNull().default("active"),
+});
+
+/** A skill domain within a goal (e.g. "Math", "Programming", "Finance" for "become a full-stack quant"). */
+export const pathDomains = sqliteTable("path_domains", {
+  id: text("id").primaryKey(),
+  pathId: text("path_id")
+    .notNull()
+    .references(() => paths.id),
+  name: text("name").notNull(),
+  /** Domains are just presentational grouping/display order here — the real cross-domain scheduling constraint lives on pathTopics.order/parallelGroup, not on domain order. */
+  order: integer("order_index").notNull(),
+});
+
+export const pathTopics = sqliteTable("path_topics", {
+  id: text("id").primaryKey(),
+  pathId: text("path_id")
+    .notNull()
+    .references(() => paths.id),
+  domainId: text("domain_id")
+    .notNull()
+    .references(() => pathDomains.id),
+  topicName: text("topic_name").notNull(),
+  description: text("description").notNull(),
+  /**
+   * A topological TIER across the WHOLE path's cross-domain dependency graph (0 = no
+   * prerequisites within the path, 1 = depends only on tier-0 topics, etc.) — computed by
+   * src/pathPlanner/ordering.ts's computeCrossDomainOrder(), never trusted directly from the
+   * model. Topic selection (Deliverable 4) gates on this: a topic can be generated once every
+   * topic at a strictly lower tier is done, regardless of which domain it's in.
+   */
+  order: integer("order_index").notNull(),
+  /** Topics sharing this value are mutually order-free (no dependency edge between them) — in this design, every topic at the same `order` tier shares one parallelGroup, so the two fields move together; parallelGroup exists as its own column because "which topics form one freely-orderable batch" is the more useful thing for a UI/CLI to group by, even though it's currently derived 1:1 from order. */
+  parallelGroup: text("parallel_group").notNull(),
+  /** Null until a course is generated for (or matched to) this topic. */
+  courseId: text("course_id").references(() => courses.id),
+  status: text("status", { enum: ["pending", "linked_existing", "delta_needed", "in_progress", "mastered"] })
+    .notNull()
+    .default("pending"),
 });
