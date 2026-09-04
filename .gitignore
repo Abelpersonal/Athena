@@ -5,3 +5,6 @@ logs/
 *.log
 output/
 data/*.db
+.next/
+next-env.d.ts
+*.tsbuildinfo

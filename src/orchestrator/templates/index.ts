@@ -35,6 +35,7 @@ import "./generateNextTopicSuggestions.js";
 import "./generateRecheckQueries.js";
 import "./compareFindingsToFacts.js";
 import "./generateUpdateLesson.js";
+import "./answerLessonQuestion.js";
 
 export * from "./registry.js";
 export * from "./summarizeText.js";
@@ -70,3 +71,4 @@ export * from "./generateNextTopicSuggestions.js";
 export * from "./generateRecheckQueries.js";
 export * from "./compareFindingsToFacts.js";
 export * from "./generateUpdateLesson.js";
+export * from "./answerLessonQuestion.js";

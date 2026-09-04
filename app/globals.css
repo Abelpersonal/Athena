@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+/*
+ * Dark mode is the only mode for v1 (PRD §6.1: "dark mode default") — no light-mode toggle
+ * invented, since none was asked for. Tokens named semantically (bg/surface/text/accent/...)
+ * rather than raw colors so the "calm, low-distraction, study-space feel" constraint stays a
+ * single place to tune, not scattered literal hex values across every component.
+ */
+@theme {
+  --color-bg: #0b0e12;
+  --color-surface: #12161c;
+  --color-surface-raised: #1a2029;
+  --color-border: #262d38;
+  --color-text: #e6e9ee;
+  --color-text-muted: #8b93a1;
+  --color-text-faint: #5a6270;
+  --color-accent: #7dd3c0;
+  --color-accent-muted: #3f6f66;
+  --color-warn: #e0b568;
+  --color-danger: #e0768a;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+}
+
+/* One-tap-away disclosure: a <details> element styled plainly, used for "advanced detail" panels
+   (source citations, mastery breakdowns, overlap-detection reasoning) throughout the app. */
+details.disclosure > summary {
+  cursor: pointer;
+  color: var(--color-text-muted);
+  list-style: none;
+}
+details.disclosure > summary::-webkit-details-marker {
+  display: none;
+}

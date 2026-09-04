@@ -1,8 +1,8 @@
 {
-  "name": "teacher",
+  "name": "athena",
   "version": "0.1.0",
   "private": true,
-  "description": "Personal AI learning platform - Phase 1: Orchestrator + MCP web search integration",
+  "description": "Personal AI learning platform",
   "type": "module",
   "scripts": {
     "harness": "tsx src/harness/cli.ts",
@@ -12,8 +12,11 @@
     "db:generate": "drizzle-kit generate",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
-    "build": "tsc"
+    "typecheck": "tsc --noEmit -p tsconfig.backend.json && tsc --noEmit -p tsconfig.json",
+    "dev": "next dev --webpack",
+    "build": "next build --webpack",
+    "start": "next start",
+    "build:backend": "tsc -p tsconfig.backend.json"
   },
   "keywords": [],
   "author": "",
@@ -26,12 +29,19 @@
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "jsdom": "^30.0.1",
+    "next": "^16.3.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
     "@types/jsdom": "^30.0.0",
     "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
     "drizzle-kit": "^0.31.10",
+    "tailwindcss": "^4.3.3",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"

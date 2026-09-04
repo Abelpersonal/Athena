@@ -55,6 +55,31 @@ function openDb(dbPath: string): OpenDb {
 
 let cached: OpenDb | null = null;
 let cachedPath: string | null = null;
+/**
+ * Phase 7: the in-flight open+migrate call, memoized so concurrent getDb() calls for the same
+ * path await the SAME migration run instead of each opening their own DatabaseSync handle and
+ * racing to apply migrations against the same file — a real, previously-latent bug this codebase
+ * never hit before Phase 7's Dashboard, the first caller to Promise.all() several independent
+ * reads that each call getDb() with no shared connection passed in (a completely normal Server
+ * Component pattern). Without this, a second concurrent call could see `cached` still null (the
+ * first call hasn't finished migrating yet) and start its own migrate() against a database that
+ * now already has the tables the first call just created, throwing "table already exists".
+ * `tests/dbClient.test.ts` exercises this directly with a real concurrent Promise.all().
+ */
+let pending: Promise<OpenDb> | null = null;
+let pendingPath: string | null = null;
+
+async function openAndMigrate(dbPath: string): Promise<OpenDb> {
+  const opened = openDb(dbPath);
+  await migrate(
+    opened.db,
+    async (queries) => {
+      for (const query of queries) opened.raw.exec(query);
+    },
+    { migrationsFolder: MIGRATIONS_FOLDER }
+  );
+  return opened;
+}
 
 /**
  * Lazily opens (or reuses) the SQLite connection and applies any pending
@@ -66,22 +91,36 @@ export async function getDb(
   dbPath: string = process.env.TEACHER_DB_PATH ?? DEFAULT_DB_PATH
 ): Promise<TeacherDb> {
   if (cached && cachedPath === dbPath) return cached.db;
+  if (pending && pendingPath === dbPath) return (await pending).db;
 
-  const opened = openDb(dbPath);
-  await migrate(
-    opened.db,
-    async (queries) => {
-      for (const query of queries) opened.raw.exec(query);
-    },
-    { migrationsFolder: MIGRATIONS_FOLDER }
-  );
-
-  cached = opened;
-  cachedPath = dbPath;
-  return opened.db;
+  pendingPath = dbPath;
+  pending = openAndMigrate(dbPath);
+  try {
+    const opened = await pending;
+    cached = opened;
+    cachedPath = dbPath;
+    return opened.db;
+  } finally {
+    pending = null;
+    pendingPath = null;
+  }
 }
 
+/**
+ * Also closes the cached DatabaseSync handle — previously this just dropped the JS reference and
+ * relied on GC, harmless for the ":memory:" paths every pre-Phase-7 test used, but leaves a real
+ * file handle locked on Windows until GC eventually runs, which is unreliable and too slow for
+ * test cleanup that needs the file gone immediately afterward (tests/dbClient.test.ts's temp-file
+ * cleanup surfaced this). Never throws even if the handle is already closed.
+ */
 export function resetDbCache(): void {
+  try {
+    cached?.raw.close();
+  } catch {
+    // already closed — fine
+  }
   cached = null;
   cachedPath = null;
+  pending = null;
+  pendingPath = null;
 }
