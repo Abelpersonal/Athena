@@ -3,9 +3,11 @@ import { run as orchestratorRun } from "../orchestrator/index.js";
 import type { AnswerLessonQuestionOutput, AnswerLessonQuestionSourceRef } from "../orchestrator/templates/answerLessonQuestion.js";
 import { createCitationValidator } from "../research/grounding.js";
 import { getDb, type TeacherDb } from "../db/client.js";
-import { lessons, sources } from "../db/schema.js";
+import { lessons, sources, modules } from "../db/schema.js";
+import { recordActivityEvent as recordActivityEventDefault } from "../motivation/index.js";
 
 export type OrchestratorRunFn = typeof orchestratorRun;
+export type RecordActivityEventFn = typeof recordActivityEventDefault;
 
 export class TeachingEngineError extends Error {}
 
@@ -17,6 +19,8 @@ export interface AnswerLessonQuestionOptions {
   orchestratorRun?: OrchestratorRunFn;
   /** Injectable for tests. Default: getDb() (real, migrated SQLite at data/teacher.db). */
   db?: TeacherDb;
+  /** Injectable for tests. Default: the real motivation.recordActivityEvent() (Phase 9). */
+  recordActivityEvent?: RecordActivityEventFn;
 }
 
 export interface AnswerLessonQuestionResult extends AnswerLessonQuestionOutput {
@@ -38,6 +42,7 @@ export async function answerLessonQuestion(
 ): Promise<AnswerLessonQuestionResult> {
   const run = options.orchestratorRun ?? orchestratorRun;
   const db = options.db ?? (await getDb());
+  const recordActivity = options.recordActivityEvent ?? recordActivityEventDefault;
 
   const [lesson] = await db.select().from(lessons).where(eq(lessons.id, lessonId));
   if (!lesson) throw new TeachingEngineError(`No lesson found with id "${lessonId}".`);
@@ -73,6 +78,11 @@ export async function answerLessonQuestion(
       validateExtra: createCitationValidator(validSourceIds, (data) => (data as AnswerLessonQuestionOutput).sourceIds),
     }
   );
+
+  const [mod] = await db.select().from(modules).where(eq(modules.id, lesson.moduleId));
+  if (mod) {
+    await recordActivity("lesson_question_asked", lessonId, mod.courseId, { db });
+  }
 
   return { lessonId, ...result.data };
 }

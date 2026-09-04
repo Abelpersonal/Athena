@@ -1,6 +1,21 @@
 import { eq, inArray, isNull, isNotNull } from "drizzle-orm";
 import { getDb, type TeacherDb } from "./client.js";
-import { courses, modules, lessons, sources, paths, pathTopics, masteryState, mindMaps, lessonUpdates, type MindMapGraph } from "./schema.js";
+import {
+  courses,
+  modules,
+  lessons,
+  sources,
+  paths,
+  pathTopics,
+  masteryState,
+  mindMaps,
+  lessonUpdates,
+  activityEvents,
+  type MindMapGraph,
+} from "./schema.js";
+import { computeStreak, selectWeakestConceptLesson, isPathInactive, type StreakResult, type ReentryOffer } from "../motivation/pure.js";
+import { DEFAULT_WEAK_CONCEPT_THRESHOLD } from "../quizEngine/index.js";
+import { getRecentCourseDomains, isDomainClusterNarrow } from "../continuousLearning/index.js";
 
 /**
  * Phase 7: cross-cutting, read-only queries for the frontend's Dashboard/Course/Lesson screens —
@@ -207,4 +222,100 @@ export async function getLessonWithSources(
     courseTopic: course.topic,
     sourceRefs: sourceRows.map((s) => ({ id: s.id, url: s.url, type: s.type, credibilityScore: s.credibilityScore })),
   };
+}
+
+/** Momentum framing (Phase 9, Deliverable 2): "X days of momentum" computed fresh from every real ActivityEvent — no separate streak counter column to keep in sync with the events that actually determine it. */
+export async function getMomentumStreak(options: { db?: TeacherDb; now?: Date } = {}): Promise<StreakResult> {
+  const db = options.db ?? (await getDb());
+  const rows = await db.select({ occurredAt: activityEvents.occurredAt }).from(activityEvents);
+  return computeStreak(
+    rows.map((r) => r.occurredAt),
+    options.now
+  );
+}
+
+/** Low-friction re-entry (Phase 9, Deliverable 3): the single weakest-scoring lesson across every in-progress course, or null when nothing needs it. Reuses quizEngine's own weak-concept threshold — never a second scoring system. */
+export async function getReentryOffer(options: { db?: TeacherDb } = {}): Promise<ReentryOffer | null> {
+  const db = options.db ?? (await getDb());
+  const inProgressCourses = await db.select().from(courses).where(isNull(courses.completedAt));
+
+  const candidates: { lessonId: string; lessonTitle: string; courseId: string; courseTopic: string; knowledgeScore: number | null }[] = [];
+  for (const c of inProgressCourses) {
+    const courseModules = await db.select().from(modules).where(eq(modules.courseId, c.id));
+    for (const m of courseModules) {
+      const lessonRows = await db.select().from(lessons).where(eq(lessons.moduleId, m.id));
+      for (const l of lessonRows) {
+        const [mastery] = await db.select().from(masteryState).where(eq(masteryState.conceptNodeId, l.id));
+        candidates.push({
+          lessonId: l.id,
+          lessonTitle: l.title,
+          courseId: c.id,
+          courseTopic: c.topic,
+          knowledgeScore: mastery?.knowledgeScore ?? null,
+        });
+      }
+    }
+  }
+  return selectWeakestConceptLesson(candidates, DEFAULT_WEAK_CONCEPT_THRESHOLD);
+}
+
+export interface BoredomProofingSuggestion {
+  pathId: string;
+  goalDescription: string;
+  message: string;
+}
+
+/**
+ * Boredom-proofing (Phase 9, Deliverable 4): a path that's gone quiet specifically — no
+ * ActivityEvent on any of its own courses in the inactivity window, while the app HAS seen real
+ * activity elsewhere in that same window (see isPathInactive, src/motivation/pure.ts). Recomputed
+ * fresh every Dashboard load — the same "don't persist Suggestion records" simplification Phase 6
+ * already made for its own next-topic suggestions. The framing reuses Phase 6's existing
+ * diversity signal (getRecentCourseDomains + isDomainClusterNarrow, src/continuousLearning/
+ * index.ts) verbatim to decide the copy, not a second diversity algorithm and not a new LLM call
+ * of its own — though getRecentCourseDomains DOES make a real `infer_course_domain` LLM call per
+ * completed course that isn't Path-linked, so that step is wrapped and degrades to the plain
+ * (non-diversity-biased) copy on failure, the same "an enrichment step, not a precondition"
+ * policy applied elsewhere in this phase (see getGoalConnectionMessage) — this runs on every
+ * Dashboard page load, so an LLM hiccup here must never take the whole Dashboard down.
+ */
+export async function getBoredomProofingSuggestions(
+  options: { db?: TeacherDb; now?: Date } = {}
+): Promise<BoredomProofingSuggestion[]> {
+  const db = options.db ?? (await getDb());
+  const now = options.now ?? new Date();
+
+  const activePaths = await db.select().from(paths).where(eq(paths.status, "active"));
+  if (activePaths.length === 0) return [];
+
+  const allEvents = await db.select({ courseId: activityEvents.courseId, occurredAt: activityEvents.occurredAt }).from(activityEvents);
+
+  const flagged: (typeof paths.$inferSelect)[] = [];
+  for (const p of activePaths) {
+    const topics = await db.select().from(pathTopics).where(eq(pathTopics.pathId, p.id));
+    const pathCourseIds = new Set(topics.map((t) => t.courseId).filter((id): id is string => id !== null));
+    if (pathCourseIds.size === 0) continue;
+
+    const pathTimestamps = allEvents.filter((e) => pathCourseIds.has(e.courseId)).map((e) => e.occurredAt);
+    const otherTimestamps = allEvents.filter((e) => !pathCourseIds.has(e.courseId)).map((e) => e.occurredAt);
+
+    if (isPathInactive(pathTimestamps, otherTimestamps, now)) flagged.push(p);
+  }
+  if (flagged.length === 0) return [];
+
+  let diversityBiasApplied = false;
+  try {
+    const recentDomains = await getRecentCourseDomains({ db });
+    diversityBiasApplied = isDomainClusterNarrow(recentDomains);
+  } catch (error) {
+    console.error(`[boredom-proofing] Failed to compute the recent-domain diversity signal: ${(error as Error).message}`);
+  }
+
+  return flagged.map((p) => ({
+    pathId: p.id,
+    goalDescription: p.goalDescription,
+    message: diversityBiasApplied
+      ? "This path's gone quiet, and recent activity elsewhere has clustered pretty narrowly too — a genuine change of pace might help."
+      : "This path's gone quiet while you've been active elsewhere — pick it back up, or try something different for a bit.",
+  }));
 }

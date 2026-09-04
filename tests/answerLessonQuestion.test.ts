@@ -132,4 +132,28 @@ describe("answerLessonQuestion", () => {
     const result = await answerLessonQuestion(lessonId, "What's the capital of France?", { db, orchestratorRun: mock as never });
     expect(result.outsideLessonScope).toBe(true);
   });
+
+  it("records a real lesson_question_asked ActivityEvent scoped to the lesson's real course (Phase 9)", async () => {
+    const db = await getDb(":memory:");
+    const { lessonId } = await seedLessonWithSources(db);
+
+    const mock: MockRun = async (taskType) => ({
+      taskType,
+      promptVersion: "test",
+      data: { answer: "a", sourceIds: [], outsideLessonScope: false },
+      attempts: 1,
+      raw: "{}",
+    });
+
+    const calls: Array<{ eventType: string; entityId: string; courseId: string }> = [];
+    await answerLessonQuestion(lessonId, "q", {
+      db,
+      orchestratorRun: mock as never,
+      recordActivityEvent: async (eventType, entityId, courseId) => {
+        calls.push({ eventType, entityId, courseId });
+      },
+    });
+
+    expect(calls).toEqual([{ eventType: "lesson_question_asked", entityId: lessonId, courseId: "crs_teach_test" }]);
+  });
 });

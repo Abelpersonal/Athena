@@ -12,10 +12,12 @@ import type { GenerateReflectionPromptOutput } from "../orchestrator/templates/g
 import { getDb, type TeacherDb } from "../db/client.js";
 import { modules, lessons, practiceAttempts, masteryState } from "../db/schema.js";
 import { writeMasteryUpdate as writeMasteryUpdateDefault } from "../memoryGraph/index.js";
+import { recordActivityEvent as recordActivityEventDefault } from "../motivation/index.js";
 
 export type OrchestratorRunFn = typeof orchestratorRun;
 export type ProgressListener = (message: string) => void;
 export type WriteMasteryUpdateFn = typeof writeMasteryUpdateDefault;
+export type RecordActivityEventFn = typeof recordActivityEventDefault;
 export type DialogueHistoryEntry = DialogueTurnHistoryEntry;
 
 export class PracticeEngineError extends Error {}
@@ -68,6 +70,8 @@ export interface PracticeEngineOptions {
   db?: TeacherDb;
   /** Injectable for tests. Default: the real memoryGraph.writeMasteryUpdate() (Phase 4). */
   writeMasteryUpdate?: WriteMasteryUpdateFn;
+  /** Injectable for tests. Default: the real motivation.recordActivityEvent() (Phase 9). */
+  recordActivityEvent?: RecordActivityEventFn;
   escalationCap?: number;
   onProgress?: ProgressListener;
 }
@@ -311,6 +315,7 @@ export async function recordPracticeAttempt(
 ): Promise<RecordPracticeAttemptResult> {
   const db = options.db ?? (await getDb());
   const writeMastery = options.writeMasteryUpdate ?? writeMasteryUpdateDefault;
+  const recordActivity = options.recordActivityEvent ?? recordActivityEventDefault;
   const cap = options.escalationCap ?? DEFAULT_ESCALATION_CAP;
   const onProgress = options.onProgress;
   const now = new Date().toISOString();
@@ -343,6 +348,11 @@ export async function recordPracticeAttempt(
       `Practice attempt ${session.attemptNumber} (${session.format}) on module "${session.moduleTitle}".`
     );
     updatedLessonIds.push(lesson.id);
+  }
+
+  const [mod] = await db.select().from(modules).where(eq(modules.id, session.moduleId));
+  if (mod) {
+    await recordActivity("practice_completed", session.moduleId, mod.courseId, { db });
   }
 
   const willEscalateNextAttempt = session.attemptNumber < cap;

@@ -331,3 +331,51 @@ export const mindMaps = sqliteTable("mind_maps", {
   graphJson: text("graph_json", { mode: "json" }).$type<MindMapGraph>().notNull(),
   createdAt: text("created_at").notNull(),
 });
+
+/**
+ * Phase 9: the Motivation/Engagement Layer's own data model. Neither table is in the PRD's
+ * Section 7 list even though §5.12b clearly requires both — the same kind of gap Phase 5 hit for
+ * `Path` and Phase 8 hit for `MindMap`.
+ *
+ * `courseId` is stored on EVERY row regardless of `eventType`, not just derivable from
+ * `entityId` (a lessonId for lesson_viewed/quiz_completed/lesson_question_asked, a moduleId for
+ * practice_completed) — a deliberate denormalization. Every real consumer of this table (the
+ * streak, the low-friction re-entry offer, and boredom-proofing's "has THIS path's courses gone
+ * quiet" check) needs to group/filter by course, and re-deriving that from entityId would mean a
+ * different join per eventType at every read site. Writing it once, where the real action
+ * happened, is simpler and cheaper than re-deriving it repeatedly at read time.
+ */
+export const activityEvents = sqliteTable("activity_events", {
+  id: text("id").primaryKey(),
+  eventType: text("event_type", {
+    enum: ["lesson_viewed", "quiz_completed", "practice_completed", "lesson_question_asked"],
+  }).notNull(),
+  /** A lessons.id for lesson_viewed/quiz_completed/lesson_question_asked, a modules.id for practice_completed. */
+  entityId: text("entity_id").notNull(),
+  courseId: text("course_id")
+    .notNull()
+    .references(() => courses.id),
+  occurredAt: text("occurred_at").notNull(),
+});
+export type ActivityEventType = (typeof activityEvents.$inferInsert)["eventType"];
+
+/** Fixed id for the one `userProfile` row this single-user app ever has — see README, "Why a singleton row, not a users table." */
+export const USER_PROFILE_SINGLETON_ID = "singleton";
+
+/**
+ * A singleton row (this is an explicitly single-user app — see the PRD's own scope note, echoed
+ * throughout the README — so a `users` table with a foreign key on every other table would be
+ * pure overhead with no second user to ever key against). `statedGoals` is the concrete
+ * resolution of PRD Open Decision 10: a short JSON array of free-text strings captured at
+ * onboarding (§6.2 screen 1's "short, honest capture"), not a structured taxonomy — see README,
+ * "Resolving Open Decision 10." `lastGoalConnectionShownAt` is Deliverable 2's cadence gate (a
+ * lightweight last-shown timestamp, not a scheduling system) — null until the first goal-
+ * connection message is ever shown.
+ */
+export const userProfile = sqliteTable("user_profile", {
+  id: text("id").primaryKey(),
+  statedGoals: text("stated_goals", { mode: "json" }).$type<string[]>().notNull(),
+  lastGoalConnectionShownAt: text("last_goal_connection_shown_at"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});

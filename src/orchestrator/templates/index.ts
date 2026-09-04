@@ -37,6 +37,7 @@ import "./compareFindingsToFacts.js";
 import "./generateUpdateLesson.js";
 import "./answerLessonQuestion.js";
 import "./generateMindMap.js";
+import "./connectActivityToGoal.js";
 
 export * from "./registry.js";
 export * from "./summarizeText.js";
@@ -74,3 +75,4 @@ export * from "./compareFindingsToFacts.js";
 export * from "./generateUpdateLesson.js";
 export * from "./answerLessonQuestion.js";
 export * from "./generateMindMap.js";
+export * from "./connectActivityToGoal.js";

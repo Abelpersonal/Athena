@@ -27,6 +27,8 @@ interface QuizResult {
   weakConceptNodes: string[];
   masteryState: { knowledgeScore: number | null; experienceScore: number | null };
   courseCompleted?: string;
+  /** Phase 9, Deliverable 5: true only on a real transfer-tier high score — one of exactly two milestone-celebration triggers. */
+  transferHighScoreAchieved: boolean;
 }
 
 const TIER_COLOR: Record<QuizTier, string> = {
@@ -39,20 +41,38 @@ const TIER_COLOR: Record<QuizTier, string> = {
  * The Quiz screen: generateQuizQuestions() -> present -> capture answers -> scoreAndRecordQuiz()
  * -> score + updated mastery, the same flow the harness's `quiz` command runs end-to-end, now a
  * real multi-step form instead of readline prompts. Tiers are visually distinct per §6.2 screen 7.
+ * `tiers`/`questionsPerTier` (Phase 9): set by the Dashboard's "5-minute check-in" low-friction
+ * re-entry offer to request a genuinely single-question, single-tier session — same generation
+ * path, just parameterized differently.
  */
-export function QuizClient({ lessonId, courseId }: { lessonId: string; courseId: string }) {
+export function QuizClient({
+  lessonId,
+  courseId,
+  tiers,
+  questionsPerTier,
+}: {
+  lessonId: string;
+  courseId: string;
+  tiers?: QuizTier[];
+  questionsPerTier?: number;
+}) {
   const [phase, setPhase] = useState<"start" | "answering" | "scored">("start");
   const [questions, setQuestions] = useState<QuizQuestion[]>([]);
   const [answers, setAnswers] = useState<Record<string, string | number>>({});
   const [result, setResult] = useState<QuizResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const isQuickCheckIn = Boolean(tiers && tiers.length === 1 && questionsPerTier === 1);
 
   async function start() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/quiz/${lessonId}/generate`, { method: "POST" });
+      const res = await fetch(`/api/quiz/${lessonId}/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...(tiers ? { tiers } : {}), ...(questionsPerTier ? { questionsPerTier } : {}) }),
+      });
       if (!res.ok) throw new Error("Failed to generate quiz questions.");
       const data = (await res.json()) as { questions: QuizQuestion[] };
       setQuestions(data.questions);
@@ -94,7 +114,7 @@ export function QuizClient({ lessonId, courseId }: { lessonId: string; courseId:
           disabled={loading}
           className="rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
         >
-          {loading ? "Generating…" : "Start quiz"}
+          {loading ? "Generating…" : isQuickCheckIn ? "Start 5-minute check-in" : "Start quiz"}
         </button>
         {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
       </div>
@@ -149,8 +169,31 @@ export function QuizClient({ lessonId, courseId }: { lessonId: string; courseId:
     );
   }
 
+  const isMilestone = Boolean(result!.courseCompleted) || result!.transferHighScoreAchieved;
+
   return (
     <div className="space-y-3">
+      {isMilestone && (
+        <div className="rounded-lg border-2 border-[var(--color-accent)] bg-[var(--color-accent)]/10 p-4 space-y-1">
+          <p className="text-lg font-medium text-[var(--color-accent)]">
+            {result!.courseCompleted ? "Course complete" : "Real, deep mastery"}
+          </p>
+          <p className="text-sm">
+            {result!.courseCompleted ? (
+              <>
+                Every lesson in this course now has real quiz results across all three tiers —
+                genuinely done. Suggestions are now available from the{" "}
+                <Link href="/" className="underline">
+                  Dashboard
+                </Link>
+                .
+              </>
+            ) : (
+              "That transfer-tier score reflects real, applied understanding, not just recall."
+            )}
+          </p>
+        </div>
+      )}
       <p className="text-lg">Overall: {(result!.overallScore * 100).toFixed(0)}%</p>
       <ul className="text-sm text-[var(--color-text-muted)]">
         {Object.entries(result!.tierScores).map(([tier, score]) => (
@@ -159,15 +202,6 @@ export function QuizClient({ lessonId, courseId }: { lessonId: string; courseId:
           </li>
         ))}
       </ul>
-      {result!.courseCompleted && (
-        <p className="text-[var(--color-accent)] text-sm">
-          Course complete! Suggestions are now available from the{" "}
-          <Link href="/" className="underline">
-            Dashboard
-          </Link>
-          .
-        </p>
-      )}
       <Link href={`/courses/${courseId}`} className="inline-block text-sm underline text-[var(--color-text-muted)]">
         Back to course
       </Link>

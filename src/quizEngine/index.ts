@@ -6,10 +6,13 @@ import type { ScoreFreeTextAnswerOutput } from "../orchestrator/templates/scoreF
 import { getDb, type TeacherDb } from "../db/client.js";
 import { lessons, modules, courses, quizResults, masteryState } from "../db/schema.js";
 import { writeMasteryUpdate as writeMasteryUpdateDefault } from "../memoryGraph/index.js";
+import { recordActivityEvent as recordActivityEventDefault } from "../motivation/index.js";
+import { DEFAULT_HIGH_SCORE_THRESHOLD } from "../pathPlanner/overlap.js";
 
 export type OrchestratorRunFn = typeof orchestratorRun;
 export type ProgressListener = (message: string) => void;
 export type WriteMasteryUpdateFn = typeof writeMasteryUpdateDefault;
+export type RecordActivityEventFn = typeof recordActivityEventDefault;
 
 export class QuizEngineError extends Error {}
 
@@ -64,12 +67,33 @@ export interface QuizSessionResult {
    * complete, or still incomplete). See checkAndMarkCourseCompletion below.
    */
   courseCompleted?: string;
+  /**
+   * Phase 9, Deliverable 5: true when THIS session's transfer-tier score is at/above the "high
+   * score" bar — reusing Phase 5's DEFAULT_HIGH_SCORE_THRESHOLD (0.75, src/pathPlanner/overlap.ts)
+   * rather than inventing a third threshold, per the Phase 9 kickoff's explicit instruction. One
+   * of exactly two real milestone-celebration triggers (the other is courseCompleted above) — a
+   * routine below-threshold result, or a session with no transfer-tier questions, is false.
+   */
+  transferHighScoreAchieved: boolean;
 }
 
 /** 0-1 continuous score scale for both knowledgeScore and experienceScore (resolved default, see README). */
 export const DEFAULT_QUESTIONS_PER_TIER = Number(process.env.QUIZ_QUESTIONS_PER_TIER ?? 2);
 /** Below this knowledge_score, a concept node is surfaced as a weak-concept candidate (not load-bearing yet — see README). */
 export const DEFAULT_WEAK_CONCEPT_THRESHOLD = Number(process.env.QUIZ_WEAK_CONCEPT_THRESHOLD ?? 0.6);
+
+/**
+ * Phase 9's milestone-trigger pure logic, extracted for direct unit testing (see the Phase 9
+ * kickoff's "milestone-trigger conditions... as pure-function tests" requirement) — a session's
+ * transfer-tier score just crossed the same "high score" bar Phase 5's overlap detection already
+ * uses for "well-mastered."
+ */
+export function isTransferHighScoreAchieved(
+  tierScores: Partial<Record<QuizTier, number>>,
+  threshold: number = DEFAULT_HIGH_SCORE_THRESHOLD
+): boolean {
+  return tierScores.transfer !== undefined && tierScores.transfer >= threshold;
+}
 
 const TASK_TYPE_BY_TIER: Record<QuizTier, string> = {
   recall: "generate_recall_questions",
@@ -84,6 +108,8 @@ export interface QuizEngineOptions {
   db?: TeacherDb;
   /** Injectable for tests. Default: the real memoryGraph.writeMasteryUpdate() (Phase 4). */
   writeMasteryUpdate?: WriteMasteryUpdateFn;
+  /** Injectable for tests. Default: the real motivation.recordActivityEvent() (Phase 9). */
+  recordActivityEvent?: RecordActivityEventFn;
   questionsPerTier?: number;
   weakConceptThreshold?: number;
   onProgress?: ProgressListener;
@@ -200,6 +226,7 @@ export async function scoreAndRecordQuiz(
   const run = options.orchestratorRun ?? orchestratorRun;
   const db = options.db ?? (await getDb());
   const writeMastery = options.writeMasteryUpdate ?? writeMasteryUpdateDefault;
+  const recordActivity = options.recordActivityEvent ?? recordActivityEventDefault;
   const weakThreshold = options.weakConceptThreshold ?? DEFAULT_WEAK_CONCEPT_THRESHOLD;
   const onProgress = options.onProgress;
 
@@ -267,6 +294,17 @@ export async function scoreAndRecordQuiz(
     onProgress?.(`Course ${courseCompleted} marked complete — every lesson now has quiz results across all three tiers.`);
   }
 
+  const transferHighScoreAchieved = isTransferHighScoreAchieved(tierScores);
+  if (transferHighScoreAchieved) {
+    onProgress?.(`Transfer-tier score (${tierScores.transfer!.toFixed(2)}) crossed the high-score bar — a real milestone.`);
+  }
+
+  const [lessonRow] = await db.select().from(lessons).where(eq(lessons.id, lessonId));
+  const [moduleRow] = lessonRow ? await db.select().from(modules).where(eq(modules.id, lessonRow.moduleId)) : [];
+  if (moduleRow) {
+    await recordActivity("quiz_completed", lessonId, moduleRow.courseId, { db });
+  }
+
   return {
     lessonId,
     tierScores,
@@ -274,6 +312,7 @@ export async function scoreAndRecordQuiz(
     questionResults,
     weakConceptNodes,
     masteryState: updatedMastery!,
+    transferHighScoreAchieved,
     ...(courseCompleted ? { courseCompleted } : {}),
   };
 }

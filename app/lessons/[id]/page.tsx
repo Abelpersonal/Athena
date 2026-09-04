@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getLessonWithSources } from "../../../src/db/queries.js";
 import { chunkLessonAudio } from "../../../src/teachingEngine/chunkLessonAudio.js";
+import { recordActivityEvent } from "../../../src/motivation/index.js";
 import { LessonAudioSection } from "../../../components/LessonAudioSection.js";
 import { SourceCitations } from "../../../components/SourceCitations.js";
 import { LessonQA } from "../../../components/LessonQA.js";
@@ -20,6 +21,7 @@ export default async function LessonPage({ params }: { params: Promise<{ id: str
   const { lesson, courseId, courseTopic, sourceRefs } = detail;
   const track = chunkLessonAudio(id, lesson.layers);
   const mode = (process.env.TTS_PROVIDER || "openai").toLowerCase() === "browser" ? "browser" : "server";
+  await recordActivityEvent("lesson_viewed", id, courseId);
 
   return (
     <div className="space-y-6">

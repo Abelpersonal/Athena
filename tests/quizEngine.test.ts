@@ -4,13 +4,14 @@ import {
   generateQuizQuestions,
   scoreAndRecordQuiz,
   checkAndMarkCourseCompletion,
+  isTransferHighScoreAchieved,
   QuizEngineError,
   ALL_QUIZ_TIERS,
   type QuizQuestion,
   type QuizAnswer,
 } from "../src/quizEngine/index.js";
 import { getDb, resetDbCache } from "../src/db/client.js";
-import { courses, modules, lessons, quizResults, masteryState } from "../src/db/schema.js";
+import { courses, modules, lessons, quizResults, masteryState, activityEvents } from "../src/db/schema.js";
 import type { TeacherDb } from "../src/db/client.js";
 import type { OrchestratorResult, RunOptions } from "../src/orchestrator/index.js";
 
@@ -445,5 +446,100 @@ describe("checkAndMarkCourseCompletion (Phase 6 completion trigger)", () => {
     });
 
     expect(result.courseCompleted).toBeDefined();
+  });
+});
+
+describe("isTransferHighScoreAchieved (Phase 9 milestone trigger)", () => {
+  it("is true when the transfer tier score is at or above the threshold", () => {
+    expect(isTransferHighScoreAchieved({ transfer: 0.75 }, 0.75)).toBe(true);
+    expect(isTransferHighScoreAchieved({ transfer: 0.9 }, 0.75)).toBe(true);
+  });
+
+  it("is false when the transfer tier score is below the threshold", () => {
+    expect(isTransferHighScoreAchieved({ transfer: 0.74 }, 0.75)).toBe(false);
+  });
+
+  it("is false when no transfer tier was tested this session", () => {
+    expect(isTransferHighScoreAchieved({ recall: 0.9, application: 0.9 }, 0.75)).toBe(false);
+  });
+
+  it("defaults to Phase 5's own high-score threshold (0.75) when none is passed", () => {
+    expect(isTransferHighScoreAchieved({ transfer: 0.76 })).toBe(true);
+    expect(isTransferHighScoreAchieved({ transfer: 0.5 })).toBe(false);
+  });
+});
+
+describe("scoreAndRecordQuiz — Phase 9 instrumentation", () => {
+  beforeEach(() => resetDbCache());
+
+  it("surfaces transferHighScoreAchieved only on a real transfer-tier high score", async () => {
+    const db = await getDb(":memory:");
+    const { lessonId } = await seedLesson(db);
+    const questions: QuizQuestion[] = [
+      { id: "q-transfer", tier: "transfer", type: "multiple_choice", prompt: "p", options: ["a", "b"], correctOptionIndex: 0 },
+    ];
+
+    const highResult = await scoreAndRecordQuiz(lessonId, questions, [{ questionId: "q-transfer", answer: 0 }], {
+      db,
+      orchestratorRun: (async () => {
+        throw new Error("no LLM call expected — multiple_choice only");
+      }) as never,
+      writeMasteryUpdate: async () => {},
+    });
+    expect(highResult.transferHighScoreAchieved).toBe(true);
+
+    resetDbCache();
+    const db2 = await getDb(":memory:");
+    const { lessonId: lessonId2 } = await seedLesson(db2);
+    const lowResult = await scoreAndRecordQuiz(lessonId2, questions, [{ questionId: "q-transfer", answer: 1 }], {
+      db: db2,
+      orchestratorRun: (async () => {
+        throw new Error("no LLM call expected — multiple_choice only");
+      }) as never,
+      writeMasteryUpdate: async () => {},
+    });
+    expect(lowResult.transferHighScoreAchieved).toBe(false);
+  });
+
+  it("records a real quiz_completed ActivityEvent scoped to the lesson's real course, via the injectable collaborator", async () => {
+    const db = await getDb(":memory:");
+    const { lessonId, courseId } = await seedLesson(db);
+    const questions: QuizQuestion[] = [
+      { id: "q1", tier: "recall", type: "multiple_choice", prompt: "p", options: ["a", "b"], correctOptionIndex: 0 },
+    ];
+
+    const calls: Array<{ eventType: string; entityId: string; courseId: string }> = [];
+    await scoreAndRecordQuiz(lessonId, questions, [{ questionId: "q1", answer: 0 }], {
+      db,
+      orchestratorRun: (async () => {
+        throw new Error("no LLM call expected");
+      }) as never,
+      writeMasteryUpdate: async () => {},
+      recordActivityEvent: async (eventType, entityId, cId) => {
+        calls.push({ eventType, entityId, courseId: cId });
+      },
+    });
+
+    expect(calls).toEqual([{ eventType: "quiz_completed", entityId: lessonId, courseId }]);
+  });
+
+  it("the real (non-injected) recordActivityEvent path genuinely persists the row", async () => {
+    const db = await getDb(":memory:");
+    const { lessonId, courseId } = await seedLesson(db);
+    const questions: QuizQuestion[] = [
+      { id: "q1", tier: "recall", type: "multiple_choice", prompt: "p", options: ["a", "b"], correctOptionIndex: 0 },
+    ];
+
+    await scoreAndRecordQuiz(lessonId, questions, [{ questionId: "q1", answer: 0 }], {
+      db,
+      orchestratorRun: (async () => {
+        throw new Error("no LLM call expected");
+      }) as never,
+      writeMasteryUpdate: async () => {},
+    });
+
+    const rows = await db.select().from(activityEvents);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ eventType: "quiz_completed", entityId: lessonId, courseId });
   });
 });

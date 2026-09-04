@@ -2453,6 +2453,214 @@ the PRD's own example — confirmed live below, both a real `topic` and a real `
   course with many cross-links between distant modules. Revisit with `dagre`/`elkjs` if a real
   course's graph ever looks cluttered in practice — not something observed yet.
 
+## Phase 9: the Motivation/Engagement Layer
+
+Phases 1-8 built the full knowledge-delivery loop plus a real Mind Map and a starting menu. This
+phase adds the layer PRD §5.12b treats as just as central as the content itself — momentum
+framing, low-friction re-entry, boredom-proofing, and milestone celebration, on top of the
+Dashboard's existing real data — plus the two structural pieces §5.12b is explicitly tied to:
+real activity tracking and the onboarding goal capture Phase 8 deliberately deferred here. Every
+deliverable below is held to §6.1's "no dark patterns" rule and §11's guiding principle: no
+points, badges, leaderboards, or artificial urgency — streaks and milestones are the PRD's own
+named mechanics, and this phase stops there.
+
+### `ActivityEvent` / `UserProfile` — the Phase 9 gap-fill (same situation as `Path` and `MindMap`)
+
+Neither table is in the PRD's Section 7 list even though §5.12b clearly requires both — the same
+gap Phase 5 hit for `Path` and Phase 8 hit for `MindMap`. `activityEvents`
+(`{id, eventType, entityId, courseId, occurredAt}`) is what streak/re-entry/boredom-proofing all
+read from. `courseId` is stored on EVERY row regardless of `eventType` — a deliberate
+denormalization: every real consumer needs to group/filter by course, and re-deriving that from
+`entityId` (a lesson id for three of the four event types, a module id for the fourth) would mean
+a different join per event type at every read site. `userProfile` is a **singleton row** — this
+is an explicitly single-user app, so a `users` table with a foreign key everywhere would be pure
+overhead with no second user to ever key against.
+
+### Resolving PRD Open Decision 10
+
+`statedGoals` (a JSON array of short free-text strings, not a structured taxonomy) is the concrete
+resolution of Open Decision 10 ("full list of self-improvement goals/values to capture at
+onboarding — deferred, decide as a single batch"). The onboarding screen (`app/onboarding/`,
+Deliverable 1) asks 4 short prompts — "What are you hoping to get better at?", "Why does that
+matter to you?", "Is there something specific you're working toward?", "What would 'better'
+actually look like, a few months from now?" — each non-empty answer becomes one array entry.
+§6.2 screen 1 calls for "short, honest capture," not a long form, and a small free-text list is
+also simply enough for a single-user app: nothing downstream needs to parse or categorize these
+beyond handing them, verbatim, to one LLM call (`connect_activity_to_goal`) as plain context.
+
+### Onboarding gate — a Server Component read, not middleware
+
+`app/page.tsx` calls `getUserProfile()` first and `redirect("/onboarding")` when it returns null —
+a plain data check in the Dashboard's own Server Component, not Next.js middleware, consistent
+with how the rest of the app reads state. Skipping onboarding still calls `saveUserProfile([])`,
+so a row exists either way — the redirect fires exactly once per install, not on every visit.
+`app/onboarding/page.tsx` doubles as the Dashboard's "edit what you're working toward" link,
+pre-filled with whatever's already saved; the client component (`OnboardingClient.tsx`) shows
+"Skip for now" (saves `[]`) on a genuine first run and "Cancel" (navigates away, saves nothing) on
+a revisit, so editing existing goals can never be accidentally wiped by the wrong button.
+
+### Where ActivityEvents are actually written from
+
+Four real call sites, one per event type — `lesson_viewed` (`app/lessons/[id]/page.tsx`, on every
+real page load), `quiz_completed` (`quizEngine.scoreAndRecordQuiz`), `practice_completed`
+(`practiceEngine.recordPracticeAttempt`), `lesson_question_asked`
+(`teachingEngine.answerLessonQuestion`). Each is one additive `recordActivityEvent()` call added
+inside the function that already handles that real action — **not literally inside the thin API
+route wrapping it**, which is a deliberate deviation from the kickoff prompt's own phrasing ("add
+... at the existing API routes"): this codebase's actual convention (see `writeMasteryUpdate`) is
+that routes stay thin wrappers and the owning engine function is where a real action's side
+effects live, so `recordActivityEvent` was placed there instead, for the same reason. All three
+engine functions gained an injectable `recordActivityEvent` option (mirroring `writeMasteryUpdate`
+exactly) — but unlike the Memory Graph's best-effort writes, a failure here is **not** caught and
+degraded; it's a plain insert into the same SQLite database every other write already depends on,
+not an optional external service, so it should fail exactly like any other DB write failure would.
+
+### The pure/impure split — `src/motivation/pure.ts` vs. `src/motivation/index.ts`
+
+Same "hard logic is a pure function, DB/LLM parts are thin wrappers" split as Phase 5's
+`computeCrossDomainOrder` and Phase 8's `computeMindMapLayout`. `src/motivation/pure.ts` holds
+`computeStreak`, `selectWeakestConceptLesson`, `isPathInactive`, and `shouldShowGoalConnection` —
+zero imports from any other agent module, so it can never form an import cycle with the engines
+that call into it (quizEngine's own `DEFAULT_WEAK_CONCEPT_THRESHOLD` is passed IN by the caller,
+never imported by `pure.ts` itself). The DB-composition reads the Dashboard actually calls
+(`getMomentumStreak`, `getReentryOffer`, `getBoredomProofingSuggestions`) live in `src/db/queries.ts`
+alongside Phase 8's `getCourseMindMap` — exactly the "cross-cutting reads for frontend screens"
+role that file already has. `src/motivation/index.ts` holds the two genuinely stateful/LLM pieces
+(`recordActivityEvent`, `getUserProfile`/`saveUserProfile`, `getGoalConnectionMessage`).
+
+### Streak definition and the "no shaming" constraint
+
+Consecutive **UTC calendar days** (not the learner's local timezone — a v1 simplification) with
+at least one `ActivityEvent`, no distinction between event types. A streak whose most recent
+activity was today OR yesterday still counts (no penalty for not having logged in yet today); once
+the gap reaches 2+ days, `computeStreak` quietly returns `currentStreakDays: 0` — the Dashboard
+simply omits the momentum line in that case (`streak.currentStreakDays > 0 && ...`), never a red
+"you lost your streak" state or a comparison to a prior best. Confirmed live: aging every real
+`ActivityEvent` back by 5 days made the momentum line disappear entirely, with no shaming copy or
+styling anywhere on the page — verified by grepping the actual rendered HTML for "streak"/"lost"/
+"broke", not just by reading the code.
+
+### Low-friction re-entry — one existing quiz-generation path, parameterized
+
+`getReentryOffer()` picks the single weakest-scoring lesson (`knowledgeScore` below quizEngine's
+own `DEFAULT_WEAK_CONCEPT_THRESHOLD`, passed in) across every in-progress course. "Quick review"
+links to that lesson's normal `/quiz/:id` (all three tiers, unchanged). "5-minute check-in" links
+to `/quiz/:id?tier=recall&count=1` — `app/quiz/[lessonId]/page.tsx` reads those two query params
+and passes `tiers`/`questionsPerTier` down to `QuizClient`, which threads them into the SAME
+`/api/quiz/:id/generate` call every other quiz session uses (the route now also accepts an
+optional `questionsPerTier` in its body, alongside the `tiers` it already took) — `generateQuizQuestions`
+already supported both parameters internally; only the route's body shape and the client's props
+needed extending. No second quiz-generation path anywhere.
+
+### Boredom-proofing — reusing Phase 6's diversity signal, not a second one
+
+`isPathInactive` (pure): a path is "gone quiet" only when it has no `ActivityEvent` on any of its
+own courses in the inactivity window (`DEFAULT_BOREDOM_INACTIVITY_DAYS`, default **7 days**) WHILE
+the app has real activity elsewhere in that same window — a learner who simply hasn't opened the
+app at all doesn't trigger this for any one path, by design. The "change of pace" framing reuses
+Phase 6's `getRecentCourseDomains` + `isDomainClusterNarrow` (`src/continuousLearning/index.ts`)
+verbatim to pick between two static copy strings — not a second diversity algorithm, and not a new
+LLM call of its own. `getRecentCourseDomains` DOES make a real `infer_course_domain` LLM call per
+completed course that isn't Path-linked, though, and this runs on **every** Dashboard load — so
+that step is wrapped and degrades to the plain (non-diversity-biased) copy on failure rather than
+taking the whole Dashboard down. This was a real bug caught during live verification, not a
+hypothetical: a fresh dev-server run with a real `infer_course_domain` call missing valid
+credentials produced a genuine 500 on `/` before the fix, fixed by wrapping that one call.
+
+### Milestone celebration — exactly two triggers, both real
+
+Reuses Phase 5's own "high score" bar (`DEFAULT_HIGH_SCORE_THRESHOLD`, 0.75,
+`src/pathPlanner/overlap.ts`) rather than inventing a third threshold, per the kickoff's explicit
+instruction. `quizEngine.isTransferHighScoreAchieved` (pure, newly extracted) and the existing
+`courseCompleted` trigger (`checkAndMarkCourseCompletion`, already wired since Phase 6) are the
+**only** two triggers — both are returned from `scoreAndRecordQuiz`'s existing response, so no new
+API route was needed. `QuizClient.tsx` renders a single, visually distinct banner (a bordered,
+accent-tinted block, above the routine tier breakdown) when EITHER fires, and nothing extra when
+neither does — confirmed live via real API calls: a routine recall-tier result returns
+`transferHighScoreAchieved: false` with no `courseCompleted`; a real transfer-tier answer scored
+`transferHighScoreAchieved: true`; and completing the last missing tier across a real 3-lesson
+course's 3 lessons returned a real `courseCompleted` course id.
+
+### Goal-connection cadence and its own failure-isolation
+
+`shouldShowGoalConnection` (pure): roughly once per real day (`DEFAULT_GOAL_CONNECTION_MIN_HOURS`,
+default 20h) via `UserProfile.lastGoalConnectionShownAt` — a lightweight last-shown timestamp, not
+a notification-scheduling system, per §5.12b's own word "occasional[ly]." `getGoalConnectionMessage`
+runs from the Dashboard's Server Component read on every load, so its one real `[LLM]` call
+(`connect_activity_to_goal`, a new Orchestrator template) is wrapped and degrades to `null` on
+failure — the same reasoning as the boredom-proofing fix above, caught and fixed the same way
+during the same live-verification pass, before it could ever reach a real user.
+
+### The spaced-repetition substitution (documented plainly, per the kickoff's own instruction)
+
+There is no spaced-repetition scheduling system anywhere in this codebase, and this phase doesn't
+add one — the PRD's own UI-copy example ("Quick review," not "Spaced repetition module") and
+Dashboard mockup imply a system that was never actually specified as an agent or built. "Quick
+review" and "5-minute check-in" are real, useful low-friction re-entry options built from data
+that's genuinely available today (the weakest scoring concept node) — not spaced-repetition
+scheduling, which would need real per-lesson review-interval state this phase deliberately doesn't
+introduce.
+
+### Definition of done — Phase 9
+
+**Real, live-confirmed end-to-end**, via a real dry-run-seeded course (`npm run harness -- build
+--dry-run`) served by a real dev server pointed at that database, driven entirely through the
+actual HTTP routes (not the underlying functions directly):
+
+- A fresh load of `/` (no `UserProfile` row) returned a real `307` to `/onboarding`; completing
+  onboarding via a real `POST /api/onboarding` call made `/` return `200` immediately after, with
+  no further redirect on reload.
+- A real `GET /lessons/:id` page load wrote a real `activity_events` row (confirmed by querying
+  the database directly, not by trusting the route's response) — then the Dashboard's momentum
+  line showed "1 day of momentum." Aging that same real row back by one real day (simulating it
+  having happened "yesterday") and adding a second real row for "today" made the line read
+  "2 days of momentum" — the streak display genuinely changing across two simulated days of real
+  activity, per the kickoff's explicit bar.
+- Aging every real event back by 5 days made the momentum line disappear entirely — confirmed by
+  grepping the rendered HTML for any shaming language, not just by inspecting the source.
+- A real goal-connection message rendered on the Dashboard, generated by a real (non-mocked)
+  Gemini call grounded in the real `statedGoals` saved during onboarding and the real most-recent
+  course studied.
+- Both re-entry offers were clicked through for real: "Quick review" and "5-minute check-in" each
+  loaded `/quiz/:id` and generated real, correctly-scoped question sets via the real
+  `/api/quiz/:id/generate` route (the check-in genuinely returned exactly one recall-tier
+  question, not the full six).
+- Boredom-proofing: a real `Path`/`PathDomain`/`PathTopic` was constructed (the same "deliberately
+  constructed real record" approach Phase 5/6/8 used for their own hard-to-naturally-produce
+  branches) linking to a course with zero activity, alongside real recent activity on other
+  courses — the Dashboard correctly flagged only the quiet path, with a real "gone quiet" message
+  and a working "Explore something new" link to `/new`.
+- Milestone celebration: a real transfer-tier question, answered correctly via the real scoring
+  route, returned `transferHighScoreAchieved: true`; completing the final missing tier across a
+  real 3-lesson course returned a real `courseCompleted` course id in the same response shape
+  `QuizClient` already reads. A routine recall-tier result in the same session returned both
+  fields false/absent, confirming no celebration fires for ordinary results.
+- **Two real bugs were caught and fixed during this same live-verification pass** (not found by
+  unit tests, which mock every LLM call by design): `getGoalConnectionMessage` and
+  `getBoredomProofingSuggestions` each made a real, unguarded Orchestrator call from a Server
+  Component page read that runs on every Dashboard load — a transient failure in either would have
+  taken the ENTIRE Dashboard down with a 500, which is exactly what happened once, live, before
+  the fix. Both are now wrapped and degrade to a safe default (`null` / the non-diversity-biased
+  copy) on failure, matching the "an enrichment step, not a precondition" policy this codebase
+  already applies to Phase 8's mind map generation and every Memory Graph write.
+- `npm test` — 295 tests total (248 through Phase 8 + 47 new: `tests/motivationPure.test.ts` (19,
+  pure, no DB/LLM), `tests/motivation.test.ts` (9, including the goal-connection degradation
+  case), plus additions to `tests/quizEngine.test.ts`, `tests/practiceEngine.test.ts`,
+  `tests/answerLessonQuestion.test.ts`, and `tests/dbQueries.test.ts`, including the
+  boredom-proofing degradation case) — all pass. `npm run typecheck` clean across both configs.
+
+### Documented gaps
+
+- **No real browser click-through of the milestone banner or the onboarding form's actual
+  rendering** — same category of gap as Phase 7.5/Phase 8, no browser automation available in this
+  environment. The data these screens render was confirmed correct and real at every layer below
+  the final paint (API responses, rendered HTML/RSC payload); the pixels themselves aren't
+  screenshotted.
+- **`lesson_viewed` can, in principle, over-count from Next.js Link prefetching** a lesson page a
+  learner never actually opens. This is low-stakes here: streak/re-entry/boredom-proofing only
+  need "was there real activity on this day/course," not a precise view count, so an occasional
+  prefetch-triggered row doesn't change any real decision this phase makes.
+
 ## LLM provider swap (added mid-Phase-2, not in the original kickoff prompt)
 
 Partway through Phase 2, the decision was made to make the Orchestrator's LLM vendor swappable

@@ -5,9 +5,25 @@ import {
   getActivePathsWithProgress,
   getLessonWithSources,
   getCourseMindMap,
+  getMomentumStreak,
+  getReentryOffer,
+  getBoredomProofingSuggestions,
 } from "../src/db/queries.js";
 import { getDb, resetDbCache } from "../src/db/client.js";
-import { courses, modules, lessons, sources, paths, pathDomains, pathTopics, mindMaps, updateEvents, lessonUpdates } from "../src/db/schema.js";
+import {
+  courses,
+  modules,
+  lessons,
+  sources,
+  paths,
+  pathDomains,
+  pathTopics,
+  mindMaps,
+  updateEvents,
+  lessonUpdates,
+  masteryState,
+  activityEvents,
+} from "../src/db/schema.js";
 import type { TeacherDb } from "../src/db/client.js";
 
 const LAYER_TEXT = { text: "t", source_ids: [] };
@@ -208,5 +224,182 @@ describe("getCourseMindMap", () => {
 
     const result = await getCourseMindMap("crs_fresh", { db });
     expect(result.updatedLessonIds).toEqual(["lsn_a"]);
+  });
+});
+
+describe("getMomentumStreak (Phase 9)", () => {
+  beforeEach(() => resetDbCache());
+
+  async function seedCourse(db: TeacherDb, id: string) {
+    await db.insert(courses).values({ id, topic: "T", createdAt: "2026-01-01T00:00:00.000Z", volatilityTier: "medium", status: "complete" });
+  }
+
+  it("returns 0/null with no real ActivityEvents yet", async () => {
+    const db = await getDb(":memory:");
+    expect(await getMomentumStreak({ db })).toEqual({ currentStreakDays: 0, lastActiveDate: null });
+  });
+
+  it("computes a real streak from real ActivityEvent rows, regardless of event type", async () => {
+    const db = await getDb(":memory:");
+    await seedCourse(db, "crs_streak");
+    const now = new Date("2026-03-10T12:00:00.000Z");
+    await db.insert(activityEvents).values([
+      { id: "ae_1", eventType: "lesson_viewed", entityId: "lsn_1", courseId: "crs_streak", occurredAt: now.toISOString() },
+      { id: "ae_2", eventType: "quiz_completed", entityId: "lsn_1", courseId: "crs_streak", occurredAt: new Date(now.getTime() - 86_400_000).toISOString() },
+    ]);
+
+    expect(await getMomentumStreak({ db, now })).toEqual({ currentStreakDays: 2, lastActiveDate: "2026-03-10" });
+  });
+});
+
+describe("getReentryOffer (Phase 9)", () => {
+  beforeEach(() => resetDbCache());
+
+  async function seedCourseWithLesson(
+    db: TeacherDb,
+    courseId: string,
+    lessonId: string,
+    knowledgeScore: number | null,
+    completedAt: string | null = null
+  ) {
+    await db.insert(courses).values({ id: courseId, topic: "T", createdAt: "2026-01-01T00:00:00.000Z", volatilityTier: "medium", status: "complete", completedAt });
+    await db.insert(modules).values({ id: `mod_${courseId}`, courseId, title: "M", description: "d", order: 0, prerequisiteOf: [] });
+    await db.insert(lessons).values({
+      id: lessonId,
+      moduleId: `mod_${courseId}`,
+      title: `Lesson ${lessonId}`,
+      description: "d",
+      estimatedDuration: "5 min",
+      layers: FIVE_LAYERS,
+      sourceRefs: [],
+      sourceStatus: "ok",
+    });
+    if (knowledgeScore !== null) {
+      await db.insert(masteryState).values({ conceptNodeId: lessonId, knowledgeScore, experienceScore: null, lastUpdated: "2026-01-02T00:00:00.000Z" });
+    }
+  }
+
+  it("returns null when no in-progress lesson scores below the weak-concept threshold", async () => {
+    const db = await getDb(":memory:");
+    await seedCourseWithLesson(db, "crs_strong", "lsn_strong", 0.9);
+    expect(await getReentryOffer({ db })).toBeNull();
+  });
+
+  it("picks the weakest-scoring lesson across in-progress courses", async () => {
+    const db = await getDb(":memory:");
+    await seedCourseWithLesson(db, "crs_a", "lsn_a", 0.5);
+    await seedCourseWithLesson(db, "crs_b", "lsn_b", 0.2);
+    const offer = await getReentryOffer({ db });
+    expect(offer?.lessonId).toBe("lsn_b");
+  });
+
+  it("ignores lessons under an already-completed course", async () => {
+    const db = await getDb(":memory:");
+    await seedCourseWithLesson(db, "crs_done", "lsn_done", 0.1, "2026-02-01T00:00:00.000Z");
+    expect(await getReentryOffer({ db })).toBeNull();
+  });
+});
+
+describe("getBoredomProofingSuggestions (Phase 9)", () => {
+  beforeEach(() => resetDbCache());
+
+  async function seedPathWithCourse(db: TeacherDb, pathId: string, courseId: string) {
+    await db.insert(paths).values({ id: pathId, goalDescription: `Goal ${pathId}`, createdAt: "2026-01-01T00:00:00.000Z", status: "active" });
+    await db.insert(pathDomains).values({ id: `dom_${pathId}`, pathId, name: "Domain", order: 0 });
+    await db.insert(courses).values({ id: courseId, topic: "T", createdAt: "2026-01-01T00:00:00.000Z", volatilityTier: "medium", status: "complete" });
+    await db.insert(pathTopics).values({
+      id: `pt_${pathId}`,
+      pathId,
+      domainId: `dom_${pathId}`,
+      topicName: "Topic",
+      description: "d",
+      order: 0,
+      parallelGroup: "tier_0",
+      status: "linked_existing",
+      courseId,
+    });
+  }
+
+  it("returns nothing when there are no active paths at all", async () => {
+    const db = await getDb(":memory:");
+    expect(await getBoredomProofingSuggestions({ db })).toEqual([]);
+  });
+
+  it("flags a path whose own courses have gone quiet while another path stayed active, and leaves the active one unflagged", async () => {
+    const db = await getDb(":memory:");
+    await seedPathWithCourse(db, "path_quiet", "crs_quiet");
+    await seedPathWithCourse(db, "path_active", "crs_active");
+    const now = new Date("2026-03-10T12:00:00.000Z");
+
+    // path_quiet's course: only OLD activity (20 days ago) — genuinely gone quiet.
+    await db.insert(activityEvents).values({
+      id: "ae_old",
+      eventType: "lesson_viewed",
+      entityId: "lsn_x",
+      courseId: "crs_quiet",
+      occurredAt: new Date(now.getTime() - 20 * 86_400_000).toISOString(),
+    });
+    // path_active's course: recent activity — this is what proves the app has been used elsewhere.
+    await db.insert(activityEvents).values({
+      id: "ae_recent",
+      eventType: "lesson_viewed",
+      entityId: "lsn_y",
+      courseId: "crs_active",
+      occurredAt: new Date(now.getTime() - 1 * 86_400_000).toISOString(),
+    });
+
+    const result = await getBoredomProofingSuggestions({ db, now });
+    expect(result.map((r) => r.pathId)).toEqual(["path_quiet"]);
+    expect(result[0]!.message.length).toBeGreaterThan(0);
+  });
+
+  it("flags nothing when the whole app has simply been idle (not this path's problem to single out)", async () => {
+    const db = await getDb(":memory:");
+    await seedPathWithCourse(db, "path_a", "crs_a");
+    const now = new Date("2026-03-10T12:00:00.000Z");
+    await db.insert(activityEvents).values({
+      id: "ae_old",
+      eventType: "lesson_viewed",
+      entityId: "lsn_x",
+      courseId: "crs_a",
+      occurredAt: new Date(now.getTime() - 20 * 86_400_000).toISOString(),
+    });
+
+    expect(await getBoredomProofingSuggestions({ db, now })).toEqual([]);
+  });
+
+  it("degrades to the plain (non-diversity-biased) message rather than throwing when the diversity signal's LLM call fails", async () => {
+    const db = await getDb(":memory:");
+    await seedPathWithCourse(db, "path_quiet", "crs_quiet");
+    // A second, completed, NOT path-linked course — this is what forces getRecentCourseDomains to
+    // make a real infer_course_domain LLM call, which has no mock wired up here and will reject.
+    await db.insert(courses).values({
+      id: "crs_unrelated_completed",
+      topic: "Unrelated",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      volatilityTier: "medium",
+      status: "complete",
+      completedAt: "2026-01-05T00:00:00.000Z",
+    });
+    const now = new Date("2026-03-10T12:00:00.000Z");
+    await db.insert(activityEvents).values({
+      id: "ae_old",
+      eventType: "lesson_viewed",
+      entityId: "lsn_x",
+      courseId: "crs_quiet",
+      occurredAt: new Date(now.getTime() - 20 * 86_400_000).toISOString(),
+    });
+    await db.insert(activityEvents).values({
+      id: "ae_recent",
+      eventType: "lesson_viewed",
+      entityId: "lsn_y",
+      courseId: "crs_unrelated_completed",
+      occurredAt: new Date(now.getTime() - 1 * 86_400_000).toISOString(),
+    });
+
+    const result = await getBoredomProofingSuggestions({ db, now });
+    expect(result).toHaveLength(1);
+    expect(result[0]!.pathId).toBe("path_quiet");
+    expect(result[0]!.message).toContain("pick it back up");
   });
 });

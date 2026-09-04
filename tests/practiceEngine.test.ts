@@ -380,4 +380,31 @@ describe("recordPracticeAttempt", () => {
 
     expect(result.willEscalateNextAttempt).toBe(false);
   });
+
+  it("records a real practice_completed ActivityEvent scoped to the module's real course (Phase 9)", async () => {
+    const db = await getDb(":memory:");
+    const { moduleId, courseId } = await seedModule(db);
+    const session: PracticeSession = {
+      moduleId,
+      moduleTitle: "Test Module",
+      topicType: "skill_based",
+      topicTypeJustification: "j",
+      format: "project",
+      formatJustification: "j",
+      difficulty: "guided",
+      attemptNumber: 1,
+      project: { task: "t", datasetOrPrompt: "d", deliverableExpectations: "e" },
+    };
+
+    const calls: Array<{ eventType: string; entityId: string; courseId: string }> = [];
+    await recordPracticeAttempt(session, "Good.", "None.", 0.8, {
+      db,
+      writeMasteryUpdate: async () => {},
+      recordActivityEvent: async (eventType, entityId, cId) => {
+        calls.push({ eventType, entityId, courseId: cId });
+      },
+    });
+
+    expect(calls).toEqual([{ eventType: "practice_completed", entityId: moduleId, courseId }]);
+  });
 });
