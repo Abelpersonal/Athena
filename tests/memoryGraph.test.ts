@@ -17,8 +17,15 @@ vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
 }));
 
 const { GraphitiMCPClient } = await import("../src/memoryGraph/graphitiClient.js");
-const { writeTopic, writeSubtopicFacts, getTopicHistory, writeMasteryUpdate, supersedeFact, getCrossCourseConnections } =
-  await import("../src/memoryGraph/index.js");
+const {
+  writeTopic,
+  writeSubtopicFacts,
+  getTopicHistory,
+  writeMasteryUpdate,
+  supersedeFact,
+  getCrossCourseConnections,
+  writeMindMapNodes,
+} = await import("../src/memoryGraph/index.js");
 
 function toolResult(data: unknown): { isError: false; content: Array<{ type: "text"; text: string }> } {
   return { isError: false, content: [{ type: "text", text: JSON.stringify(data) }] };
@@ -381,6 +388,80 @@ describe("memoryGraph", () => {
 
       const result = await getCrossCourseConnections("Anything", client);
       expect(result).toEqual({ connectedTopics: [], error: expect.any(String) });
+    });
+  });
+
+  describe("writeMindMapNodes (Phase 8)", () => {
+    it("writes one add_memory episode summarizing the map, then one add_triplet per edge using concept labels as endpoint names", async () => {
+      mockCallTool.mockResolvedValue(toolResult({ message: "ok" }));
+      const client = new GraphitiMCPClient();
+      const nodes = [
+        { id: "lsn_1", conceptLabel: "Time Dilation" },
+        { id: "lsn_2", conceptLabel: "Length Contraction" },
+      ];
+      const edges = [
+        { source: "lsn_1", target: "lsn_2", type: "prerequisite" as const },
+      ];
+
+      await writeMindMapNodes("crs_123", "Special Relativity", nodes, edges, client);
+
+      expect(mockCallTool).toHaveBeenCalledTimes(2);
+      const [episodeCall, edgeCall] = mockCallTool.mock.calls.map((c) => c[0]);
+      expect(episodeCall).toMatchObject({
+        name: "add_memory",
+        arguments: expect.objectContaining({
+          name: "Mind Map: Special Relativity",
+          source_description: expect.stringContaining("crs_123"),
+        }),
+      });
+      expect(episodeCall.arguments.episode_body).toContain("2 concept node(s)");
+      expect(episodeCall.arguments.episode_body).toContain("1 edge(s)");
+
+      expect(edgeCall).toMatchObject({
+        name: "add_triplet",
+        arguments: {
+          source_node_name: "Time Dilation", // the concept label, not the raw lesson id
+          edge_name: "MIND_MAP_PREREQUISITE",
+          target_node_name: "Length Contraction",
+        },
+      });
+    });
+
+    it("uses MIND_MAP_CROSS_LINK for cross_link edges", async () => {
+      mockCallTool.mockResolvedValue(toolResult({ message: "ok" }));
+      const client = new GraphitiMCPClient();
+      const nodes = [
+        { id: "lsn_1", conceptLabel: "A" },
+        { id: "lsn_2", conceptLabel: "B" },
+      ];
+      await writeMindMapNodes("crs_123", "Topic", nodes, [{ source: "lsn_1", target: "lsn_2", type: "cross_link" }], client);
+
+      const edgeCall = mockCallTool.mock.calls[1]![0];
+      expect(edgeCall.arguments.edge_name).toBe("MIND_MAP_CROSS_LINK");
+    });
+
+    it("still writes the summary episode when there are no edges (no add_triplet calls)", async () => {
+      mockCallTool.mockResolvedValue(toolResult({ message: "ok" }));
+      const client = new GraphitiMCPClient();
+
+      await writeMindMapNodes("crs_123", "Topic", [{ id: "lsn_1", conceptLabel: "A" }], [], client);
+
+      expect(mockCallTool).toHaveBeenCalledTimes(1);
+      expect(mockCallTool.mock.calls[0]![0]).toMatchObject({ name: "add_memory" });
+    });
+
+    it("degrades gracefully (resolves, logs) when the graph server is unreachable", async () => {
+      mockConnect.mockRejectedValue(new Error("ECONNREFUSED"));
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const client = new GraphitiMCPClient();
+
+      await expect(
+        writeMindMapNodes("crs_123", "Topic", [{ id: "lsn_1", conceptLabel: "A" }], [{ source: "lsn_1", target: "lsn_2", type: "prerequisite" }], client)
+      ).resolves.toBeUndefined();
+
+      expect(mockCallTool).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalled();
+      errorSpy.mockRestore();
     });
   });
 });

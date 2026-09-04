@@ -8,6 +8,7 @@ import type {
   GraphitiEpisodeSearchResponse,
 } from "./types.js";
 import type { ExtractGroundedKeyPointsOutput } from "../orchestrator/templates/extractGroundedKeyPoints.js";
+import type { MindMapNode, MindMapEdge } from "../db/schema.js";
 
 export type { GraphitiNodeResult, GraphitiFactResult, GraphitiEpisodeResult } from "./types.js";
 export { GraphitiMCPClient } from "./graphitiClient.js";
@@ -87,6 +88,58 @@ export async function writeTopic(
     } catch (error) {
       console.error(
         `[memory-graph] Failed to write prerequisite edge "${topic}" -> "${prerequisite}" (course_id: ${courseId}): ${(error as Error).message}`
+      );
+    }
+  }
+}
+
+/**
+ * Phase 8: writes the Mind Map Agent's output (src/mindMap/index.ts) — one clearly-scoped method
+ * for this concern, matching how this module already keeps `writeTopic`/`writeSubtopicFacts`/
+ * `writeMasteryUpdate` separate rather than overloading one of them. Mirrors `writeTopic()`'s
+ * exact shape: an `add_memory` episode summarizing the map first (so a bare "no edges yet" graph
+ * still leaves a real trace), then one `add_triplet` per edge — `MIND_MAP_PREREQUISITE` or
+ * `MIND_MAP_CROSS_LINK` depending on the edge's own type, using each node's concept label (not
+ * its raw lesson id) as the triplet's endpoint names, since those are what a graph text search
+ * would actually match against later.
+ */
+export async function writeMindMapNodes(
+  courseId: string,
+  topic: string,
+  nodes: MindMapNode[],
+  edges: MindMapEdge[],
+  client: GraphitiMCPClient = getDefaultClient()
+): Promise<void> {
+  try {
+    await client.callTool("add_memory", {
+      name: `Mind Map: ${topic}`,
+      episode_body: `A mind map with ${nodes.length} concept node(s) and ${edges.length} edge(s) was generated for course "${topic}" (course_id: ${courseId}).`,
+      source: "text",
+      source_description: `Teacher Mind Map Agent (course_id: ${courseId})`,
+      reference_time: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error(
+      `[memory-graph] Failed to write mind map episode for "${topic}" (course_id: ${courseId}): ${(error as Error).message}`
+    );
+  }
+
+  const labelById = new Map(nodes.map((n) => [n.id, n.conceptLabel]));
+  for (const edge of edges) {
+    const sourceLabel = labelById.get(edge.source) ?? edge.source;
+    const targetLabel = labelById.get(edge.target) ?? edge.target;
+    const edgeName = edge.type === "prerequisite" ? "MIND_MAP_PREREQUISITE" : "MIND_MAP_CROSS_LINK";
+    const relation = edge.type === "prerequisite" ? "is a prerequisite concept for" : "is cross-linked with";
+    try {
+      await client.callTool("add_triplet", {
+        source_node_name: sourceLabel,
+        edge_name: edgeName,
+        fact: `"${sourceLabel}" ${relation} "${targetLabel}" in the mind map for "${topic}".`,
+        target_node_name: targetLabel,
+      });
+    } catch (error) {
+      console.error(
+        `[memory-graph] Failed to write mind map edge "${sourceLabel}" -> "${targetLabel}" (course_id: ${courseId}): ${(error as Error).message}`
       );
     }
   }

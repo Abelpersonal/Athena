@@ -252,6 +252,18 @@ export function createMockOrchestratorRun(): OrchestratorRunFn {
           updatedGuidance: "Mock canned corrected guidance for the learner.",
         });
 
+      case "generate_mind_map": {
+        // Reads the REAL lessonId values back out of its own context (the same pattern
+        // compare_findings_to_facts' mock uses for relatedLessonId) — a dry run's mind map graph
+        // genuinely validates against the real persisted lessons, not a canned id that happens to
+        // pass by coincidence. A simple chain (each lesson a prerequisite of the next) is enough
+        // to demonstrate a real, non-trivial edge set without hand-tuning per dry-run fixture.
+        const lessonsCtx = (context.lessons as Array<{ lessonId: string; title: string }>) ?? [];
+        const nodes = lessonsCtx.map((l) => ({ lessonId: l.lessonId, conceptLabel: `Mock concept: ${l.title}` }));
+        const edges = nodes.slice(1).map((n, i) => ({ source: nodes[i]!.lessonId, target: n.lessonId, type: "prerequisite" as const }));
+        return respond({ nodes, edges });
+      }
+
       default:
         throw new Error(`[dry-run mock] No canned response registered for task type "${taskType}".`);
     }

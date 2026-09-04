@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useProgressStream, ProgressLog } from "../../components/ProgressStream.js";
+import { STARTING_MENU, STARTING_MENU_CATEGORIES } from "../../src/startingMenu/data.js";
 
 interface ClassifyResult {
   classification: "topic" | "goal";
@@ -106,6 +107,30 @@ export default function NewEntryPage() {
           </button>
         )}
       </form>
+
+      {!classification && (
+        <div className="space-y-4">
+          <p className="text-sm text-[var(--color-text-muted)]">…or pick something to start with</p>
+          {STARTING_MENU_CATEGORIES.map((category) => (
+            <div key={category}>
+              <h2 className="text-xs uppercase tracking-wide text-[var(--color-text-faint)] mb-1.5">{category}</h2>
+              <div className="flex flex-wrap gap-1.5">
+                {STARTING_MENU.filter((entry) => entry.category === category).map((entry) => (
+                  <button
+                    key={entry.id}
+                    type="button"
+                    onClick={() => setInput(entry.prompt)}
+                    disabled={classifying}
+                    className="text-xs px-2.5 py-1 rounded-full border border-[var(--color-border)] hover:border-[var(--color-accent)] disabled:opacity-50"
+                  >
+                    {entry.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
 

@@ -1,6 +1,6 @@
 import { eq, inArray, isNull, isNotNull } from "drizzle-orm";
 import { getDb, type TeacherDb } from "./client.js";
-import { courses, modules, lessons, sources, paths, pathTopics, masteryState } from "./schema.js";
+import { courses, modules, lessons, sources, paths, pathTopics, masteryState, mindMaps, lessonUpdates, type MindMapGraph } from "./schema.js";
 
 /**
  * Phase 7: cross-cutting, read-only queries for the frontend's Dashboard/Course/Lesson screens —
@@ -146,6 +146,26 @@ export async function getCourseDetail(courseId: string, options: { db?: TeacherD
   }
 
   return { course, modules: detailModules };
+}
+
+export interface CourseMindMapData {
+  /** null when this course has no mindMaps row yet (e.g. built before Phase 8, or the LLM step degraded during build) — the Course view falls back to the plain list in that case. */
+  graph: MindMapGraph | null;
+  /** Lesson ids with an associated lessonUpdates row (Phase 6's major-delta records) — read-only; no Phase 6 write path is touched by this query. */
+  updatedLessonIds: string[];
+}
+
+/** The Course view's mind map read: the persisted graph (if any) plus which of its nodes' lessons have a Phase 6 "update lesson" — the graph's freshness indicator. */
+export async function getCourseMindMap(courseId: string, options: { db?: TeacherDb } = {}): Promise<CourseMindMapData> {
+  const db = options.db ?? (await getDb());
+  const [mindMap] = await db.select().from(mindMaps).where(eq(mindMaps.courseId, courseId));
+  if (!mindMap) return { graph: null, updatedLessonIds: [] };
+
+  const lessonIds = mindMap.graphJson.nodes.map((n) => n.id);
+  const updates =
+    lessonIds.length > 0 ? await db.select().from(lessonUpdates).where(inArray(lessonUpdates.lessonId, lessonIds)) : [];
+
+  return { graph: mindMap.graphJson, updatedLessonIds: [...new Set(updates.map((u) => u.lessonId))] };
 }
 
 export interface LessonSourceRef {

@@ -10,6 +10,7 @@ import { runResearchPipeline, ResearchPipelineError } from "../research/pipeline
 import type { CourseJson } from "../research/types.js";
 import { buildCourse, CourseBuilderError } from "../courseBuilder/index.js";
 import { aggregateMaterials } from "../materialAggregator/index.js";
+import { generateMindMap } from "../mindMap/index.js";
 import { getDb, resetDbCache } from "../db/client.js";
 import { slugify } from "../shared/ids.js";
 import {
@@ -256,6 +257,19 @@ async function runBuildCommand(args: string[]): Promise<void> {
       ? { fetchAndClean: createMockMaterialFetchAndClean(), backfillSubtopic: createMockBackfillSubtopic() }
       : {}),
   });
+
+  // Phase 8: a 4th step, not part of buildCourse()/courseBuilder itself (see README, "Mind Map
+  // call sites") — degrades on failure rather than failing the whole build, same policy every
+  // other Memory Graph/enrichment write in this codebase follows.
+  try {
+    await generateMindMap(built.courseId, {
+      onProgress,
+      db,
+      ...(dryRun ? { orchestratorRun: mockOrchestratorRun } : {}),
+    });
+  } catch (error) {
+    onProgress(`Mind map generation failed (course was still built successfully): ${(error as Error).message}`);
+  }
 
   const elapsedSeconds = ((Date.now() - startedAt) / 1000).toFixed(1);
   console.log(`\n[build-harness] Done in ${elapsedSeconds}s${dryRun ? " (dry run)" : ""}.`);

@@ -1,17 +1,20 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { getCourseDetail } from "../../../src/db/queries.js";
+import { getCourseDetail, getCourseMindMap } from "../../../src/db/queries.js";
 import { MasteryBadge } from "../../../components/MasteryBadge.js";
 import { SourceCitations } from "../../../components/SourceCitations.js";
+import { CourseMindMap } from "../../../components/CourseMindMap.js";
 
 /**
  * The Course view — module/lesson list in persisted prerequisite order (modules.order), each
- * lesson's mastery state as a simple indicator. No mind map (Phase 8) — a plain list is correct
- * here per the Phase 7 scope boundary.
+ * lesson's mastery state as a simple indicator, PLUS (Phase 8) the mind map graph when one
+ * exists. The plain list is kept unconditionally — a reasonable fallback for a course whose
+ * `mindMaps` row doesn't exist yet (e.g. one built before Phase 8 shipped, or where mind map
+ * generation degraded during that course's build).
  */
 export default async function CourseViewPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const detail = await getCourseDetail(id);
+  const [detail, mindMapData] = await Promise.all([getCourseDetail(id), getCourseMindMap(id)]);
   if (!detail) notFound();
 
   const { course, modules } = detail;
@@ -25,6 +28,22 @@ export default async function CourseViewPage({ params }: { params: Promise<{ id:
           {course.completedAt && " · completed"}
         </p>
       </div>
+
+      {mindMapData.graph && (
+        <section>
+          <h2 className="text-lg font-medium mb-3">Concept map</h2>
+          <CourseMindMap
+            graph={mindMapData.graph}
+            modules={modules.map((m) => ({
+              id: m.id,
+              title: m.title,
+              order: m.order,
+              lessons: m.lessons.map((l) => ({ id: l.id, knowledgeScore: l.knowledgeScore })),
+            }))}
+            updatedLessonIds={mindMapData.updatedLessonIds}
+          />
+        </section>
+      )}
 
       {modules.map((m) => (
         <section key={m.id}>

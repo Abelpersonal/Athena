@@ -4,9 +4,10 @@ import {
   getCompletedCourses,
   getActivePathsWithProgress,
   getLessonWithSources,
+  getCourseMindMap,
 } from "../src/db/queries.js";
 import { getDb, resetDbCache } from "../src/db/client.js";
-import { courses, modules, lessons, sources, paths, pathDomains, pathTopics } from "../src/db/schema.js";
+import { courses, modules, lessons, sources, paths, pathDomains, pathTopics, mindMaps, updateEvents, lessonUpdates } from "../src/db/schema.js";
 import type { TeacherDb } from "../src/db/client.js";
 
 const LAYER_TEXT = { text: "t", source_ids: [] };
@@ -133,5 +134,79 @@ describe("getLessonWithSources", () => {
 
     const result = await getLessonWithSources("lsn_nosrc", { db });
     expect(result!.sourceRefs).toEqual([]);
+  });
+});
+
+describe("getCourseMindMap", () => {
+  beforeEach(() => resetDbCache());
+
+  async function seedCourseWithLessons(db: TeacherDb, courseId: string, lessonIds: string[]) {
+    await db.insert(courses).values({ id: courseId, topic: "T", createdAt: "2026-01-01T00:00:00.000Z", volatilityTier: "medium", status: "complete" });
+    await db.insert(modules).values({ id: `mod_${courseId}`, courseId, title: "M", description: "d", order: 0, prerequisiteOf: [] });
+    for (const id of lessonIds) {
+      await db.insert(lessons).values({
+        id,
+        moduleId: `mod_${courseId}`,
+        title: `Lesson ${id}`,
+        description: "d",
+        estimatedDuration: "5 min",
+        layers: FIVE_LAYERS,
+        sourceRefs: [],
+        sourceStatus: "ok",
+      });
+    }
+  }
+
+  it("returns a null graph (not an error) for a course with no mindMaps row yet", async () => {
+    const db = await getDb(":memory:");
+    await seedCourseWithLessons(db, "crs_no_map", ["lsn_a"]);
+
+    const result = await getCourseMindMap("crs_no_map", { db });
+    expect(result).toEqual({ graph: null, updatedLessonIds: [] });
+  });
+
+  it("returns the real persisted graph, with updatedLessonIds empty when no lesson has a Phase 6 update", async () => {
+    const db = await getDb(":memory:");
+    await seedCourseWithLessons(db, "crs_map", ["lsn_a", "lsn_b"]);
+    await db.insert(mindMaps).values({
+      id: "mm_1",
+      courseId: "crs_map",
+      graphJson: { nodes: [{ id: "lsn_a", conceptLabel: "A" }, { id: "lsn_b", conceptLabel: "B" }], edges: [] },
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const result = await getCourseMindMap("crs_map", { db });
+    expect(result.graph?.nodes).toHaveLength(2);
+    expect(result.updatedLessonIds).toEqual([]);
+  });
+
+  it("flags a node's lesson as updated when a Phase 6 lessonUpdates row exists for it", async () => {
+    const db = await getDb(":memory:");
+    await seedCourseWithLessons(db, "crs_fresh", ["lsn_a", "lsn_b"]);
+    await db.insert(mindMaps).values({
+      id: "mm_2",
+      courseId: "crs_fresh",
+      graphJson: { nodes: [{ id: "lsn_a", conceptLabel: "A" }, { id: "lsn_b", conceptLabel: "B" }], edges: [] },
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    await db.insert(updateEvents).values({
+      id: "ue_1",
+      topicId: "crs_fresh",
+      detectedAt: "2026-02-01T00:00:00.000Z",
+      severity: "major",
+      deltaSummary: "A core claim was reversed.",
+    });
+    await db.insert(lessonUpdates).values({
+      id: "lu_1",
+      lessonId: "lsn_a",
+      updateEventId: "ue_1",
+      title: "Update",
+      whatChanged: "changed",
+      updatedGuidance: "guidance",
+      createdAt: "2026-02-01T00:00:00.000Z",
+    });
+
+    const result = await getCourseMindMap("crs_fresh", { db });
+    expect(result.updatedLessonIds).toEqual(["lsn_a"]);
   });
 });

@@ -1,13 +1,12 @@
-export type MasteryStatus = "not_started" | "in_progress" | "mastered";
-
-/** Threshold reused from the Quiz Engine's own weak-concept default (src/quizEngine/index.ts) — a knowledge_score at/above this reads as "mastered" here too, for a consistent meaning of the word across the app. */
-const MASTERED_THRESHOLD = 0.75;
-
-export function masteryStatusFor(knowledgeScore: number | null): MasteryStatus {
-  if (knowledgeScore === null) return "not_started";
-  if (knowledgeScore >= MASTERED_THRESHOLD) return "mastered";
-  return "in_progress";
-}
+/**
+ * Phase 8: masteryStatusFor()/MasteryStatus/MASTERED_THRESHOLD moved to src/shared/mastery.ts so
+ * src/mindMap/layout.ts (a pure, backend-testable function — no JSX/CSS, unlike this component)
+ * can reuse the SAME thresholds `CourseMindMap`'s graph nodes are colored by, rather than a
+ * second copy that could drift. Re-exported here unchanged so every existing import of these from
+ * "./MasteryBadge.js" keeps working.
+ */
+export { masteryStatusFor, type MasteryStatus, MASTERED_THRESHOLD } from "../src/shared/mastery.js";
+import { masteryStatusFor, type MasteryStatus } from "../src/shared/mastery.js";
 
 const LABEL: Record<MasteryStatus, string> = {
   not_started: "Not started",
@@ -21,7 +20,7 @@ const COLOR: Record<MasteryStatus, string> = {
   mastered: "text-[var(--color-accent)] border-[var(--color-accent)]/40",
 };
 
-/** A simple state indicator — not started / in progress / mastered — deliberately NOT a mind map node (Phase 8). */
+/** A simple state indicator — not started / in progress / mastered. Also what the Phase 8 mind map's node colors are keyed by (src/mindMap/layout.ts), so the two views of the same course never disagree about what "mastered" means. */
 export function MasteryBadge({ knowledgeScore }: { knowledgeScore: number | null }) {
   const status = masteryStatusFor(knowledgeScore);
   return (

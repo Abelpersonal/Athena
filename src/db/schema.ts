@@ -293,3 +293,41 @@ export const lessonUpdates = sqliteTable("lesson_updates", {
   updatedGuidance: text("updated_guidance").notNull(),
   createdAt: text("created_at").notNull(),
 });
+
+/**
+ * Phase 8: the Mind Map Agent's output. The PRD's Section 7 table has no "Mind Map"/"Graph"
+ * entity even though §5.5 clearly requires persisting one — the same gap Phase 5 hit for `Path`.
+ * One JSON blob column, not normalized node/edge tables: the graph is small (one course's concept
+ * nodes), regenerated wholesale on a rebuild (never incrementally patched in v1's static-once
+ * model — PRD §5.5: "static per-course overview graph, generated once at course creation"), and
+ * node STATE (not started/in progress/mastered) is computed at READ time from `masteryState`
+ * (PRD step 5), never stored here — storing it redundantly would just be something to keep in
+ * sync for no reason. Same deliberate v1 simplification as Phase 6's "don't persist Suggestion
+ * records." `courseId` is unique — one static map per course.
+ */
+export interface MindMapNode {
+  /** A real lessons.id — every node maps 1:1 to a real lesson, validated at generation time (src/orchestrator/templates/generateMindMap.ts). A genuine SUBSET of the course's lessons, not necessarily all of them. */
+  id: string;
+  /** The model's own concise concept framing — may differ from the lesson's full title; the real title/mastery/freshness are always joined in at read time via `id`, never trusted from the LLM. */
+  conceptLabel: string;
+}
+export interface MindMapEdge {
+  /** Both must be real node ids present in the SAME graph's `nodes` array — validated together, not just against the broader lesson id set, so the frontend never has to handle a dangling edge. */
+  source: string;
+  target: string;
+  type: "prerequisite" | "cross_link";
+}
+export interface MindMapGraph {
+  nodes: MindMapNode[];
+  edges: MindMapEdge[];
+}
+
+export const mindMaps = sqliteTable("mind_maps", {
+  id: text("id").primaryKey(),
+  courseId: text("course_id")
+    .notNull()
+    .unique()
+    .references(() => courses.id),
+  graphJson: text("graph_json", { mode: "json" }).$type<MindMapGraph>().notNull(),
+  createdAt: text("created_at").notNull(),
+});
