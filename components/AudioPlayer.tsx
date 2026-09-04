@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { LessonAudioChunk, LessonAudioTrack } from "../src/teachingEngine/chunkLessonAudio.js";
+import { getOfflineAudioObjectUrl } from "../lib/offline/db.js";
 
 export type AudioPlayerMode = "browser" | "server";
 type Speed = 1 | 1.5 | 2;
@@ -53,8 +54,10 @@ export function AudioPlayer({
   const [chunkPos, setChunkPos] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [speed, setSpeed] = useState<Speed>(1);
+  const [resolvedSrc, setResolvedSrc] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const prefetchedRef = useRef<Set<string>>(new Set());
+  const objectUrlRef = useRef<string | null>(null);
 
   // If the deeper layers collapse again while one of their chunks is playing, fall back to the
   // last intuition chunk rather than pointing at a chunk that's no longer "available".
@@ -64,6 +67,42 @@ export function AudioPlayer({
   }, [availableChunks.length]);
 
   const currentChunk = availableChunks[chunkPos];
+
+  /**
+   * Phase 10, Deliverable 3: prefers a downloaded chunk's real IndexedDB Blob over the network
+   * URL, so a course downloaded for offline plays back genuinely offline — not just incidentally,
+   * via the service worker's own opportunistic response caching (which also happens, but isn't
+   * guaranteed to survive storage pressure the way an explicit IndexedDB download is meant to).
+   * Sets the network URL first (the safe, correct default online), then upgrades to the offline
+   * Blob URL if one exists — a harmless brief failed request if genuinely offline with no download.
+   */
+  useEffect(() => {
+    if (mode !== "server" || !currentChunk) {
+      setResolvedSrc(null);
+      return;
+    }
+    const networkUrl = chunkAudioUrl(lessonId, currentChunk);
+    setResolvedSrc(networkUrl);
+    let cancelled = false;
+    void getOfflineAudioObjectUrl(networkUrl)
+      .then((offlineUrl) => {
+        if (cancelled || !offlineUrl) return;
+        if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = offlineUrl;
+        setResolvedSrc(offlineUrl);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentChunk, mode, lessonId]);
+
+  useEffect(() => {
+    return () => {
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+    };
+  }, []);
 
   function play() {
     if (!currentChunk) return;
@@ -160,32 +199,33 @@ export function AudioPlayer({
 
   return (
     <div className="rounded-lg border border-[var(--color-border)] p-4 space-y-3">
-      {mode === "server" && (
+      {mode === "server" && resolvedSrc && (
         <audio
           ref={audioRef}
-          src={chunkAudioUrl(lessonId, currentChunk)}
+          src={resolvedSrc}
           onEnded={advance}
           onPlay={() => setIsPlaying(true)}
           onPause={() => setIsPlaying(false)}
         />
       )}
-      <div className="flex items-center gap-3 text-sm">
+      {/* min-h/min-w-11 (44px) on every control: a real touch-target size pass (Phase 10, Deliverable 1), not just desktop-sized buttons that happen to also be clickable on a phone. */}
+      <div className="flex items-center gap-3 text-sm flex-wrap">
         <button
           onClick={() => (isPlaying ? pause() : play())}
-          className="rounded-md border border-[var(--color-border)] px-3 py-1.5 hover:border-[var(--color-accent)]"
+          className="min-h-11 min-w-11 rounded-md border border-[var(--color-border)] px-3 py-1.5 hover:border-[var(--color-accent)]"
         >
           {isPlaying ? "Pause" : "Play"}
         </button>
         <button
           onClick={skipBack10}
-          className="rounded-md border border-[var(--color-border)] px-3 py-1.5 hover:border-[var(--color-accent)]"
+          className="min-h-11 min-w-11 rounded-md border border-[var(--color-border)] px-3 py-1.5 hover:border-[var(--color-accent)]"
         >
           -10s
         </button>
         <select
           value={speed}
           onChange={(e) => setSpeed(Number(e.target.value) as Speed)}
-          className="rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1.5"
+          className="min-h-11 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1.5"
         >
           <option value={1}>1x</option>
           <option value={1.5}>1.5x</option>

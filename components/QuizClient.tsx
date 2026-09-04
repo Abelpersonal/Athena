@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { getOfflineQuizQuestions, enqueueOutboxItem } from "../lib/offline/db.js";
+import { registerBackgroundSync } from "../lib/offline/sync.js";
 
 type QuizTier = "recall" | "application" | "transfer";
 interface MultipleChoiceQuestion {
@@ -37,6 +39,14 @@ const TIER_COLOR: Record<QuizTier, string> = {
   transfer: "text-[var(--color-danger)] border-[var(--color-danger)]/40",
 };
 
+/** Only what CAN be scored client-side without a network call — multiple_choice, the exact same rule scoreAndRecordQuiz uses server-side. A provisional, informational figure only; the REAL score (with masteryState/activityEvent/milestone side effects) always comes from the server, once the queued submission actually syncs. */
+function provisionalOfflineScore(questions: QuizQuestion[], answers: Record<string, string | number>): number {
+  const mcQuestions = questions.filter((q): q is MultipleChoiceQuestion => q.type === "multiple_choice");
+  if (mcQuestions.length === 0) return 0;
+  const correct = mcQuestions.filter((q) => answers[q.id] === q.correctOptionIndex).length;
+  return correct / mcQuestions.length;
+}
+
 /**
  * The Quiz screen: generateQuizQuestions() -> present -> capture answers -> scoreAndRecordQuiz()
  * -> score + updated mastery, the same flow the harness's `quiz` command runs end-to-end, now a
@@ -44,6 +54,13 @@ const TIER_COLOR: Record<QuizTier, string> = {
  * `tiers`/`questionsPerTier` (Phase 9): set by the Dashboard's "5-minute check-in" low-friction
  * re-entry offer to request a genuinely single-question, single-tier session — same generation
  * path, just parameterized differently.
+ *
+ * Phase 10, Deliverable 3/4: when the real network call fails (offline, or a downloaded-but-
+ * unreachable server), `start()` falls back to the pre-generated question set Deliverable 3's
+ * download wrote into IndexedDB, and `submit()` shows a REAL provisional (multiple-choice-only)
+ * score immediately while queuing the full real submission in the offline outbox — the real
+ * score, MasteryState update, ActivityEvent, and milestone checks all still happen for real, once
+ * the queued item actually reaches `/api/quiz/:id/score` on reconnect.
  */
 export function QuizClient({
   lessonId,
@@ -56,10 +73,11 @@ export function QuizClient({
   tiers?: QuizTier[];
   questionsPerTier?: number;
 }) {
-  const [phase, setPhase] = useState<"start" | "answering" | "scored">("start");
+  const [phase, setPhase] = useState<"start" | "answering" | "scored" | "pending">("start");
   const [questions, setQuestions] = useState<QuizQuestion[]>([]);
   const [answers, setAnswers] = useState<Record<string, string | number>>({});
   const [result, setResult] = useState<QuizResult | null>(null);
+  const [pendingScore, setPendingScore] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const isQuickCheckIn = Boolean(tiers && tiers.length === 1 && questionsPerTier === 1);
@@ -77,8 +95,22 @@ export function QuizClient({
       const data = (await res.json()) as { questions: QuizQuestion[] };
       setQuestions(data.questions);
       setPhase("answering");
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong.");
+    } catch {
+      // Real network failure — fall back to whatever was downloaded for offline (Deliverable 3).
+      const offline = await getOfflineQuizQuestions(lessonId).catch(() => undefined);
+      if (!offline || offline.questions.length === 0) {
+        setError("Couldn't reach the server, and no offline copy of this quiz is downloaded.");
+        setLoading(false);
+        return;
+      }
+      let offlineQuestions = tiers ? offline.questions.filter((q) => tiers.includes(q.tier)) : offline.questions;
+      if (questionsPerTier) {
+        const byTier = new Map<QuizTier, QuizQuestion[]>();
+        for (const q of offlineQuestions) byTier.set(q.tier, [...(byTier.get(q.tier) ?? []), q]);
+        offlineQuestions = [...byTier.values()].flatMap((qs) => qs.slice(0, questionsPerTier));
+      }
+      setQuestions(offlineQuestions);
+      setPhase("answering");
     } finally {
       setLoading(false);
     }
@@ -87,8 +119,8 @@ export function QuizClient({
   async function submit() {
     setLoading(true);
     setError(null);
+    const payloadAnswers = questions.map((q) => ({ questionId: q.id, answer: answers[q.id] ?? "" }));
     try {
-      const payloadAnswers = questions.map((q) => ({ questionId: q.id, answer: answers[q.id] ?? "" }));
       const res = await fetch(`/api/quiz/${lessonId}/score`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -97,8 +129,19 @@ export function QuizClient({
       if (!res.ok) throw new Error("Failed to score the quiz.");
       setResult((await res.json()) as QuizResult);
       setPhase("scored");
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong.");
+    } catch {
+      // Offline (or the request genuinely failed) — queue the real submission for later, show a
+      // real provisional score now so the learner isn't left with nothing.
+      await enqueueOutboxItem({
+        id: `ob_${crypto.randomUUID()}`,
+        type: "quiz_score",
+        url: `/api/quiz/${lessonId}/score`,
+        payload: { questions, answers: payloadAnswers },
+        createdAt: new Date().toISOString(),
+      });
+      void registerBackgroundSync();
+      setPendingScore(provisionalOfflineScore(questions, answers));
+      setPhase("pending");
     } finally {
       setLoading(false);
     }
@@ -112,7 +155,7 @@ export function QuizClient({
         <button
           onClick={start}
           disabled={loading}
-          className="rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
+          className="min-h-11 rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
         >
           {loading ? "Generating…" : isQuickCheckIn ? "Start 5-minute check-in" : "Start quiz"}
         </button>
@@ -135,12 +178,13 @@ export function QuizClient({
             {q.type === "multiple_choice" ? (
               <div className="space-y-1">
                 {q.options.map((opt, idx) => (
-                  <label key={idx} className="flex items-center gap-2 text-sm cursor-pointer">
+                  <label key={idx} className="flex items-center gap-2 text-sm cursor-pointer py-1">
                     <input
                       type="radio"
                       name={q.id}
                       checked={answers[q.id] === idx}
                       onChange={() => setAnswers((prev) => ({ ...prev, [q.id]: idx }))}
+                      className="w-5 h-5"
                     />
                     {opt}
                   </label>
@@ -160,11 +204,29 @@ export function QuizClient({
         <button
           onClick={submit}
           disabled={loading || !allAnswered}
-          className="rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
+          className="min-h-11 rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
         >
           {loading ? "Scoring…" : "Submit"}
         </button>
         {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
+      </div>
+    );
+  }
+
+  if (phase === "pending") {
+    return (
+      <div className="space-y-3">
+        <div className="rounded-lg border border-[var(--color-warn)]/40 p-4 space-y-1">
+          <p className="text-[var(--color-warn)] font-medium">Pending — will sync when back online</p>
+          <p className="text-sm text-[var(--color-text-muted)]">
+            You&apos;re offline, so this couldn&apos;t be scored for real yet. A quick estimate from the
+            multiple-choice questions: {((pendingScore ?? 0) * 100).toFixed(0)}%. The real score (and any
+            free-text grading) will be recorded automatically once you&apos;re back online.
+          </p>
+        </div>
+        <Link href={`/courses/${courseId}`} className="inline-block text-sm underline text-[var(--color-text-muted)]">
+          Back to course
+        </Link>
       </div>
     );
   }

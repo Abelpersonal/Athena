@@ -376,6 +376,32 @@ export const userProfile = sqliteTable("user_profile", {
   id: text("id").primaryKey(),
   statedGoals: text("stated_goals", { mode: "json" }).$type<string[]>().notNull(),
   lastGoalConnectionShownAt: text("last_goal_connection_shown_at"),
+  /**
+   * Phase 10, Deliverable 5: the engagement-nudge push's "at most one per inactivity episode"
+   * cadence gate — mirrors `lastGoalConnectionShownAt` exactly. Null until the first real
+   * engagement-nudge push is ever sent; see `isEngagementNudgeDue` (src/motivation/pure.ts) for
+   * how a fresh ActivityEvent after this timestamp is what makes the learner eligible again.
+   */
+  lastEngagementNudgeSentAt: text("last_engagement_nudge_sent_at"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
+});
+
+/**
+ * Phase 10: real Web Push subscriptions (Deliverable 5). A dedicated table, not a column on the
+ * `userProfile` singleton — per the kickoff's own resolved default, a single user can still
+ * reasonably have more than one subscribed device (a phone AND a laptop), so "one row per
+ * subscribed browser/device" is the right shape even in a single-user app. `endpoint` is the
+ * subscription's own unique push-service URL (the natural key the Push API already provides);
+ * `p256dh`/`auth` are the two keys `PushSubscription.toJSON().keys` returns, required for the
+ * server to encrypt a payload via the `web-push` package. A subscription that a push service
+ * reports as gone (410/404) is deleted outright, not soft-flagged — a stale endpoint is never
+ * retried, so there's nothing useful to preserve about it.
+ */
+export const pushSubscriptions = sqliteTable("push_subscriptions", {
+  id: text("id").primaryKey(),
+  endpoint: text("endpoint").notNull().unique(),
+  p256dh: text("p256dh").notNull(),
+  auth: text("auth").notNull(),
+  createdAt: text("created_at").notNull(),
 });

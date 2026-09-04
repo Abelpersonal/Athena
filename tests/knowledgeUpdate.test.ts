@@ -247,6 +247,88 @@ describe("checkTopicForUpdates — severity routing", () => {
     expect(lessonRow!.title).toBe("Lesson One");
   });
 
+  it("major delta (Phase 10): sends a real push notification via the injectable collaborator, grounded in the real topic/delta", async () => {
+    const db = await getDb(":memory:");
+    const { courseId, lessonId } = await seedCourseWithLessons(db, "crs_major_push");
+
+    const run: MockRun = async (taskType) => {
+      if (taskType === "generate_recheck_queries") return respond(taskType, { queries: ["q1"] });
+      if (taskType === "compare_findings_to_facts")
+        return respond(taskType, {
+          deltas: [
+            {
+              existingFactSummary: "The old core claim.",
+              newFindingSummary: "The claim has been reversed.",
+              severity: "major",
+              explanation: "A core claim was reversed.",
+              relatedLessonId: lessonId,
+            },
+          ],
+        });
+      if (taskType === "generate_update_lesson")
+        return respond(taskType, { title: "t", whatChanged: "c", updatedGuidance: "g" });
+      throw new Error(`unexpected task type ${taskType}`);
+    };
+
+    const pushCalls: Array<{ title: string; body: string; url: string }> = [];
+    await checkTopicForUpdates(topicRef(courseId), {
+      db,
+      orchestratorRun: run as never,
+      searchProvider,
+      fetchAndClean,
+      getTopicHistory: async () => EMPTY_HISTORY,
+      supersedeFact: async () => {},
+      sendPushToAllSubscriptions: async (payload) => {
+        pushCalls.push(payload);
+        return { sent: 1, removedStale: 0 };
+      },
+    });
+
+    expect(pushCalls).toHaveLength(1);
+    expect(pushCalls[0]!.title).toContain(`Topic ${courseId}`);
+    expect(pushCalls[0]!.body).toBe("A core claim was reversed.");
+  });
+
+  it("a failed push send doesn't fail the whole knowledge-update run for that topic", async () => {
+    const db = await getDb(":memory:");
+    const { courseId, lessonId } = await seedCourseWithLessons(db, "crs_major_push_fail");
+
+    const run: MockRun = async (taskType) => {
+      if (taskType === "generate_recheck_queries") return respond(taskType, { queries: ["q1"] });
+      if (taskType === "compare_findings_to_facts")
+        return respond(taskType, {
+          deltas: [
+            {
+              existingFactSummary: "old",
+              newFindingSummary: "new",
+              severity: "major",
+              explanation: "A core claim was reversed.",
+              relatedLessonId: lessonId,
+            },
+          ],
+        });
+      if (taskType === "generate_update_lesson")
+        return respond(taskType, { title: "t", whatChanged: "c", updatedGuidance: "g" });
+      throw new Error(`unexpected task type ${taskType}`);
+    };
+
+    const result = await checkTopicForUpdates(topicRef(courseId), {
+      db,
+      orchestratorRun: run as never,
+      searchProvider,
+      fetchAndClean,
+      getTopicHistory: async () => EMPTY_HISTORY,
+      supersedeFact: async () => {},
+      sendPushToAllSubscriptions: async () => {
+        throw new Error("Simulated push service outage");
+      },
+    });
+
+    // The real work (event + update lesson) still completed despite the push failing.
+    expect(result.events[0]!.severity).toBe("major");
+    expect(result.lessonUpdatesCreated).toHaveLength(1);
+  });
+
   it("a 'none' severity delta is not persisted as an UpdateEvent at all", async () => {
     const db = await getDb(":memory:");
     const { courseId, lessonId } = await seedCourseWithLessons(db, "crs_none");

@@ -9,6 +9,7 @@
     "inspect": "tsx src/harness/inspect.ts",
     "inspect-graph": "tsx src/harness/inspectGraph.ts",
     "knowledge-update": "tsx src/knowledgeUpdate/cli.ts",
+    "engagement-check": "tsx src/engagementCheck/cli.ts",
     "db:generate": "drizzle-kit generate",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -33,6 +34,7 @@
     "next": "^16.3.4",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "web-push": "^3.6.7",
     "zod": "^4.4.3"
   },
   "devDependencies": {
@@ -41,6 +43,7 @@
     "@types/node": "^26.2.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
+    "@types/web-push": "^3.6.4",
     "drizzle-kit": "^0.31.10",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.23.12",

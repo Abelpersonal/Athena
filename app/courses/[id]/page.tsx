@@ -4,6 +4,7 @@ import { getCourseDetail, getCourseMindMap } from "../../../src/db/queries.js";
 import { MasteryBadge } from "../../../components/MasteryBadge.js";
 import { SourceCitations } from "../../../components/SourceCitations.js";
 import { CourseMindMap } from "../../../components/CourseMindMap.js";
+import { DownloadCourseButton } from "../../../components/DownloadCourseButton.js";
 
 /**
  * The Course view — module/lesson list in persisted prerequisite order (modules.order), each
@@ -21,12 +22,13 @@ export default async function CourseViewPage({ params }: { params: Promise<{ id:
 
   return (
     <div className="space-y-8">
-      <div>
+      <div className="space-y-2">
         <h1 className="text-xl font-medium">{course.topic}</h1>
         <p className="text-sm text-[var(--color-text-muted)]">
           {course.status === "complete" ? "Content ready" : "Still building"} · volatility: {course.volatilityTier}
           {course.completedAt && " · completed"}
         </p>
+        <DownloadCourseButton courseId={course.id} />
       </div>
 
       {mindMapData.graph && (

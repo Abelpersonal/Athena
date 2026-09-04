@@ -43,6 +43,13 @@
       "when": 1788515610390,
       "tag": "0005_eminent_captain_midlands",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1788517953607,
+      "tag": "0006_slippery_caretaker",
+      "breakpoints": true
     }
   ]
 }

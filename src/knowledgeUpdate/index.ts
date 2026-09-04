@@ -19,12 +19,14 @@ import {
 } from "../memoryGraph/index.js";
 import type { GraphitiFactResult } from "../memoryGraph/index.js";
 import { getRecheckIntervalDays, type VolatilityTier } from "../shared/recheckInterval.js";
+import { buildKnowledgeUpdatePushPayload, sendPushToAllSubscriptions as sendPushToAllSubscriptionsDefault } from "../push/index.js";
 
 export type OrchestratorRunFn = typeof orchestratorRun;
 export type ProgressListener = (message: string) => void;
 export type FetchAndCleanFn = (url: string) => Promise<CleanedContent>;
 export type GetTopicHistoryFn = typeof getTopicHistoryDefault;
 export type SupersedeFactFn = typeof supersedeFactDefault;
+export type SendPushToAllSubscriptionsFn = typeof sendPushToAllSubscriptionsDefault;
 
 const MAX_FINDINGS = 5;
 
@@ -83,6 +85,8 @@ export interface CheckTopicForUpdatesOptions {
   fetchAndClean?: FetchAndCleanFn;
   getTopicHistory?: GetTopicHistoryFn;
   supersedeFact?: SupersedeFactFn;
+  /** Injectable for tests. Default: the real Web Push send (src/push/index.ts, Phase 10). */
+  sendPushToAllSubscriptions?: SendPushToAllSubscriptionsFn;
   onProgress?: ProgressListener;
 }
 
@@ -134,6 +138,7 @@ export async function checkTopicForUpdates(
   const fetchAndClean = options.fetchAndClean ?? fetchAndCleanDefault;
   const getTopicHistory = options.getTopicHistory ?? getTopicHistoryDefault;
   const supersede = options.supersedeFact ?? supersedeFactDefault;
+  const sendPush = options.sendPushToAllSubscriptions ?? sendPushToAllSubscriptionsDefault;
   const onProgress = options.onProgress;
 
   const courseModules = await db.select().from(modules).where(eq(modules.courseId, topic.id));
@@ -222,6 +227,12 @@ export async function checkTopicForUpdates(
     }
 
     onProgress?.(`  [MAJOR] ${topic.topic}: ${delta.explanation}`);
+    try {
+      const pushResult = await sendPush(buildKnowledgeUpdatePushPayload({ topicName: topic.topic, deltaSummary: delta.explanation }), { db });
+      onProgress?.(`  Push notification sent to ${pushResult.sent} device(s)${pushResult.removedStale > 0 ? ` (${pushResult.removedStale} stale subscription(s) removed)` : ""}.`);
+    } catch (error) {
+      onProgress?.(`  Push notification failed (not fatal to this run): ${(error as Error).message}`);
+    }
     const relatedLesson = courseLessons.find((l) => l.id === delta.relatedLessonId)!;
     const updateLessonResult = await run<GenerateUpdateLessonOutput>(
       "generate_update_lesson",
@@ -260,6 +271,7 @@ export interface RunKnowledgeUpdateAgentOptions {
   fetchAndClean?: FetchAndCleanFn;
   getTopicHistory?: GetTopicHistoryFn;
   supersedeFact?: SupersedeFactFn;
+  sendPushToAllSubscriptions?: SendPushToAllSubscriptionsFn;
   now?: Date;
   onProgress?: ProgressListener;
 }
@@ -298,6 +310,7 @@ export async function runKnowledgeUpdateAgent(
       fetchAndClean: options.fetchAndClean,
       getTopicHistory: options.getTopicHistory,
       supersedeFact: options.supersedeFact,
+      sendPushToAllSubscriptions: options.sendPushToAllSubscriptions,
       onProgress,
     });
     for (const event of result.events) eventsBySeverity[event.severity] += 1;

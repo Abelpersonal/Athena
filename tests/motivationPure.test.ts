@@ -4,6 +4,7 @@ import {
   selectWeakestConceptLesson,
   isPathInactive,
   shouldShowGoalConnection,
+  isEngagementNudgeDue,
   type ReentryCandidateLesson,
 } from "../src/motivation/pure.js";
 
@@ -124,5 +125,36 @@ describe("shouldShowGoalConnection", () => {
 
   it("is true again once the cadence window has elapsed", () => {
     expect(shouldShowGoalConnection(new Date(NOW.getTime() - 21 * 3_600_000).toISOString(), NOW, 20)).toBe(true);
+  });
+});
+
+describe("isEngagementNudgeDue (Phase 10 push cadence)", () => {
+  // Whether a path is CURRENTLY inactive is decided upstream (isPathInactive /
+  // findInactivePathForNudge) before this is ever called — this function only answers "has a
+  // nudge already been sent for this same stretch," given the flagged path's OWN most recent
+  // ActivityEvent (never a global one — see the function's doc comment for why).
+
+  it("is true the first time (no nudge has ever been sent)", () => {
+    expect(isEngagementNudgeDue(daysAgo(10), null)).toBe(true);
+  });
+
+  it("is true even when the flagged path has literally never had any activity, if no nudge was ever sent", () => {
+    expect(isEngagementNudgeDue(null, null)).toBe(true);
+  });
+
+  it("stays false on a repeated scheduled-check run for the SAME inactivity stretch (a nudge already sent, no fresher activity on this path since)", () => {
+    const lastPathActivity = daysAgo(10);
+    const nudgeSentAfterThatActivity = daysAgo(9); // sent shortly after the inactivity was first detected
+    expect(isEngagementNudgeDue(lastPathActivity, nudgeSentAfterThatActivity)).toBe(false);
+  });
+
+  it("becomes true again once fresh activity on THIS PATH happens after the last nudge (a genuinely new episode)", () => {
+    const nudgeSentAt = daysAgo(15);
+    const freshPathActivityAfterThatNudge = daysAgo(10); // the learner came back to this path...
+    expect(isEngagementNudgeDue(freshPathActivityAfterThatNudge, nudgeSentAt)).toBe(true);
+  });
+
+  it("stays false when a nudge was sent but the path has never had any activity to reference as 'fresh'", () => {
+    expect(isEngagementNudgeDue(null, daysAgo(15))).toBe(false);
   });
 });

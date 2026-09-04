@@ -118,3 +118,24 @@ export function shouldShowGoalConnection(
   const hoursSince = (now.getTime() - new Date(lastShownAt).getTime()) / 3_600_000;
   return hoursSince >= minHours;
 }
+
+/**
+ * Phase 10, Deliverable 5: the real engagement-nudge push's "at most one" cadence gate — §5.12b's
+ * own bar: "at most one low-pressure re-engagement message after inactivity." This is deliberately
+ * NOT a second inactivity check — whether a path is currently quiet is already decided by
+ * `isPathInactive` (findInactivePathForNudge, src/engagementCheck/index.ts) before this function
+ * is ever called. This function answers a narrower question: has a nudge already been sent for
+ * THIS SAME inactivity stretch? `mostRecentPathEventTimestamp` is the flagged path's OWN most
+ * recent `ActivityEvent` (not a global/app-wide one — using the global signal would mean an
+ * unrelated active path's recent activity could wrongly suppress a real nudge about a different,
+ * genuinely quiet one). Due when: no nudge has ever been sent (`lastNudgeSentAt` null), OR the
+ * flagged path has seen genuinely fresh activity AFTER the last nudge (the learner came back, then
+ * went quiet again — a new, distinct episode). Not due when the path's own last activity is at or
+ * before the last nudge — the same continuous stretch a nudge already covered, which is exactly
+ * what keeps a repeated scheduled-check run from ever sending a second nudge for it.
+ */
+export function isEngagementNudgeDue(mostRecentPathEventTimestamp: string | null, lastNudgeSentAt: string | null): boolean {
+  if (!lastNudgeSentAt) return true;
+  if (!mostRecentPathEventTimestamp) return false;
+  return mostRecentPathEventTimestamp > lastNudgeSentAt;
+}

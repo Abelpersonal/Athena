@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 import type { AudioPlayerMode } from "./AudioPlayer.js";
+import { enqueueOutboxItem } from "../lib/offline/db.js";
+import { registerBackgroundSync } from "../lib/offline/sync.js";
 
 interface AnswerResult {
   answer: string;
@@ -22,6 +24,7 @@ export function LessonQA({ lessonId, ttsMode }: { lessonId: string; ttsMode: Aud
   const [question, setQuestion] = useState("");
   const [asking, setAsking] = useState(false);
   const [answer, setAnswer] = useState<AnswerResult | null>(null);
+  const [queued, setQueued] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [voiceContinuous, setVoiceContinuous] = useState(false);
   const [speaking, setSpeaking] = useState(false);
@@ -64,11 +67,13 @@ export function LessonQA({ lessonId, ttsMode }: { lessonId: string; ttsMode: Aud
     setAsking(true);
     setError(null);
     setAnswer(null);
+    setQueued(null);
+    const askedQuestion = question;
     try {
       const res = await fetch(`/api/lessons/${lessonId}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question: askedQuestion }),
       });
       if (!res.ok) {
         const body = (await res.json()) as { message?: string };
@@ -78,7 +83,23 @@ export function LessonQA({ lessonId, ttsMode }: { lessonId: string; ttsMode: Aud
       setAnswer(result);
       if (voiceContinuous) void speak(result.answer);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong.");
+      // A genuine network failure (offline, or a downloaded-but-unreachable server) — a NEW
+      // question needs a real LLM call, which can't run offline (PRD §6.4's own hard boundary),
+      // so it's queued instead of shown as an error (Phase 10, Deliverable 4).
+      if (e instanceof TypeError) {
+        await enqueueOutboxItem({
+          id: `ob_${crypto.randomUUID()}`,
+          type: "ask_question",
+          url: `/api/lessons/${lessonId}/ask`,
+          payload: { question: askedQuestion },
+          createdAt: new Date().toISOString(),
+        });
+        void registerBackgroundSync();
+        setQueued(askedQuestion);
+        setQuestion("");
+      } else {
+        setError(e instanceof Error ? e.message : "Something went wrong.");
+      }
     } finally {
       setAsking(false);
     }
@@ -114,6 +135,12 @@ export function LessonQA({ lessonId, ttsMode }: { lessonId: string; ttsMode: Aud
         </button>
       </form>
       {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
+      {queued && (
+        <div className="rounded-lg border border-[var(--color-warn)]/40 p-3 text-sm">
+          <p className="text-[var(--color-warn)] font-medium">Queued — will answer when back online</p>
+          <p className="text-[var(--color-text-muted)] mt-1">&quot;{queued}&quot;</p>
+        </div>
+      )}
       {answer && (
         <div className="rounded-lg border border-[var(--color-border)] p-3 text-sm">
           <p>{answer.answer}</p>

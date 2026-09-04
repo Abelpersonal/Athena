@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { loadPathRoadmap, isTopicGeneratable } from "../../../src/pathPlanner/index.js";
 import { getPathMeta } from "../../../src/db/queries.js";
 import { GenerateTopicButton } from "../../../components/GenerateTopicButton.js";
+import { DownloadPathButton } from "../../../components/DownloadPathButton.js";
 
 const STATUS_LABEL: Record<string, string> = {
   pending: "Not started",
@@ -29,12 +30,14 @@ export default async function PathViewPage({ params }: { params: Promise<{ id: s
   if (!path) notFound();
 
   const domains = [...new Set(roadmap.map((t) => t.domainName))];
+  const downloadableCourseIds = [...new Set(roadmap.map((t) => t.courseId).filter((id): id is string => id !== null))];
 
   return (
     <div className="space-y-8">
-      <div>
+      <div className="space-y-2">
         <h1 className="text-xl font-medium">{path.goalDescription}</h1>
         <p className="text-sm text-[var(--color-text-muted)]">{path.status}</p>
+        <DownloadPathButton courseIds={downloadableCourseIds} />
       </div>
 
       {domains.map((domainName) => {

@@ -2661,6 +2661,235 @@ actual HTTP routes (not the underlying functions directly):
   need "was there real activity on this day/course," not a precise view count, so an occasional
   prefetch-triggered row doesn't change any real decision this phase makes.
 
+## Phase 10: Mobile — PWA, offline mode, background sync, and real push
+
+The last item on the PRD's core roadmap before Phase 11's polish pass: installability, one-handed
+phone usability, offline access to already-downloaded content, background sync of what gets queued
+while offline, and turning Phase 9's own "no real push notifications" scope note into a real one —
+plus the Knowledge Update Agent's own long-deferred "push notifications are a later upgrade"
+(§5.10). No new content or agent logic anywhere — every module from Phases 1-9 is untouched; this
+phase is entirely about *delivery*.
+
+### Service worker tooling: hand-rolled, not next-pwa/Workbox
+
+This project already pins a deliberately customized webpack config (`next.config.ts`'s
+`resolve.extensionAlias` fix, documented since Phase 7, for NodeNext `.js`-extension imports).
+`next-pwa`'s own webpack plugin has a real history of fighting custom webpack configs and lagging
+Next.js major-version support — not a risk worth taking for a personal, single-deployment app.
+`public/sw.js` is a hand-rolled CLASSIC script (not `{type: "module"}`) — module service workers
+aren't supported everywhere (notably older Safari), and classic scripts are also what Background
+Sync/Push need broad support for anyway. Zero new dependencies. It handles four real concerns:
+generic network-first-with-cache-fallback for same-origin GETs (what makes previously-cached pages
+readable offline), a `message` handler for explicit pre-caching/clearing of a course's real page
+and audio URLs (Deliverable 3's download/remove actions), a `push`/`notificationclick` pair
+(Deliverable 5), and a `sync` handler (Deliverable 4). It duplicates a small slice of
+`lib/offline/db.ts`'s IndexedDB shape by necessity — a classic-script SW can't `import` the page's
+ES module, so its own outbox-processing code re-opens the same database directly.
+
+### Where offline code lives and why (a real TypeScript-config constraint, not a style choice)
+
+`tsconfig.backend.json` (covering `src/` and `tests/`) has `lib: ["ES2022"]` — **no DOM types at
+all**. Any file under `src/` that referenced `indexedDB`, `Blob`, `PushSubscription`, or similar
+would fail backend typecheck. So every genuinely browser-only piece — the real IndexedDB wrapper,
+the download/sync glue, every new component — lives under `lib/offline/` or `components/`
+(both covered by `tsconfig.json`, which DOES include `dom`), never under `src/`. The one exception
+is `src/offline/outbox.ts` — deliberately kept in `src/` because it's genuinely pure (no DOM refs
+at all) and needs to be reachable from `tests/` the same way every other pure module in this
+codebase is (see the Phase 5/8/9 precedent: hard logic is a pure function, browser/DB/LLM parts are
+thin wrappers around it — `lib/offline/sync.ts`'s `attemptSync()` is that thin wrapper here).
+
+### Responsive pass (Deliverable 1)
+
+Audited every Phase 7-9 screen at a phone-width viewport and fixed what was actually broken, not a
+redesign: `CourseMindMap` now collapses to a drawer below Tailwind's `sm` (640px) breakpoint — a
+`matchMedia` check (not a CSS-only trick, since the drawer's open/closed state also gates whether
+React Flow even mounts) behind a "View concept map" toggle, per §6.3's explicit requirement.
+`AudioPlayer`'s Play/Pause/-10s/speed controls all gained a real `min-h-11 min-w-11` (44px) touch
+target — the size iOS/Android's own accessibility guidelines treat as the real minimum, not just
+"technically clickable." The header nav also picked up a `flex-wrap` + tighter mobile padding pass
+opportunistically while touching `app/layout.tsx` for the service worker registration anyway.
+
+### A real bug this phase's own `next build` check surfaced (not introduced by this phase)
+
+`npm run dev` never statically prerenders, so nobody had run a real `next build` and inspected its
+route table since the Dashboard started reading real DB state in Phase 7. It turns out `app/page.tsx`
+and `app/onboarding/page.tsx` were BOTH being silently prerendered as static HTML at build time —
+`node:sqlite` reads are invisible to Next's static/dynamic heuristics (unlike `cookies()`/
+`headers()`/an uncached `fetch`), so Next had no signal these pages needed per-request rendering.
+In a real production build, this would have frozen the Phase 9 onboarding-redirect and every real
+Dashboard figure to whatever the database looked like at BUILD time, not per real request — a
+genuine, previously-invisible correctness bug, not something introduced by this phase. Fixed with
+`export const dynamic = "force-dynamic"` on both files; confirmed via two full `next build` runs
+(the route table showed `○ /` / `○ /onboarding` before the fix, `ƒ /` / `ƒ /onboarding` after).
+
+### Background audio playback (Deliverable 2) — verification, not a rewrite
+
+Phase 7.5's Media Session wiring (`AudioPlayer.tsx`) already covered a backgrounded BROWSER TAB;
+its own README flagged "app fully closed" as needing PWA infra it didn't have yet. That infra is
+exactly `app/manifest.ts`'s `display: "standalone"` plus a registered service worker — once
+installed, the page runs as a persistent top-level browsing context rather than a backgroundable
+tab, which is the actual mechanism the gap was about. No changes to the Media Session hooks
+themselves were needed or made (per the kickoff's own instruction not to rework a verified phase's
+player beyond what's needed) — the ONE real addition is `AudioPlayer` now resolving a downloaded
+chunk's audio from its real IndexedDB Blob first, network second (see Deliverable 3), so playback
+genuinely doesn't depend on the service worker's own opportunistic response cache surviving
+storage pressure. **Not verified live on a real installed PWA on a real device** — no such device
+is available in this environment; this is the one Deliverable 2 DoD item left honestly unverified,
+same category of gap as Phase 7.5's own original one.
+
+### Offline download + IndexedDB (Deliverable 3)
+
+`GET /api/courses/:id/download` bundles a course's real modules/lessons/layers, a fresh
+`generateQuizQuestions()` call per lesson across all three tiers (a real LLM cost, the SAME one a
+learner would incur taking that quiz normally — there's no persisted question-bank table to read
+from instead; caching happens client-side, in IndexedDB, not as a new server table), the real
+persisted mind map graph (Phase 8), and a list of ALREADY-cached audio chunk URLs from Phase 7.5's
+`lessons.audioCacheRef` — **never** a chunk that would need synthesizing (a course whose lessons
+have no server audio cache yet, or one running `TTS_PROVIDER=browser`, simply downloads with fewer
+or zero audio chunks; no new TTS call is ever triggered by a download). `lib/offline/db.ts`
+mirrors the relevant slice of `src/db/schema.ts`'s real tables (`courses`/`modules`/`lessons`/
+`quizQuestions`/`mindMaps`/`audio`) rather than a redesigned shape, plus `outbox` (Deliverable 4)
+and `downloads` (a per-course summary: real size, real lesson ids, and every URL — page AND audio —
+the service worker cached for it, so removal can clear exactly those Cache API entries too, not
+just IndexedDB's own share of the space). `downloadCourse()` (`lib/offline/download.ts`) is the one
+real download action, reused unchanged by both `DownloadCourseButton` (Course view) and
+`DownloadPathButton` (Path view, looping it once per course in the path — not a second mechanism).
+
+Offline reads: a downloaded lesson/quiz/mind-map's PAGE is served by the service worker's cached
+response (pre-fetched via a `CACHE_URLS` message at download time, covering `/courses/:id`,
+`/lessons/:id`, and `/quiz/:id` for every lesson) — the same generic network-first-with-fallback
+strategy that makes any previously-visited page work offline, just triggered explicitly and in
+advance rather than incidentally. Audio plays from the real downloaded Blob (see Deliverable 2
+above). Quiz-taking offline reads its pre-generated question set from IndexedDB (`QuizClient`'s
+`start()` falls back to `getOfflineQuizQuestions()` on a real network failure) — see Deliverable 4
+for how scoring works without a connection.
+
+**Storage management** (`/downloads`, `DownloadsManager.tsx`): real IndexedDB reads, real per-course
+size (audio Blob bytes + the structured JSON's own serialized size — a real, if not byte-exact,
+figure), and a real "Remove" action that clears every store's rows for that course AND messages the
+service worker to clear its own cached page/audio entries for it (`CLEAR_URLS`) — both halves of
+the space a download actually used.
+
+### Background sync for queued offline actions (Deliverable 4)
+
+Per §6.4's own hard boundary, exactly two things get queued: a mid-lesson question
+(`LessonQA.ask()`) and a quiz submission (`QuizClient.submit()`) — both need a real `[LLM]` call
+(a brand-new question's answer; a free-text answer's semantic score) that genuinely can't run
+offline. The pure resolve-on-reconnect core, `resolvePendingItems` (`src/offline/outbox.ts`), takes
+a plain item list and a `post` function and is directly unit tested with a mocked network (no real
+browser/IndexedDB needed) — `lib/offline/sync.ts`'s `attemptSync()` is the thin real wrapper around
+it (real IndexedDB reads, real `fetch`). Critically, a queued item resolves against the SAME real
+route (`/api/lessons/:id/ask`, `/api/quiz/:id/score`) an online action already uses — Phase 9's
+`recordActivityEvent`, milestone checks, and MasteryState updates all fire for real once it
+actually sends, never a parallel sync-only path that could drift from the online one.
+
+- **Quiz submitted offline**: multiple-choice questions get a REAL provisional score immediately
+  (client-side, the exact same `selected === correctOptionIndex` rule `scoreAndRecordQuiz` uses
+  server-side) so the learner isn't left with nothing; free-text questions can't be scored without
+  the server's semantic grader, so the whole session shows "Pending — will sync when back online"
+  rather than a fabricated number. The full real payload is queued regardless of question mix.
+- **A question asked offline**: shown as "Queued — will answer when back online," never silently
+  dropped or shown as a generic error.
+- **Background Sync API**, registered right after queuing (`registerBackgroundSync()`) — real
+  support was confirmed absent in one major real-world browser this project has to account for:
+  Safari/iOS has no Background Sync API at all (a well-documented, permanent WebKit gap, not a
+  version-lag issue). The documented fallback: the page's own `online` event listener
+  (`ServiceWorkerRegister.tsx`) calls the exact same `attemptSync()` the service worker's `sync`
+  handler uses — covers every browser, at the cost of only syncing while a tab is actually open.
+
+### Real push notifications (Deliverable 5) — exactly the two named use cases, nothing else
+
+`pushSubscriptions` (a dedicated table, not a `userProfile` column, per the kickoff's own resolved
+default — a single user can still reasonably have more than one subscribed device) plus
+`userProfile.lastEngagementNudgeSentAt` (the second cadence gate, alongside Phase 9's
+`lastGoalConnectionShownAt`). `src/push/index.ts` wraps the `web-push` npm package (the standard
+VAPID-based choice — no reason to hand-roll the protocol) behind `sendPushToAllSubscriptions()`,
+injectable exactly like every other external-service call in this codebase (`orchestratorRun`,
+`writeMasteryUpdate`); a subscription the push service reports gone (410/404) is deleted outright,
+any other per-subscription failure is logged and skipped — one dead subscription never blocks
+delivery to the rest.
+
+- **Knowledge Update major-severity delta** (§5.10's own "push notifications are a later upgrade" —
+  this is it): `checkTopicForUpdates` (`src/knowledgeUpdate/index.ts`) sends a real push right where
+  it already writes the major `UpdateEvent`/generates the delta lesson — wrapped in try/catch so a
+  push failure never fails the topic's real work, confirmed live (a dry run with real VAPID
+  env vars unset produced exactly the expected non-fatal "Push notification failed" log line, the
+  rest of the run completing normally).
+- **The engagement nudge, now real** (`src/engagementCheck/`, `npm run engagement-check`) — its own
+  scheduled-job script, mirroring `knowledge-update`'s exact "cron entry, not a persistent daemon"
+  shape (§6.4's "no heavy job-queue infra" guidance), deliberately separate since the trigger
+  condition is unrelated to topic staleness. Reuses Phase 9's OWN `isPathInactive` verbatim, scoped
+  per active Path (`findInactivePathForNudge`) — not a second inactivity detector, and this specific
+  script skips the diversity-signal LLM call the Dashboard's sibling boredom-proofing read makes,
+  so it never calls the LLM at all. The "at most one" cadence (`isEngagementNudgeDue`,
+  `src/motivation/pure.ts`) compares the FLAGGED PATH's OWN most recent `ActivityEvent` against
+  `lastEngagementNudgeSentAt` — deliberately not a global/app-wide timestamp, which would let any
+  OTHER active path's recent activity wrongly suppress a real nudge about a genuinely quiet one (a
+  real design bug caught and fixed during this phase's own test-writing, before it shipped).
+
+**Definition of done — Phase 10**
+
+- Real, end-to-end confirmed via a real dry-run-seeded course through a real dev server (manifest,
+  service worker, and every new route hit through real HTTP, not called directly): `GET /` redirects
+  to onboarding pre-profile exactly like Phase 9 (now genuinely per-request, post-fix); `/manifest.
+  webmanifest` serves real, correct JSON; `/sw.js` serves real content with the right
+  `Content-Type`; `/downloads` renders; `GET /api/push/vapid-public-key` correctly 503s with VAPID
+  unset and would 200 with real keys (see below).
+- **A real, non-mocked `npm run engagement-check` run against a constructed real inactive-Path
+  scenario** (a real `Path`/`PathDomain`/`PathTopic` linked to a quiet course, real recent
+  `ActivityEvent`s elsewhere) fired a real, tone-correct nudge on the first run and correctly
+  no-opped (`reason: cadence_not_due`) on an immediate second run against the same stretch —
+  the "at most one... even across multiple scheduled-check runs" DoD bar, demonstrated live, not
+  just asserted by the unit tests.
+- **Real VAPID keys** were generated (`npx web-push generate-vapid-keys`) and configured; a real
+  `sendPushToAllSubscriptions()` call with zero subscriptions returned `{sent: 0, removedStale: 0}`
+  cleanly, and with one subscription (necessarily a fabricated one — no real subscribed browser is
+  available in this environment) the REAL `web-push` library's own real cryptographic validation
+  correctly rejected the malformed key and the failure was caught and logged, not thrown — real
+  VAPID signing and the real send path are confirmed working; delivery to an actual device is not.
+- **The download bundle's assembly logic was verified with a mocked Orchestrator** (real DB, real
+  `generateQuizQuestions`/`getCourseMindMap`, a mocked LLM call) after the real Gemini free-tier
+  daily quota (20 requests/day) was exhausted by this session's own testing — confirmed real
+  module/lesson enumeration, 3-tier question generation per lesson, real mind map retrieval, and
+  correct page-URL construction. **The download route's actual real, non-mocked LLM call was not
+  exercised live in this session** — a genuine real-run-blocker (quota, not code), same category as
+  every prior phase's own quota-exhaustion note; the route's logic is otherwise the same
+  `generateQuizQuestions`/`getCourseMindMap` calls already covered elsewhere in this codebase's real
+  verification history.
+- A real production `next build` was run twice (once surfacing the static-rendering bug above, once
+  confirming the fix) — every new route compiles and appears in the route table with the expected
+  static/dynamic classification.
+- **Not verified live, honestly**: real PWA installability ("Add to Home Screen") on a real mobile
+  browser, real offline airplane-mode behavior end-to-end, real background-audio-while-backgrounded
+  on an installed PWA, a real queued item actually resolving via a real Background Sync event, and
+  real push delivery to a real subscribed device — none of these are reachable without a real
+  mobile browser/device, which this environment doesn't have. Every one of them rests on code paths
+  that ARE independently verified here: the manifest/service-worker/routes are real and serve
+  correctly, the outbox's resolve logic is unit tested, the cadence logic is both unit tested and
+  live-confirmed against constructed data, and real VAPID signing is confirmed working.
+- `npm test` — 323 tests total (295 through Phase 9 + 28 new): `tests/offlineOutbox.test.ts` (5,
+  pure resolve-on-reconnect logic), `tests/push.test.ts` (11, payload construction + subscription
+  CRUD + send/stale-cleanup, all DB-real/network-mocked), `tests/engagementCheck.test.ts` (7,
+  including the "at most one" cadence across repeated runs and a fresh-activity-resets-eligibility
+  case), plus additions to `tests/motivationPure.test.ts` (`isEngagementNudgeDue`) and
+  `tests/knowledgeUpdate.test.ts` (the real major-severity push trigger and its failure isolation)
+  — all pass. `npm run typecheck` clean across both configs.
+
+### Documented gaps
+
+- **No real mobile device/browser anywhere in this environment** — the single biggest gap this
+  phase has, honestly: installability, offline-mode-via-airplane-mode, backgrounded-PWA audio,
+  real Background Sync delivery, and real push delivery to a device all need one, and none is
+  available. Every one of these rests on independently-verified pieces (see the DoD section above)
+  but the actual end-to-end, on-device experience is unverified. Worth a real device pass before
+  this ships to actual daily use.
+- **The real Gemini free-tier daily quota (20 req/day) was exhausted by this session's own testing**
+  before the download route's real (non-mocked) LLM call could be exercised live — see the DoD
+  section. Worth a real run once quota resets.
+- **Safari/iOS has no Background Sync API** — a permanent platform gap, not a version-lag issue.
+  The `online`-event fallback (`ServiceWorkerRegister.tsx`) covers it, at the cost of only syncing
+  while a tab is actually open on that platform, rather than in the background.
+
 ## LLM provider swap (added mid-Phase-2, not in the original kickoff prompt)
 
 Partway through Phase 2, the decision was made to make the Orchestrator's LLM vendor swappable

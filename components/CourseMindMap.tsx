@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ReactFlow, Background, Controls, type Node, type Edge, type NodeProps } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
@@ -44,6 +44,12 @@ const nodeTypes = { concept: ConceptNode };
  * (tests/mindMapLayout.test.ts) — this component just renders that output through React Flow.
  *
  * Modules start COLLAPSED (PRD §5.5's "expandable/collapsible," this phase's chosen default).
+ *
+ * Phase 10, Deliverable 1: below a 640px viewport (Tailwind's `sm` breakpoint), the whole panel
+ * collapses to a drawer behind a "View concept map" toggle — PRD §6.3's explicit requirement —
+ * rather than always rendering an inline React Flow canvas that would otherwise dominate a phone
+ * screen. `matchMedia` (not a CSS-only trick) since the drawer's OPEN/CLOSED state also needs to
+ * gate whether React Flow even mounts — no advantage to rendering a hidden canvas underneath.
  */
 export function CourseMindMap({
   graph,
@@ -56,6 +62,16 @@ export function CourseMindMap({
 }) {
   const router = useRouter();
   const [expandedModuleIds, setExpandedModuleIds] = useState<Set<string>>(new Set());
+  const [isNarrowViewport, setIsNarrowViewport] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 639px)");
+    setIsNarrowViewport(mq.matches);
+    const handler = (e: MediaQueryListEvent) => setIsNarrowViewport(e.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
 
   const sortedModules = useMemo(() => [...modules].sort((a, b) => a.order - b.order), [modules]);
   const counts = useMemo(() => nodeCountByModule(graph, modules), [graph, modules]);
@@ -87,8 +103,27 @@ export function CourseMindMap({
     });
   }
 
+  if (isNarrowViewport && !drawerOpen) {
+    return (
+      <button
+        onClick={() => setDrawerOpen(true)}
+        className="min-h-11 text-sm px-3 py-2 rounded-md border border-[var(--color-border)] hover:border-[var(--color-accent)]"
+      >
+        View concept map
+      </button>
+    );
+  }
+
   return (
     <div className="space-y-3">
+      {isNarrowViewport && (
+        <button
+          onClick={() => setDrawerOpen(false)}
+          className="min-h-11 text-sm px-3 py-2 rounded-md border border-[var(--color-border)] hover:border-[var(--color-accent)]"
+        >
+          Hide concept map
+        </button>
+      )}
       <div className="flex flex-wrap gap-2">
         {sortedModules.map((m) => {
           const count = counts.get(m.id) ?? 0;

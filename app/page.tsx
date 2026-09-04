@@ -13,6 +13,17 @@ import { getUserProfile, getGoalConnectionMessage } from "../src/motivation/inde
 import { SuggestionsPanel } from "../components/SuggestionsPanel.js";
 
 /**
+ * Phase 10 fix (a real, pre-existing bug this build surfaced, predating this phase): every read
+ * here goes through `node:sqlite` directly, a data source Next has no visibility into for its
+ * static-vs-dynamic heuristics (unlike `cookies()`/`headers()`/an uncached `fetch`) — so `next
+ * build` was silently prerendering this page as STATIC, freezing the onboarding-redirect and
+ * every real Dashboard figure to whatever the database looked like at BUILD time, not per real
+ * request. `npm run dev` never statically prerenders, so this was invisible until a real
+ * production build was checked. Forcing dynamic rendering is the fix.
+ */
+export const dynamic = "force-dynamic";
+
+/**
  * The Dashboard — a Server Component calling the read functions directly (no self-HTTP round-trip;
  * see README, "Server Components vs. API routes"). "Get suggestions" is the one client-interactive
  * piece, deliberately on-demand per completed course rather than eager for all of them.
