@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import type { AudioPlayerMode } from "./AudioPlayer.js";
 
 interface AnswerResult {
   answer: string;
@@ -8,12 +9,54 @@ interface AnswerResult {
   outsideLessonScope: boolean;
 }
 
-/** The Lesson screen's text-question Q&A — real, grounded (src/teachingEngine/answerLessonQuestion.ts). */
-export function LessonQA({ lessonId }: { lessonId: string }) {
+/**
+ * The Lesson screen's text-question Q&A — real, grounded (src/teachingEngine/answerLessonQuestion.ts).
+ * Socratic checkpoints stay TEXT-INPUT (PRD §5.1/§5.6, explicit — voice is output-only, never
+ * speech-to-text). Phase 7.5's addition: a "Speak answers" toggle (default off, so Phase 7's
+ * text-only behavior is unchanged unless the learner opts in) — when on, the answer is spoken via
+ * the same mode-aware path `AudioPlayer` uses (client-side `speechSynthesis` in "browser" mode,
+ * `/api/lessons/:id/audio/adhoc` — uncached, since a Q&A answer is unique per question — in
+ * "server" mode), a thin addition to the existing flow, not a rebuild of it.
+ */
+export function LessonQA({ lessonId, ttsMode }: { lessonId: string; ttsMode: AudioPlayerMode }) {
   const [question, setQuestion] = useState("");
   const [asking, setAsking] = useState(false);
   const [answer, setAnswer] = useState<AnswerResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [voiceContinuous, setVoiceContinuous] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
+
+  async function speak(text: string): Promise<void> {
+    setSpeaking(true);
+    try {
+      if (ttsMode === "browser") {
+        await new Promise<void>((resolve) => {
+          const utterance = new SpeechSynthesisUtterance(text);
+          utterance.onend = () => resolve();
+          utterance.onerror = () => resolve();
+          window.speechSynthesis.speak(utterance);
+        });
+      } else {
+        const res = await fetch(`/api/lessons/${lessonId}/audio/adhoc`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        if (!res.ok) return;
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        await new Promise<void>((resolve) => {
+          const audio = new Audio(url);
+          audio.onended = () => resolve();
+          audio.onerror = () => resolve();
+          audio.play().catch(() => resolve());
+        });
+        URL.revokeObjectURL(url);
+      }
+    } finally {
+      setSpeaking(false);
+    }
+  }
 
   async function ask(e: React.FormEvent) {
     e.preventDefault();
@@ -31,7 +74,9 @@ export function LessonQA({ lessonId }: { lessonId: string }) {
         const body = (await res.json()) as { message?: string };
         throw new Error(body.message ?? "Failed to get an answer.");
       }
-      setAnswer((await res.json()) as AnswerResult);
+      const result = (await res.json()) as AnswerResult;
+      setAnswer(result);
+      if (voiceContinuous) void speak(result.answer);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong.");
     } finally {
@@ -41,7 +86,17 @@ export function LessonQA({ lessonId }: { lessonId: string }) {
 
   return (
     <div className="space-y-3">
-      <h3 className="text-sm font-medium text-[var(--color-text-muted)]">Ask a question</h3>
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-medium text-[var(--color-text-muted)]">Ask a question</h3>
+        <label className="flex items-center gap-1.5 text-xs text-[var(--color-text-faint)]">
+          <input
+            type="checkbox"
+            checked={voiceContinuous}
+            onChange={(e) => setVoiceContinuous(e.target.checked)}
+          />
+          Speak answers
+        </label>
+      </div>
       <form onSubmit={ask} className="flex gap-2">
         <input
           value={question}
@@ -62,6 +117,7 @@ export function LessonQA({ lessonId }: { lessonId: string }) {
       {answer && (
         <div className="rounded-lg border border-[var(--color-border)] p-3 text-sm">
           <p>{answer.answer}</p>
+          {speaking && <p className="text-[var(--color-text-faint)] mt-1">Speaking…</p>}
           {answer.outsideLessonScope && (
             <p className="text-[var(--color-text-faint)] mt-1">(This goes beyond what this lesson covers.)</p>
           )}

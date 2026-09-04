@@ -58,6 +58,23 @@ export const modules = sqliteTable("modules", {
 
 export type CourseLessonLayers = RestructureLayersOutput["layers"];
 
+/**
+ * Phase 7.5: one cached audio chunk's record. `layer`/`chunkIndex` locate it within
+ * chunkLessonAudio()'s output (src/teachingEngine/chunkLessonAudio.ts) — deliberately NOT
+ * importing `LessonLayerKey` from there to avoid a schema.ts <-> teachingEngine circular import;
+ * this literal union is structurally identical and TypeScript treats them as compatible.
+ * `contentHash` is the actual cache key (a hash of the chunk's text) — `layer`/`chunkIndex` locate
+ * the entry, but a text change (e.g. Phase 6's Knowledge Update Agent regenerating a layer)
+ * naturally produces a different hash, so a stale entry is detected by hash mismatch rather than
+ * needing explicit invalidation coupling between the two phases.
+ */
+export interface AudioCacheEntry {
+  layer: "intuition" | "mechanics" | "formal" | "application" | "frontier";
+  chunkIndex: number;
+  contentHash: string;
+  filePath: string;
+}
+
 export const lessons = sqliteTable("lessons", {
   id: text("id").primaryKey(),
   moduleId: text("module_id")
@@ -68,8 +85,15 @@ export const lessons = sqliteTable("lessons", {
   estimatedDuration: text("estimated_duration").notNull(),
   layers: text("layers", { mode: "json" }).$type<CourseLessonLayers>().notNull(),
   sourceRefs: text("source_refs", { mode: "json" }).$type<string[]>().notNull(),
-  /** Not populated until the audio-caching phase; column exists now so the schema doesn't need to change later. */
-  audioCacheRef: text("audio_cache_ref"),
+  /**
+   * Phase 7.5: per-chunk audio cache index — an array of AudioCacheEntry, not a single ref,
+   * since layers reveal progressively in the UI (Phase 7's "one tap away" principle) and a
+   * collapsed layer's chunks must never be force-generated together with the rest. Still the
+   * SAME text column reserved since Phase 3 ("column exists now so the schema doesn't need to
+   * change later") — only the Drizzle-level type annotation changed (JSON mode), not the
+   * underlying SQL column type, so this needed no migration (confirmed via `db:generate`).
+   */
+  audioCacheRef: text("audio_cache_ref", { mode: "json" }).$type<AudioCacheEntry[]>(),
   /** "below_threshold" when a lesson still has fewer than the minimum valid sources after one backfill attempt — shipped anyway, flagged rather than blocked. */
   sourceStatus: text("source_status", { enum: ["ok", "below_threshold"] })
     .notNull()

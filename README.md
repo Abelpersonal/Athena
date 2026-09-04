@@ -2093,6 +2093,197 @@ phase's README names applies unchanged.
   has the same full access), and stripping it would be a filtering step beyond what a thin wrapper
   does; noted rather than silently accepted as ideal.
 
+## Phase 7.5: the Teaching Engine voice layer
+
+Phase 7 shipped the Lesson/Teaching screen text-only, with one deliberate stub:
+`<PlaceholderPanel label="Voice playback" note="Phase 7.5" />`. This phase fills that seam in two
+stages, per PRD §5.6's own sequencing: a zero-cost browser-`SpeechSynthesis` prototype to prove
+chunking and player UI, then production OpenAI TTS behind a swappable provider interface with
+per-chunk disk caching. Socratic checkpoints stay text-input — voice is output-only this phase, no
+speech-to-text (PRD §5.1/§5.6, explicit). No changes to `LayerViewer`'s own layer text/markup or
+`answerLessonQuestion()`'s content pipeline beyond one small additive prop (below); no Mind Map,
+Motivation Layer, or offline/PWA work.
+
+### Chunking (`src/teachingEngine/chunkLessonAudio.ts`)
+
+Pure function, no I/O. Splits each of a lesson's five depth layers into paragraph-sized chunks
+(falling back to sentence-grouping when a single paragraph exceeds ~800 characters — comfortably
+under OpenAI TTS's 4096-char `input` cap, and small enough that a chunk is a genuine listening
+unit, not just the longest string that would technically fit), **per layer**, not the whole lesson
+flattened. `LessonAudioTrack`/`LessonAudioChunk` are the vendor-neutral shapes both TTS stages
+consume identically — only how a chunk's audio gets produced differs, same "swappable adapter"
+discipline `SearchProvider`/`LLMProvider` already use elsewhere in this codebase.
+
+### `TTSProvider` — mirrors `LLMProvider` exactly (`src/teachingEngine/tts/`)
+
+One method, `synthesize(text): Promise<{audio: Buffer, contentType: string}>`. Selected via
+`TTS_PROVIDER` (`openai` default, `browser` a manual dev opt-in — **no silent fallback**:
+`openai` with no `OPENAI_API_KEY` fails loudly from `OpenAiTtsProvider`, exactly matching
+`GeminiProvider`'s own unkeyed behavior, confirmed live below — it does not quietly switch to
+`browser`). `getTtsProvider()` (`src/teachingEngine/tts/index.ts`) mirrors `getProvider()`
+(`src/orchestrator/providers/index.ts`) including its cache-per-selected-name pattern.
+
+- **`OpenAiTtsProvider`** (`openaiTts.ts`) — raw `fetch`, no `openai` SDK dependency (matching
+  `fetchAndClean.ts`'s own no-SDK style for a single-endpoint integration). Confirmed directly
+  from OpenAI's real API reference, not guessed: `POST https://api.openai.com/v1/audio/speech`,
+  `Authorization: Bearer <key>`, body `{model, input, voice, response_format, speed}`, response =
+  raw binary audio bytes by default. `stream_format: "sse"` exists upstream but is explicitly
+  unsupported on `tts-1`/`tts-1-hd` — this project's default model — so no per-call streaming is
+  attempted; "streaming, chunked by paragraph/section" (PRD §5.6) is achieved at the CHUNK level
+  instead (see the audio route below), not within one call's response body. Default model
+  `tts-1` ($15/1M characters — cost-optimal, vs. `tts-1-hd`'s $30/1M, both current pricing at the
+  time of this build); `tts-1-hd`/`gpt-4o-mini-tts` are documented, swappable alternates via
+  `OPENAI_TTS_MODEL` for anyone who wants the quality tradeoff. ElevenLabs stays a documented,
+  swappable alternative via the same `TTSProvider` interface, not implemented this phase — OpenAI
+  TTS alone satisfies the Definition of Done.
+- **`BrowserTtsProvider`** (`browserTts.ts`) — a defense-in-depth SENTINEL, not a real server-side
+  implementation: `window.speechSynthesis` is inherently a browser API and cannot run server-side.
+  `TTS_PROVIDER=browser` is meant to keep the Lesson page's `AudioPlayer` entirely client-side and
+  never call `/api/lessons/:id/audio` at all — confirmed live below (no `<audio>` element is even
+  server-rendered in this mode). If a server call somehow reaches this provider anyway (a routing
+  bug, not an expected path), it throws a clear, specific error rather than failing silently.
+
+### Caching — per-chunk, no new table, keyed by content hash
+
+`lessons.audioCacheRef` (`src/db/schema.ts`) has been reserved since Phase 3 for exactly this
+("Not populated until the audio-caching phase; column exists now so the schema doesn't need to
+change later"). Retyped as a Drizzle JSON column (`{mode: "json"}.$type<AudioCacheEntry[]>()`,
+the same pattern `layers`/`sourceRefs` already use on this table) storing
+`[{layer, chunkIndex, contentHash, filePath}, ...]` — real per-chunk granularity, since layers
+reveal progressively (Phase 7's "one tap away" principle) and a collapsed formal/frontier layer
+must never have its audio force-generated alongside the rest. **This needed no migration** — the
+underlying SQL column stays `TEXT`; only the TypeScript-level type annotation changed. Confirmed,
+not assumed: `npm run db:generate` was run after the schema edit and printed "No schema changes,
+nothing to migrate."
+
+`contentHash` (not `lessonId`+`layer`+`chunkIndex` alone) is the actual cache key — a SHA-256 of
+the chunk's own text. A later content change (Phase 6's Knowledge Update Agent regenerating a
+layer, for instance) naturally produces a different hash, so a stale entry is detected by hash
+mismatch and re-synthesized automatically, with zero explicit coupling between the two phases.
+Files live under `data/audio-cache/<lessonId>/<contentHash>.<ext>` on local disk — the PRD's pick
+for a personal, single-user, local-first app, matching Phase 3's own "local-first, no extra infra"
+reasoning for source-text caching (not R2/cloud storage). `src/teachingEngine/audioCache.ts`'s
+`getOrSynthesizeChunk()` is the actual orchestration (check the DB index → verify the file's still
+on disk → serve on a real hit; otherwise synthesize, write, and record) — `cacheDir` is injectable
+for tests, same DI convention as `db` throughout this codebase.
+
+### Audio delivery: per-chunk HTTP GET, not SSE — a deliberate divergence from Phase 7's precedent
+
+`GET /api/lessons/:id/audio?layer=X&chunkIndex=N` returns raw bytes (`Content-Type: audio/mpeg`,
+`Cache-Control: immutable` — safe indefinitely, since the cache key IS the content hash) rather
+than streaming over Server-Sent Events. This is a real, considered departure from Phase 7's SSE
+routes, not an inconsistency: those stream a TEXT PROGRESS LOG from one long-running server-side
+job (course build, path decompose). Audio chunks are independent, cacheable BINARY resources — a
+real HTTP GET gives the browser's own `<audio>` element and HTTP cache for free, rather than
+base64-encoding audio into SSE frames and hand-rolling reassembly. `AudioPlayer`
+(`components/AudioPlayer.tsx`) plays chunk N via a real `<audio>` element and prefetches chunk
+N+1's URL in the background while N plays (a plain background `Audio()` load, relying on the
+route's own cache header) — satisfying "begin playback of chunk 1 while chunk 2+ are still
+generating" without needing OpenAI's own per-call streaming (which, as noted above, isn't even
+available on the default `tts-1` model). `POST /api/lessons/:id/audio/adhoc` (uncached — a Q&A
+answer is unique per question, so content-hash caching doesn't apply the same way) is the
+voice-continuous Q&A path's equivalent, see below.
+
+### The player (`components/AudioPlayer.tsx`) and the layer-gating it shares with `LayerViewer`
+
+Controls per PRD §5.6/§6.3: play/pause, speed (1x/1.5x/2x — `<audio>.playbackRate` in "server"
+mode, `SpeechSynthesisUtterance.rate` in "browser" mode), skip-back-10s (`<audio>.currentTime -=
+10` in "server" mode; the Web Speech API has no real seek, so "browser" mode approximates this by
+restarting the current chunk from its beginning — **a documented Stage-1-only limitation, not a
+Stage-2 gap**). `AudioPlayer` only ever requests/synthesizes chunks for the `intuition` layer plus
+— once expanded — every other layer, mirroring `LayerViewer`'s own "Go deeper" disclosure exactly.
+
+Sharing that expand state required one small, additive change to `LayerViewer.tsx` (otherwise
+untouched): an optional `onDeeperLayersToggle?: (open: boolean) => void` prop wired to the
+existing `<details>` element's native `onToggle` — omitting it leaves Phase 7's behavior byte-for-
+byte identical. `components/LessonAudioSection.tsx` is the small new client component that holds
+this one piece of shared state and renders `AudioPlayer` + `LayerViewer` together, replacing both
+the old `PlaceholderPanel` and the direct `LayerViewer` call in `app/lessons/[id]/page.tsx`. The
+Lesson page (a Server Component) reads `TTS_PROVIDER` itself and passes a plain
+`mode: "browser" | "server"` prop down — the client never needs the env var exposed to it (no
+`NEXT_PUBLIC_` prefix needed), and in `"browser"` mode no `<audio>` element is even
+server-rendered, confirmed live below.
+
+**Media Session API** wiring (`navigator.mediaSession.metadata` + `setActionHandler` for
+play/pause/seekbackward) applies in both modes where the browser supports it — this covers a
+**backgrounded browser tab** (lock-screen/notification transport controls), not "app fully
+closed"; that stronger guarantee needs Phase 10's PWA work or a native wrapper, both still out of
+scope here, same as Phase 7's own scope boundary.
+
+### Voice-continuous Q&A — a small, additive change to `LessonQA` (not a rebuild)
+
+Per PRD §5.6's Teaching Engine pipeline step ("convert answer to audio if voice-continuous mode is
+on, else return as text"): a "Speak answers" checkbox, **default off** (Phase 7's text-only
+behavior is unchanged unless the learner opts in). When on, the answer text is spoken through the
+same mode-aware path `AudioPlayer` uses — client-side `speechSynthesis` directly in `"browser"`
+mode, `POST /api/lessons/:id/audio/adhoc` in `"server"` mode — reusing the same primitives rather
+than a parallel implementation. `answerLessonQuestion()` itself is completely unmodified.
+
+### Definition of done — Phase 7.5
+
+**Real, live-confirmed behavior** (this environment has no `OPENAI_API_KEY` — see below — so
+verification ran with `TTS_PROVIDER=browser`, which is also this environment's genuine real
+dev-mode setting, not just a test config):
+
+- The Lesson screen renders with the "Voice playback" placeholder genuinely GONE (confirmed by
+  grepping the rendered page — zero matches) and the real player controls (`Play`, `-10s`, the
+  speed selector, "Go deeper") and the "Speak answers" toggle present in its place.
+- **Confirmed live that `"browser"` mode never touches the server audio route at all**: the
+  rendered HTML contains no `<audio>` element whatsoever in this mode (grepped directly, zero
+  matches) — the client genuinely has no URL to request from, not just "chooses not to."
+- **Confirmed live that the "no silent fallback" design works exactly as intended**: with
+  `TTS_PROVIDER` unset (falling back to its `openai` default) and no `OPENAI_API_KEY`, a real
+  request to `/api/lessons/:id/audio` failed with a clear, specific, correctly-attributed error
+  (`OpenAiTtsProvider.synthesize`: `"OPENAI_API_KEY is not set — cannot call OpenAI TTS."`, plus
+  the constructor's own startup warning naming the `TTS_PROVIDER=browser` fix) — not a silent
+  fallback, not an opaque crash.
+- **Confirmed live, every validation/error branch of the audio route**: missing
+  `layer`/`chunkIndex` query params → `400`; an unknown lesson id → `404`; a `chunkIndex` past the
+  end of that layer's real chunk list → `404`.
+- `npm test` — 220 tests total (208 through Phase 7 + 12 new: `chunkLessonAudio.test.ts` (pure,
+  4 tests), `openaiTts.test.ts` (mocked `fetch`, 4 tests, confirming the exact request shape
+  against OpenAI's real documented schema), `audioCache.test.ts` (4 tests: cache miss, cache hit
+  with zero additional `synthesize()` calls, a content change correctly treated as a miss and
+  replacing — not duplicating — the stale entry, independent entries accumulating per chunk)) —
+  all pass. `npm run typecheck` clean across both configs.
+
+**Stage 2 (OpenAI TTS): adapter-verified, not live-API-verified** — `OPENAI_API_KEY` is not
+configured in this environment, the same real-run-blocker category Phases 2/3/5/6/7 already
+documented (a missing credential/quota wall, not a code gap). What stands in as evidence, per this
+project's own established convention: `tests/openaiTts.test.ts` proves the adapter's exact request
+shape (`model`, `input`, `voice`, `response_format`, `speed`) against OpenAI's real, independently-
+confirmed API schema, not a guessed one; the live error-path check above proves the surrounding
+cache-then-synthesize orchestration genuinely reaches the provider boundary correctly and fails at
+exactly the right, well-attributed point — everything up to the actual external HTTP call is real
+and exercised, only the call itself is unverified live. **Cache-hit-avoids-re-calling-the-API** is
+proven at the function level (`audioCache.test.ts`'s dedicated test, a fake provider whose call
+count is asserted to stay at 1 across two requests for the same chunk) rather than against the
+real OpenAI endpoint, for the same reason.
+
+**Media Session**: wired per the API (`navigator.mediaSession.metadata`/`setActionHandler`) and
+confirmed present in the rendered component tree, but **not manually verified on a real mobile
+browser** — no browser automation tooling is available in this environment (checked: no
+Playwright/Puppeteer installed), and there is no physical mobile device to test against here. This
+is honestly reported as unverified-on-device rather than claimed; the implementation follows the
+documented API directly and should be checked on a real phone browser (lock the screen or switch
+tabs mid-playback; the lock-screen/notification transport controls should show and control
+playback) before relying on it.
+
+**What would still be worth doing once `OPENAI_API_KEY` is available**: one real
+`synthesize()` call end-to-end through `/api/lessons/:id/audio`, confirming a real audio file
+lands in `data/audio-cache/` and that a second request for the same chunk is a genuine cache hit
+against the real file (not just the mocked-provider test); a real mobile-browser Media Session
+check. The exact same "Options to actually close these out" framing every prior phase's README
+uses applies unchanged.
+
+### Documented gaps
+
+- **No native mobile audio plugin (Capacitor)** and **no offline/PWA background-audio guarantee**
+  — both explicitly out of scope this phase (PRD §6.3 names Capacitor as an option "if wrapped
+  natively," which doesn't exist yet). Media Session covers a backgrounded browser tab only.
+- **`BrowserTtsProvider` is a sentinel, not a real provider** — by design (`window.speechSynthesis`
+  cannot run server-side). Documented plainly in its own file rather than left implicit.
+
 ## LLM provider swap (added mid-Phase-2, not in the original kickoff prompt)
 
 Partway through Phase 2, the decision was made to make the Orchestrator's LLM vendor swappable
