@@ -18,6 +18,7 @@ import type { OrchestratorResult, RunOptions } from "../src/orchestrator/index.j
 import type { CourseJson } from "../src/research/types.js";
 import type { RunResearchPipelineOptions } from "../src/research/pipeline.js";
 import type { BuildCourseResult } from "../src/courseBuilder/index.js";
+import type { GenerateMindMapResult } from "../src/mindMap/index.js";
 
 type MockRun = (
   taskType: string,
@@ -235,6 +236,7 @@ describe("isTopicGeneratable", () => {
 function makeMockPipeline(db: TeacherDb) {
   const capturedTopics: string[] = [];
   const capturedGoalContexts: Array<string | undefined> = [];
+  const generateMindMapCalls: string[] = [];
   const runResearchPipelineFn = async (topic: string, options?: RunResearchPipelineOptions): Promise<CourseJson> => {
     capturedTopics.push(topic);
     capturedGoalContexts.push(options?.goalContext);
@@ -254,7 +256,21 @@ function makeMockPipeline(db: TeacherDb) {
     return { courseId, moduleCount: 2, lessonCount: 4, subtopicLessonMap: {} };
   };
   const aggregateMaterialsFn = async () => ({ sourceCount: 0, backfillTriggeredCount: 0, belowThresholdLessonCount: 0 });
-  return { capturedTopics, capturedGoalContexts, runResearchPipelineFn, buildCourseFn, aggregateMaterialsFn };
+  // Mocked the same way as the other three injected steps — without this, generateTopicCourse's
+  // real default (a genuine orchestrator.run() call) would fire during every test above.
+  const generateMindMapFn = async (courseId: string): Promise<GenerateMindMapResult> => {
+    generateMindMapCalls.push(courseId);
+    return { courseId, graph: { nodes: [], edges: [] } };
+  };
+  return {
+    capturedTopics,
+    capturedGoalContexts,
+    generateMindMapCalls,
+    runResearchPipelineFn,
+    buildCourseFn,
+    aggregateMaterialsFn,
+    generateMindMapFn,
+  };
 }
 
 describe("generateTopicCourse", () => {
@@ -315,6 +331,38 @@ describe("generateTopicCourse", () => {
     const db = await getDb(":memory:");
     const mocks = makeMockPipeline(db);
     await expect(generateTopicCourse("does-not-exist", { db, ...mocks })).rejects.toThrow(PathPlannerError);
+  });
+
+  it("generates a mind map for the newly built course as a 4th step, mirroring build-stream's chain", async () => {
+    const db = await getDb(":memory:");
+    await seedPathDirectly(db, [{ id: "pt_a", name: "Linear Algebra", order: 0, parallelGroup: "tier_0" }]);
+    const mocks = makeMockPipeline(db);
+
+    const result = await generateTopicCourse("pt_a", { db, ...mocks });
+
+    expect(mocks.generateMindMapCalls).toEqual([result.courseId]);
+  });
+
+  it("degrades (logs, does not throw) when mind map generation fails — the course is still built and linked", async () => {
+    const db = await getDb(":memory:");
+    await seedPathDirectly(db, [{ id: "pt_a", name: "Linear Algebra", order: 0, parallelGroup: "tier_0" }]);
+    const mocks = makeMockPipeline(db);
+    const progressMessages: string[] = [];
+    const failingGenerateMindMapFn = async (): Promise<GenerateMindMapResult> => {
+      throw new Error("mind map LLM call failed");
+    };
+
+    const result = await generateTopicCourse("pt_a", {
+      db,
+      ...mocks,
+      generateMindMapFn: failingGenerateMindMapFn,
+      onProgress: (message) => progressMessages.push(message),
+    });
+
+    expect(result.courseId).toBe("crs_generated_1");
+    const [row] = await db.select().from(pathTopics).where(eq(pathTopics.id, "pt_a"));
+    expect(row!.status).toBe("linked_existing"); // course generation still completed and linked
+    expect(progressMessages.some((m) => m.includes("Mind map generation failed"))).toBe(true);
   });
 });
 

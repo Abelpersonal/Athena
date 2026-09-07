@@ -3,7 +3,7 @@ import { run as orchestratorRun } from "../orchestrator/index.js";
 import type { AnswerLessonQuestionOutput, AnswerLessonQuestionSourceRef } from "../orchestrator/templates/answerLessonQuestion.js";
 import { createCitationValidator } from "../research/grounding.js";
 import { getDb, type TeacherDb } from "../db/client.js";
-import { lessons, sources, modules } from "../db/schema.js";
+import { lessons, sources, modules, normalizeSourceRefEntry } from "../db/schema.js";
 import { recordActivityEvent as recordActivityEventDefault } from "../motivation/index.js";
 
 export type OrchestratorRunFn = typeof orchestratorRun;
@@ -47,8 +47,8 @@ export async function answerLessonQuestion(
   const [lesson] = await db.select().from(lessons).where(eq(lessons.id, lessonId));
   if (!lesson) throw new TeachingEngineError(`No lesson found with id "${lessonId}".`);
 
-  const sourceRows =
-    lesson.sourceRefs.length > 0 ? await db.select().from(sources).where(inArray(sources.id, lesson.sourceRefs)) : [];
+  const sourceIds = [...new Set(lesson.sourceRefs.map(normalizeSourceRefEntry).map((r) => r.sourceId))];
+  const sourceRows = sourceIds.length > 0 ? await db.select().from(sources).where(inArray(sources.id, sourceIds)) : [];
   const sourceRefs: AnswerLessonQuestionSourceRef[] = sourceRows.map((s) => ({
     source_id: s.id,
     title: s.url,

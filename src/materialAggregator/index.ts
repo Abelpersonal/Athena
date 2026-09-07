@@ -3,9 +3,10 @@ import { fetchAndClean as fetchAndCleanDefault } from "../extraction/fetchAndCle
 import type { FetchAndCleanFn, BackfillSubtopicOptions } from "../research/pipeline.js";
 import { backfillSubtopic as backfillSubtopicDefault } from "../research/pipeline.js";
 import { getDb, type TeacherDb } from "../db/client.js";
-import { lessons, sources as sourcesTable, courses } from "../db/schema.js";
-import type { CourseJson, SourceRecord } from "../research/types.js";
+import { lessons, sources as sourcesTable, courses, type LessonSourceRefEntry } from "../db/schema.js";
+import type { CourseJson, SourceRecord, SubtopicResult } from "../research/types.js";
 import type { SourceType } from "../extraction/fetchAndClean.js";
+import type { Locator } from "../shared/locator.js";
 import { writeSubtopicFacts as writeSubtopicFactsDefault } from "../memoryGraph/index.js";
 
 export type ProgressListener = (message: string) => void;
@@ -111,7 +112,7 @@ export async function aggregateMaterials(
     await db
       .update(lessons)
       .set({
-        sourceRefs: persisted.map((p) => p.id),
+        sourceRefs: buildSourceRefEntries(persisted, subtopic.keyPoints),
         sourceStatus: validCount < minValidSources ? "below_threshold" : "ok",
       })
       .where(eq(lessons.id, lessonId));
@@ -130,6 +131,40 @@ export async function aggregateMaterials(
 
 function countValid(list: PersistableSource[]): number {
   return list.filter((p) => p.type === "article").length;
+}
+
+function sameLocator(a: Locator, b: Locator): boolean {
+  return a.type === b.type && a.value === b.value;
+}
+
+/**
+ * Builds `lessons.sourceRefs` (LessonSourceRefEntry[]) for one lesson: every PERSISTED source gets
+ * at least one entry (preserving today's "every source this lesson links to" behavior exactly,
+ * for a source no key point cited with a specific locator — e.g. every article), but a source
+ * that real key points DID cite with one or more distinct real locators (a pdf page / video
+ * timestamp) gets one entry per distinct locator instead of one bare entry — the locator is
+ * strictly more specific than "this lesson used this source," so it replaces the bare reference
+ * rather than sitting alongside it. Two key points citing the exact same (source_id, locator)
+ * pair collapse to one entry (nothing new to say); two DIFFERENT locators on the same source_id
+ * are kept as separate entries, per the source-diversity kickoff's own resolved default.
+ */
+function buildSourceRefEntries(
+  persisted: PersistableSource[],
+  keyPoints: SubtopicResult["keyPoints"]
+): LessonSourceRefEntry[] {
+  const persistedIds = new Set(persisted.map((p) => p.id));
+  const locatorsBySourceId = new Map<string, LessonSourceRefEntry[]>();
+
+  for (const kp of keyPoints) {
+    if (!kp.locator || !persistedIds.has(kp.source_id)) continue;
+    const existing = locatorsBySourceId.get(kp.source_id) ?? [];
+    if (!existing.some((e) => sameLocator(e.locator!, kp.locator!))) {
+      existing.push({ sourceId: kp.source_id, locator: kp.locator });
+    }
+    locatorsBySourceId.set(kp.source_id, existing);
+  }
+
+  return persisted.flatMap((p) => locatorsBySourceId.get(p.id) ?? [{ sourceId: p.id }]);
 }
 
 async function refetchAndPersist(

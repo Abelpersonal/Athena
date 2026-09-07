@@ -1,5 +1,6 @@
 import { sqliteTable, text, real, integer } from "drizzle-orm/sqlite-core";
 import type { RestructureLayersOutput } from "../orchestrator/templates/restructureLayers.js";
+import type { Locator } from "../shared/locator.js";
 
 /**
  * Phase 3's slice of the PRD's data model (Section 7), plus Phase 4's
@@ -59,6 +60,45 @@ export const modules = sqliteTable("modules", {
 export type CourseLessonLayers = RestructureLayersOutput["layers"];
 
 /**
+ * One real, persisted source linked to a lesson, plus the optional citation locator (page/
+ * timestamp) a key point cited it with — the Source Diversity phase's `locator` (src/shared/
+ * locator.ts) surviving past the Research Agent's in-memory `CourseJson` into the actual DB row,
+ * which it never did before this. `locator` absent means either an article source (no natural
+ * locator) or a pdf/video source that was persisted but that no key point happened to cite with a
+ * specific page/timestamp — both indistinguishable and both fine, same as a source with no
+ * locator info at all today. If the same `sourceId` is cited at two distinct locators within one
+ * lesson, that's two separate entries here, not one collapsed/overwritten entry — see
+ * `materialAggregator/index.ts`'s `buildSourceRefEntries`, the only writer of this column.
+ *
+ * This changed from a bare `string[]` of source ids. Only the Drizzle-level `.$type<>()`
+ * annotation changed — the underlying SQL column is still `text` in `{mode: "json"}` (same as the
+ * `AudioCacheEntry[]` precedent above), so this needed no migration; confirmed via a real
+ * `npm run db:generate` producing no new migration file. A pre-existing persisted row's raw JSON
+ * is still a bare array of id strings, not objects — every reader of this column
+ * (`db/queries.ts`, `teachingEngine/answerLessonQuestion.ts`) normalizes each entry through
+ * `normalizeSourceRefEntry` before use specifically so that old-shape data keeps reading
+ * correctly (as "no locator") rather than crashing; nothing backfills a locator onto old rows,
+ * since that information was never captured for them.
+ */
+export interface LessonSourceRefEntry {
+  sourceId: string;
+  locator?: Locator;
+}
+
+/**
+ * Normalizes one raw `lessons.source_refs` array entry into the current `LessonSourceRefEntry`
+ * shape, regardless of whether it was written before or after this shape existed — a
+ * pre-existing persisted row's raw JSON is a bare source-id string (the old `string[]` shape),
+ * and normalizing it to `{sourceId: entry}` (no locator) is reading it the way it was actually
+ * written, not backfilling anything that was never captured. Every reader of `lessons.sourceRefs`
+ * (`db/queries.ts`, `teachingEngine/answerLessonQuestion.ts`) must map entries through this
+ * before using them, so old-shape data keeps rendering correctly instead of crashing.
+ */
+export function normalizeSourceRefEntry(entry: LessonSourceRefEntry | string): LessonSourceRefEntry {
+  return typeof entry === "string" ? { sourceId: entry } : entry;
+}
+
+/**
  * Phase 7.5: one cached audio chunk's record. `layer`/`chunkIndex` locate it within
  * chunkLessonAudio()'s output (src/teachingEngine/chunkLessonAudio.ts) — deliberately NOT
  * importing `LessonLayerKey` from there to avoid a schema.ts <-> teachingEngine circular import;
@@ -84,7 +124,7 @@ export const lessons = sqliteTable("lessons", {
   description: text("description").notNull(),
   estimatedDuration: text("estimated_duration").notNull(),
   layers: text("layers", { mode: "json" }).$type<CourseLessonLayers>().notNull(),
-  sourceRefs: text("source_refs", { mode: "json" }).$type<string[]>().notNull(),
+  sourceRefs: text("source_refs", { mode: "json" }).$type<LessonSourceRefEntry[]>().notNull(),
   /**
    * Phase 7.5: per-chunk audio cache index — an array of AudioCacheEntry, not a single ref,
    * since layers reveal progressively in the UI (Phase 7's "one tap away" principle) and a

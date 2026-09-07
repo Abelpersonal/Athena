@@ -4,6 +4,7 @@ import {
   getCompletedCourses,
   getActivePathsWithProgress,
   getLessonWithSources,
+  getCourseDetail,
   getCourseMindMap,
   getMomentumStreak,
   getReentryOffer,
@@ -111,7 +112,7 @@ describe("getLessonWithSources", () => {
       description: "d",
       estimatedDuration: "5 min",
       layers: FIVE_LAYERS,
-      sourceRefs: ["src_ls_1"],
+      sourceRefs: [{ sourceId: "src_ls_1" }],
       sourceStatus: "ok",
     });
   }
@@ -150,6 +151,118 @@ describe("getLessonWithSources", () => {
 
     const result = await getLessonWithSources("lsn_nosrc", { db });
     expect(result!.sourceRefs).toEqual([]);
+  });
+
+  it("includes a source's real locator when one was cited (Pre-Real-Testing Gap Fixes, Deliverable 2)", async () => {
+    const db = await getDb(":memory:");
+    await db.insert(courses).values({ id: "crs_loc", topic: "Locator Topic", createdAt: "2026-01-01T00:00:00.000Z", volatilityTier: "medium", status: "complete" });
+    await db.insert(modules).values({ id: "mod_loc", courseId: "crs_loc", title: "M", description: "d", order: 0, prerequisiteOf: [] });
+    await db.insert(sources).values([
+      { id: "src_pdf", url: "https://example.com/paper.pdf", type: "pdf", extractedText: "page text", credibilityScore: 0.85, fetchedAt: "2026-01-01T00:00:00.000Z" },
+    ]);
+    await db.insert(lessons).values({
+      id: "lsn_loc",
+      moduleId: "mod_loc",
+      title: "Lesson With A Locator",
+      description: "d",
+      estimatedDuration: "5 min",
+      layers: FIVE_LAYERS,
+      sourceRefs: [
+        { sourceId: "src_pdf", locator: { type: "page", value: 4 } },
+        { sourceId: "src_pdf", locator: { type: "page", value: 9 } },
+      ],
+      sourceStatus: "ok",
+    });
+
+    const result = await getLessonWithSources("lsn_loc", { db });
+    expect(result!.sourceRefs).toEqual([
+      { id: "src_pdf", url: "https://example.com/paper.pdf", type: "pdf", credibilityScore: 0.85, locator: { type: "page", value: 4 } },
+      { id: "src_pdf", url: "https://example.com/paper.pdf", type: "pdf", credibilityScore: 0.85, locator: { type: "page", value: 9 } },
+    ]);
+  });
+
+  it("reads a pre-migration lesson whose sourceRefs is still the old bare source-id-string shape, with no locator and no crash", async () => {
+    const db = await getDb(":memory:");
+    await db.insert(courses).values({ id: "crs_old", topic: "Old Shape Topic", createdAt: "2026-01-01T00:00:00.000Z", volatilityTier: "medium", status: "complete" });
+    await db.insert(modules).values({ id: "mod_old", courseId: "crs_old", title: "M", description: "d", order: 0, prerequisiteOf: [] });
+    await db.insert(sources).values([
+      { id: "src_old_1", url: "https://example.com/old", type: "article", extractedText: "old text", credibilityScore: 0.7, fetchedAt: "2026-01-01T00:00:00.000Z" },
+    ]);
+    // Simulates a row persisted before this phase's schema change — its real, raw JSON is a bare
+    // array of id strings, not {sourceId, locator?} objects. Bypassing the (now-updated) insert
+    // type deliberately, since this is exactly what already-persisted data looks like.
+    await db.insert(lessons).values({
+      id: "lsn_old",
+      moduleId: "mod_old",
+      title: "Old Shape Lesson",
+      description: "d",
+      estimatedDuration: "5 min",
+      layers: FIVE_LAYERS,
+      sourceRefs: ["src_old_1"] as unknown as { sourceId: string }[],
+      sourceStatus: "ok",
+    });
+
+    const result = await getLessonWithSources("lsn_old", { db });
+    expect(result!.sourceRefs).toEqual([
+      { id: "src_old_1", url: "https://example.com/old", type: "article", credibilityScore: 0.7 },
+    ]);
+  });
+});
+
+describe("getCourseDetail", () => {
+  beforeEach(() => resetDbCache());
+
+  it("joins each lesson's real sourceRefs, including a locator when one was cited (Course view's own read path)", async () => {
+    const db = await getDb(":memory:");
+    await db.insert(courses).values({ id: "crs_detail", topic: "Detail Topic", createdAt: "2026-01-01T00:00:00.000Z", volatilityTier: "medium", status: "complete" });
+    await db.insert(modules).values({ id: "mod_detail", courseId: "crs_detail", title: "M", description: "d", order: 0, prerequisiteOf: [] });
+    await db.insert(sources).values([
+      { id: "src_video", url: "https://youtube.com/watch?v=abc", type: "video", extractedText: "caption text", credibilityScore: 0.8, fetchedAt: "2026-01-01T00:00:00.000Z" },
+    ]);
+    await db.insert(lessons).values({
+      id: "lsn_detail",
+      moduleId: "mod_detail",
+      title: "Lesson",
+      description: "d",
+      estimatedDuration: "5 min",
+      layers: FIVE_LAYERS,
+      sourceRefs: [{ sourceId: "src_video", locator: { type: "timestamp", value: "4:32" } }],
+      sourceStatus: "ok",
+    });
+
+    const result = await getCourseDetail("crs_detail", { db });
+    expect(result!.modules[0]!.lessons[0]!.sourceRefs).toEqual([
+      { id: "src_video", url: "https://youtube.com/watch?v=abc", type: "video", credibilityScore: 0.8, locator: { type: "timestamp", value: "4:32" } },
+    ]);
+  });
+
+  it("reads a pre-migration lesson's old bare-string-array sourceRefs correctly, with no locator and no crash", async () => {
+    const db = await getDb(":memory:");
+    await db.insert(courses).values({ id: "crs_detail_old", topic: "Old Topic", createdAt: "2026-01-01T00:00:00.000Z", volatilityTier: "medium", status: "complete" });
+    await db.insert(modules).values({ id: "mod_detail_old", courseId: "crs_detail_old", title: "M", description: "d", order: 0, prerequisiteOf: [] });
+    await db.insert(sources).values([
+      { id: "src_detail_old", url: "https://example.com/old", type: "article", extractedText: "old text", credibilityScore: 0.6, fetchedAt: "2026-01-01T00:00:00.000Z" },
+    ]);
+    await db.insert(lessons).values({
+      id: "lsn_detail_old",
+      moduleId: "mod_detail_old",
+      title: "Old Lesson",
+      description: "d",
+      estimatedDuration: "5 min",
+      layers: FIVE_LAYERS,
+      sourceRefs: ["src_detail_old"] as unknown as { sourceId: string }[],
+      sourceStatus: "ok",
+    });
+
+    const result = await getCourseDetail("crs_detail_old", { db });
+    expect(result!.modules[0]!.lessons[0]!.sourceRefs).toEqual([
+      { id: "src_detail_old", url: "https://example.com/old", type: "article", credibilityScore: 0.6 },
+    ]);
+  });
+
+  it("returns null for an unknown course id", async () => {
+    const db = await getDb(":memory:");
+    expect(await getCourseDetail("does-not-exist", { db })).toBeNull();
   });
 });
 

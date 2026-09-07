@@ -117,7 +117,7 @@ describe("aggregateMaterials", () => {
 
     const lessonId = built.subtopicLessonMap["sub-a"]!;
     const [lesson] = await db.select().from(lessons).where(eq(lessons.id, lessonId));
-    expect(lesson!.sourceRefs.sort()).toEqual(["src_a1", "src_a2"]);
+    expect(lesson!.sourceRefs.map((r) => r.sourceId).sort()).toEqual(["src_a1", "src_a2"]);
     expect(lesson!.sourceStatus).toBe("ok");
   });
 
@@ -160,8 +160,9 @@ describe("aggregateMaterials", () => {
     const lessonId = built.subtopicLessonMap["sub-b"]!;
     const [lesson] = await db.select().from(lessons).where(eq(lessons.id, lessonId));
     expect(lesson!.sourceStatus).toBe("ok");
-    expect(lesson!.sourceRefs).toContain("src_backfill_1");
-    expect(lesson!.sourceRefs).toContain("src_backfill_2");
+    const linkedSourceIds = lesson!.sourceRefs.map((r) => r.sourceId);
+    expect(linkedSourceIds).toContain("src_backfill_1");
+    expect(linkedSourceIds).toContain("src_backfill_2");
   });
 
   it("flags a lesson source_status: below_threshold when it is still short after the one backfill attempt", async () => {
@@ -290,5 +291,81 @@ describe("aggregateMaterials", () => {
     expect(calls[0]!.courseId).toBe(built.courseId);
     expect(calls[0]!.subtopicId).toBe("sub-g");
     expect(calls[0]!.keyPoints).toEqual(course.subtopics[0]!.keyPoints);
+  });
+
+  describe("sourceRefs locator threading (Pre-Real-Testing Gap Fixes, Deliverable 2)", () => {
+    it("carries a key point's real locator into sourceRefs instead of a bare source id", async () => {
+      resetDbCache();
+      const db = await getDb(":memory:");
+      const pdfSource = makeSource("src_pdf_1", "https://example.com/paper.pdf");
+      const articleSource = makeSource("src_art_1", "https://example.com/article");
+      const subtopic = makeSubtopic("sub-h", "Subtopic H", [pdfSource, articleSource]);
+      subtopic.keyPoints = [
+        { point: "A point from page 3.", source_id: "src_pdf_1", locator: { type: "page", value: 3 } },
+        { point: "A plain article point.", source_id: "src_art_1" },
+      ];
+      const course: CourseJson = {
+        topic: "Topic",
+        prerequisites: [],
+        subtopics: [subtopic],
+        generatedAt: new Date().toISOString(),
+      };
+      const built = await seedCourse(db, course);
+
+      await aggregateMaterials(built.courseId, course, built.subtopicLessonMap, {
+        db,
+        minValidSources: 1, // only articleSource counts as "valid" (type: "article") — avoid the backfill path, unrelated to what this test checks
+        fetchAndClean: fetchAndCleanReturning({
+          "https://example.com/paper.pdf": { text: "t", title: "t", extractionConfidence: 0.9, sourceType: "pdf" },
+          "https://example.com/article": { text: "t", title: "t", extractionConfidence: 0.9, sourceType: "article" },
+        }),
+        backfillSubtopic: async () => {
+          throw new Error("should not be called");
+        },
+        writeSubtopicFacts: async () => {},
+      });
+
+      const lessonId = built.subtopicLessonMap["sub-h"]!;
+      const [lesson] = await db.select().from(lessons).where(eq(lessons.id, lessonId));
+      expect(lesson!.sourceRefs).toEqual([
+        { sourceId: "src_pdf_1", locator: { type: "page", value: 3 } },
+        { sourceId: "src_art_1" },
+      ]);
+    });
+
+    it("keeps two distinct locators on the same source as separate entries, and collapses an exact repeat", async () => {
+      resetDbCache();
+      const db = await getDb(":memory:");
+      const pdfSource = makeSource("src_pdf_2", "https://example.com/paper2.pdf");
+      const subtopic = makeSubtopic("sub-i", "Subtopic I", [pdfSource]);
+      subtopic.keyPoints = [
+        { point: "From page 1.", source_id: "src_pdf_2", locator: { type: "page", value: 1 } },
+        { point: "From page 1 again — same locator, should not duplicate.", source_id: "src_pdf_2", locator: { type: "page", value: 1 } },
+        { point: "From page 5 — a genuinely different locator.", source_id: "src_pdf_2", locator: { type: "page", value: 5 } },
+      ];
+      const course: CourseJson = {
+        topic: "Topic",
+        prerequisites: [],
+        subtopics: [subtopic],
+        generatedAt: new Date().toISOString(),
+      };
+      const built = await seedCourse(db, course);
+
+      await aggregateMaterials(built.courseId, course, built.subtopicLessonMap, {
+        db,
+        fetchAndClean: fetchAndCleanReturning({
+          "https://example.com/paper2.pdf": { text: "t", title: "t", extractionConfidence: 0.9, sourceType: "pdf" },
+        }),
+        backfillSubtopic: async () => [],
+        writeSubtopicFacts: async () => {},
+      });
+
+      const lessonId = built.subtopicLessonMap["sub-i"]!;
+      const [lesson] = await db.select().from(lessons).where(eq(lessons.id, lessonId));
+      expect(lesson!.sourceRefs).toEqual([
+        { sourceId: "src_pdf_2", locator: { type: "page", value: 1 } },
+        { sourceId: "src_pdf_2", locator: { type: "page", value: 5 } },
+      ]);
+    });
   });
 });

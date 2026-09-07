@@ -20,6 +20,7 @@ import { runResearchPipeline as runResearchPipelineDefault, type RunResearchPipe
 import type { CourseJson } from "../research/types.js";
 import { buildCourse as buildCourseDefault, type BuildCourseOptions } from "../courseBuilder/index.js";
 import { aggregateMaterials as aggregateMaterialsDefault, type AggregateMaterialsOptions } from "../materialAggregator/index.js";
+import { generateMindMap as generateMindMapDefault } from "../mindMap/index.js";
 import { getDb, type TeacherDb } from "../db/client.js";
 import { paths, pathDomains, pathTopics } from "../db/schema.js";
 import { assignUniqueIds } from "../shared/ids.js";
@@ -288,6 +289,8 @@ export interface GenerateTopicCourseOptions {
   runResearchPipelineFn?: typeof runResearchPipelineDefault;
   buildCourseFn?: typeof buildCourseDefault;
   aggregateMaterialsFn?: typeof aggregateMaterialsDefault;
+  /** Injectable for tests. Default: the real generateMindMap() (src/mindMap/index.ts). */
+  generateMindMapFn?: typeof generateMindMapDefault;
   onProgress?: ProgressListener;
   /** Pass-throughs for --dry-run/testing — forwarded into runResearchPipeline/buildCourse/aggregateMaterials exactly like build --dry-run does. */
   orchestratorRun?: RunResearchPipelineOptions["orchestratorRun"];
@@ -328,6 +331,7 @@ export async function generateTopicCourse(
   const runResearchPipelineFn = options.runResearchPipelineFn ?? runResearchPipelineDefault;
   const buildCourseFn = options.buildCourseFn ?? buildCourseDefault;
   const aggregateMaterialsFn = options.aggregateMaterialsFn ?? aggregateMaterialsDefault;
+  const generateMindMapFn = options.generateMindMapFn ?? generateMindMapDefault;
   const onProgress = options.onProgress;
 
   const [topic] = await db.select().from(pathTopics).where(eq(pathTopics.id, pathTopicId));
@@ -375,6 +379,16 @@ export async function generateTopicCourse(
     backfillSubtopic: options.backfillSubtopic,
   };
   await aggregateMaterialsFn(built.courseId, course, built.subtopicLessonMap, aggregateOptions);
+
+  // Mirrors build-stream/route.ts's exact 4th-step call site (Phase 8) — a mind map failure
+  // degrades (logged, course generation still completes) rather than failing the whole
+  // generation; without this, every goal-path-generated course (the PRD's own primary example)
+  // silently never got a mind map, even though the standalone /new topic flow already did.
+  try {
+    await generateMindMapFn(built.courseId, { db, onProgress, orchestratorRun: options.orchestratorRun });
+  } catch (error) {
+    onProgress?.(`Mind map generation failed (course was still built successfully): ${(error as Error).message}`);
+  }
 
   await db
     .update(pathTopics)

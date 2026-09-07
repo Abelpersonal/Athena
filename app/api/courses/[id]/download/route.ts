@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
 import { getDb } from "../../../../../src/db/client.js";
-import { courses, modules, lessons } from "../../../../../src/db/schema.js";
+import { courses, modules, lessons, normalizeSourceRefEntry } from "../../../../../src/db/schema.js";
 import { getCourseMindMap } from "../../../../../src/db/queries.js";
 import { generateQuizQuestions, ALL_QUIZ_TIERS } from "../../../../../src/quizEngine/index.js";
 import type { CourseDownloadBundle, OfflineAudioChunkRef } from "../../../../../lib/offline/types.js";
@@ -62,7 +62,10 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       description: l.description,
       estimatedDuration: l.estimatedDuration,
       layers: l.layers,
-      sourceRefs: l.sourceRefs,
+      // The offline bundle only ever needs source ids (nothing in the offline viewer renders
+      // locators today) — deduped, since the same source id can now legitimately appear more
+      // than once in lessons.sourceRefs (distinct locators on the same source).
+      sourceRefs: [...new Set(l.sourceRefs.map(normalizeSourceRefEntry).map((r) => r.sourceId))],
     })),
     quizQuestions,
     mindMap: mindMapData.graph ? { courseId, graph: mindMapData.graph } : null,

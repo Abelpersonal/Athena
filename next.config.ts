@@ -19,14 +19,20 @@ import type { Configuration } from "webpack";
  */
 const nextConfig: NextConfig = {
   /**
-   * `serverExternalPackages`: keep these two out of the bundle rather than letting it try to
+   * `serverExternalPackages`: keep these out of the bundle rather than letting it try to
    * trace/bundle them — @modelcontextprotocol/sdk spawns child processes (stdio MCP transports,
    * src/mcp/*.ts) and jsdom is a large, non-trivial-to-bundle DOM implementation
-   * (src/extraction/fetchAndClean.ts). node:sqlite is a Node builtin, not a package, so it needs
-   * no entry here — every route that reaches into src/ runs in the default Node.js runtime (never
-   * "edge"), which is what both of these — and node:sqlite — require.
+   * (src/extraction/fetchAndClean.ts). `pdf-parse` (Source Diversity phase) was missing from this
+   * list — a real, discovered gap: `next dev --webpack` crashed with "Object.defineProperty called
+   * on non-object" while bundling `src/extraction/fetchAndCleanPdf.ts` for the RSC graph on ANY
+   * page that transitively imports it (e.g. `/` -> knowledgeUpdate -> extraction/fetchAndClean),
+   * even though `next build`/`next start` (production) never hit it — the exact same "large/
+   * non-trivial-to-bundle" reasoning `jsdom` already gets here, just missed when `pdf-parse` was
+   * added. node:sqlite is a Node builtin, not a package, so it needs no entry here — every route
+   * that reaches into src/ runs in the default Node.js runtime (never "edge"), which all of these —
+   * and node:sqlite — require.
    */
-  serverExternalPackages: ["@modelcontextprotocol/sdk", "jsdom"],
+  serverExternalPackages: ["@modelcontextprotocol/sdk", "jsdom", "pdf-parse"],
   webpack: (config: Configuration) => {
     config.resolve = {
       ...config.resolve,

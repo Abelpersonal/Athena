@@ -43,7 +43,7 @@ async function seedLessonWithSources(
       application: { text: "This is why heat flows from hot to cold, not the reverse.", source_ids: [sourceId2] },
       frontier: { text: "Open questions remain about entropy at the quantum scale.", source_ids: [] },
     },
-    sourceRefs: [sourceId1, sourceId2],
+    sourceRefs: [{ sourceId: sourceId1 }, { sourceId: sourceId2 }],
     sourceStatus: "ok",
   });
   return { lessonId, sourceId1, sourceId2 };

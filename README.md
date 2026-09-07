@@ -20,7 +20,7 @@ functional gap.
 
 ## Contents
 
-- [Current status (Phase 11 + Source Diversity)](#current-status-phase-11--source-diversity) —
+- [Current status (Phase 11 + Source Diversity + Pre-Real-Testing Gap Fixes)](#current-status-phase-11--source-diversity--pre-real-testing-gap-fixes) —
   what's built, what's real-verified vs. dry-run/mocked, what's still genuinely outstanding
 - [Tech choices](#tech-choices)
 - [Setup](#setup)
@@ -41,29 +41,34 @@ functional gap.
 - [Source Diversity: PDF + Video Transcript Support](#source-diversity-pdf--video-transcript-support-a-scoped-addition-not-a-numbered-phase)
   (a scoped addition, not a numbered phase — real PDF/YouTube-transcript extraction, the optional
   citation `locator`, the YouTube URL-routing bug fix)
+- [Pre-Real-Testing Gap Fixes](#pre-real-testing-gap-fixes-a-scoped-addition-not-a-numbered-phase)
+  (a scoped addition, not a numbered phase — the Goal Planner's missing mind map step, the
+  citation `locator` finally persisted and rendered, the `GRAPHITI_MCP_URL` env var gap, the
+  dependency audit, and an incidentally-discovered `pdf-parse`/`next dev` bundling bug)
 - [LLM provider swap](#llm-provider-swap-added-mid-phase-2-not-in-the-original-kickoff-prompt)
 - [Definition of done — status](#definition-of-done--status) (historical, Phases 1-3.5 only —
   each later phase's own "Definition of done" subsection is the record for that phase)
 - [Deviations from the spec (documented)](#deviations-from-the-spec-documented)
 
-## Current status (Phase 11 + Source Diversity)
+## Current status (Phase 11 + Source Diversity + Pre-Real-Testing Gap Fixes)
 
 All ten phases on the PRD's roadmap are built and individually tested; Phase 11 was a polish pass,
-and "Source Diversity" (below) is a scoped addition after it, not a new numbered phase — see their
-own sections below. This is a **summary index**, not a re-verification — every claim here is a
-pointer to the fuller, phase-by-phase record already in this document; when in doubt, the linked
-phase section is the source of truth.
+and "Source Diversity" and "Pre-Real-Testing Gap Fixes" (below) are scoped additions after it, not
+new numbered phases — see their own sections below. This is a **summary index**, not a
+re-verification — every claim here is a pointer to the fuller, phase-by-phase record already in
+this document; when in doubt, the linked phase section is the source of truth.
 
 **What's built, end to end:** topic/goal intake with classify-confirm-override → multi-pass
 research with cited, volatility-tagged sources (now including real PDF and YouTube-transcript
-sources with an optional page/timestamp citation locator, not just HTML articles) → five-layer
-course persistence → a Memory Graph of dated facts and mastery history → tiered quizzes and
+sources with an optional page/timestamp citation locator that's now persisted AND rendered in the
+Course view, not just HTML articles) → five-layer course persistence → a real per-course concept
+mind map generated for a course reached through EITHER the standalone topic flow or a Goal/Path →
+a Memory Graph of dated facts and mastery history → tiered quizzes and
 project/simulation/debate practice with auto-escalating difficulty → a goal/career Path Planner
 with cross-domain ordering and overlap detection → a Continuous Learning Agent (next-topic
 suggestions, verified book recommendations) and a Knowledge Update Agent (real-world drift
 detection, severity-routed digests) → a full Next.js frontend over all of the above → voice
-narration with lock-screen media controls → a per-course concept mind map and a fixed
-self-improvement starting menu → real activity tracking,
+narration with lock-screen media controls → a fixed self-improvement starting menu → real activity tracking,
 momentum streaks, low-friction re-entry, boredom-proofing, and milestone celebration → PWA
 installability, explicit offline download, background sync of queued offline actions, and real
 Web Push for both PRD-named cases (major knowledge updates, an inactivity nudge).
@@ -3320,6 +3325,174 @@ about.
   not built now, since it wasn't yet clear real topics need it.
 - **Podcasts, other video platforms, images/OCR remain fully out of scope** — not partially built,
   not stubbed, genuinely untouched, exactly as scoped.
+
+## Pre-Real-Testing Gap Fixes (a scoped addition, not a numbered phase)
+
+A direct code-and-call-graph audit done right before moving to full real-API/real-device testing
+found four real gaps — completing or connecting work that already existed, not new features.
+
+### Gap 1: the Goal Planner's on-demand generation never called generateMindMap
+
+`app/api/courses/build-stream/route.ts` (the standalone `/new` topic flow) already ran
+`generateMindMap()` as a 4th step after research → build → aggregate (Phase 8). `generateTopicCourse()`
+(`src/pathPlanner/index.ts`) — the function every Goal/Path-generated course goes through, reached
+via `/paths/[id]`'s "generate this topic" action — never did, so any course reached through a Path
+(the PRD's own primary example, "become a full-stack quant," is a goal, not a single topic)
+silently never got a mind map. Fixed by adding a `generateMindMapFn` option to
+`generateTopicCourse()` (same optional-injection shape as its existing `runResearchPipelineFn`/
+`buildCourseFn`/`aggregateMaterialsFn`) and calling it as a 4th step in the exact same
+degrade-on-failure way (`try`/`catch`, logged via `onProgress`, never fails the course generation)
+`build-stream/route.ts` already established — mirrored, not reinvented. Both real call sites —
+`build-stream/route.ts` and `app/api/paths/[id]/topics/[topicId]/generate-stream/route.ts` — needed
+**zero** route changes, since both are thin wrappers that already just call their respective
+research/build chain function directly; the fix lives entirely inside `generateTopicCourse()`
+itself. The harness's `goal` command needed no separate wiring either: it already forwards a
+generic `onProgress` into `generateTopicCourse()` without printing its own per-step headers, so the
+mind map step's own progress lines ("Generating mind map for...", "Persisted mind map: N node(s),
+M edge(s).") now surface there automatically, for free.
+
+### Gap 2: a citation's locator never survived past the Research Agent's in-memory CourseJson
+
+The Source Diversity phase's per-key-point `locator` (page/timestamp) existed only in the
+in-memory `CourseJson`/`SubtopicResult.keyPoints` — `lessons.sourceRefs` (`src/db/schema.ts`) was a
+bare `string[]` of source ids, and `materialAggregator/index.ts`'s `aggregateMaterials()` (not
+`courseBuilder/index.ts`, which correctly leaves `sourceRefs: []` at initial insert time by design
+— see "Source linking is the Material Aggregator's job" in that file's own doc comment) wrote it as
+`persisted.map((p) => p.id)`, discarding every locator. `SourceCitations.tsx` never rendered one.
+The entire payoff of the Source Diversity work — a citation that says *where* (page 4, 12:34), not
+just *that* — never reached the UI.
+
+- **Schema**: `lessons.sourceRefs` is now `LessonSourceRefEntry[]` (`{sourceId: string, locator?:
+  Locator}[]`), not `string[]`. Only the Drizzle-level `.$type<>()` annotation changed — the
+  underlying SQL column is still `text` in `{mode: "json"}` (the same situation Phase 7.5's
+  `AudioCacheEntry[]` retype hit) — confirmed via a real `npm run db:generate`, which produced
+  `No schema changes, nothing to migrate 😴`. No migration file exists for this change because none
+  was needed, not because one was skipped.
+- **Where it's populated**: `materialAggregator/index.ts`'s new `buildSourceRefEntries(persisted,
+  keyPoints)` — every persisted source gets one bare `{sourceId}` entry (identical to today's
+  behavior) UNLESS a real key point cited it with a real locator, in which case that source gets
+  one entry per DISTINCT locator instead (a locator is strictly more specific than "this lesson
+  used this source," so it replaces the bare entry rather than sitting alongside it). Two key
+  points citing the exact same `(source_id, locator)` pair collapse to one entry; two different
+  locators on the same source are kept as two separate entries — the source-diversity kickoff's
+  own resolved default for exactly this case.
+- **Where it's shown**: `SourceCitations.tsx` renders `(pdf, page 4, credibility 0.75)` /
+  `(video, 12:34, credibility 0.70)` when a locator is present, and the original `(article,
+  credibility 0.82)` unchanged when it isn't. The list `key` now includes the locator (not just the
+  source id), since the same source can legitimately appear more than once.
+- **Every reader normalized**: `db/schema.ts`'s new `normalizeSourceRefEntry()` maps a raw
+  `sourceRefs` array entry to `{sourceId, locator?}` regardless of whether it's the new object
+  shape or a pre-existing row's old bare id string — every reader (`db/queries.ts`'s
+  `getCourseDetail()`/`getLessonWithSources()`, `teachingEngine/answerLessonQuestion.ts`, the
+  course download bundle route) runs entries through it before use. This is reading old data the
+  way it was actually written, not backfilling a locator that was never captured for it — per the
+  kickoff's own resolved default, nothing attempts to backfill old rows.
+- **`LessonSourceRef`** (`db/queries.ts`, the joined read shape `SourceCitations.tsx` consumes)
+  gained an optional `locator` field; joining now fans out one output row per `sourceRefs` entry
+  (not deduped by source id), so two distinct locators on the same source render as two separate
+  citations, matching how they're stored.
+- **The offline download bundle** (`app/api/courses/[id]/download/route.ts`,
+  `lib/offline/types.ts`) deliberately keeps its `sourceRefs: string[]` shape unchanged — nothing in
+  the offline viewer renders a locator today, so the route just extracts and dedupes ids before
+  assigning; not a "new screen," not touched beyond that one line, per this addition's own scope
+  boundary.
+
+### Gap 3: `GRAPHITI_MCP_URL` was undocumented in `.env.example`
+
+`src/memoryGraph/graphitiClient.ts` reads `process.env.GRAPHITI_MCP_URL` (defaulting to
+`http://localhost:8000/mcp/`) and it was already correctly documented in this README's
+"Environment variables" table — but never listed in `.env.example` itself, the one file someone
+standing up their first real Docker/Graphiti instance (this project's own #1 stated outstanding
+item) would actually copy and fill in. Added, with a comment pointing at "Setting up the Memory
+Graph (Docker)" above rather than duplicating those instructions.
+
+### Gap 4: two non-breaking dependency vulnerabilities
+
+`npm audit` reported 6 findings (1 high: `fast-uri`, host-confusion/SSRF; 2 moderate: `qs`,
+DoS/array-limit bypass; the rest, `esbuild` via `drizzle-kit`). Ran `npm audit fix` (not
+`--force`) — a lockfile-only patch bump (`fast-uri` 3.1.5→3.1.7, `qs` 6.15.3→6.16.0, no
+`package.json` change, confirmed via `git diff`) resolved `fast-uri` and `qs` completely.
+`typecheck`/`lint`/`test`/`build` all confirmed clean afterward. The remaining `esbuild` finding
+(`GHSA-67mh-4wv8-2f99`, moderate — a vulnerable dev-server-only `esbuild` transitively required by
+`drizzle-kit`'s `@esbuild-kit/esm-loader`) is **accepted, not force-fixed**: it's a local
+`drizzle-kit` tooling risk (never present in the shipped app, which never runs `esbuild`'s dev
+server), and `npm audit fix --force` would downgrade `drizzle-kit` to `0.18.1` — a real breaking
+change to migration tooling, not worth the risk this close to real testing for a risk that isn't
+in the shipped app at all.
+
+### An incidental discovery while verifying Gap 1+2 together: `pdf-parse` broke `next dev`
+
+Not one of the four audited gaps, but a real, load-bearing bug found DURING this addition's own
+verification (see Definition of done below) and fixed on the spot since it would have blocked the
+very next-testing-phase this whole addition exists to unblock: `next.config.ts`'s
+`serverExternalPackages` already lists `jsdom` and `@modelcontextprotocol/sdk` specifically because
+webpack can't cleanly bundle a "large, non-trivial-to-bundle" package into the RSC graph — the
+Source Diversity phase added `pdf-parse` as a new dependency (`extraction/fetchAndCleanPdf.ts`)
+without adding it to this same list. The result: `next dev --webpack` crashed with `TypeError:
+Object.defineProperty called on non-object` while bundling `fetchAndCleanPdf.ts` for **any** page
+that transitively imports it — including `/`, the Dashboard, via `knowledgeUpdate/index.ts` →
+`extraction/fetchAndClean.ts` — a 500 on the homepage in dev mode. Confirmed this was dev-bundling-
+specific, not a real production bug: `npm run build && npm run start` never hit it (`/` correctly
+307-redirected to `/onboarding` on a fresh DB). Fixed by adding `"pdf-parse"` to
+`serverExternalPackages` (now `["@modelcontextprotocol/sdk", "jsdom", "pdf-parse"]`) — confirmed
+`next dev` serves the same page cleanly (a real 200, no error trace) afterward.
+
+### Definition of done — Pre-Real-Testing Gap Fixes
+
+**Real, live-confirmed against a real running server, not dry-run-claimed-only**:
+
+- **Ran a single scripted, real (not interactive-CLI) call through `decomposeAndPersistPath` →
+  `runOverlapDetectionForPath` → `generateTopicCourse`** — real code, the exact function chain
+  `/paths/[id]` drives, using the same mocked LLM/search/fetch machinery
+  (`src/harness/mocks.ts`'s `createMockOrchestratorRun`/`createMockFetchAndCleanWithSourceDiversity`)
+  every other dry-run demonstration in this README already uses (no real `TAVILY_API_KEY` in this
+  environment — same root cause as every prior phase). Produced a real PathTopic-generated course
+  with real modules/lessons, and — the actual point of Gap 1 — a real, queried-directly `mindMaps`
+  row whose node ids are a genuine subset of that course's real lesson ids.
+- **Confirmed Gap 2's locator threading against the SAME course's real persisted `lessons` row**:
+  its `source_refs` column genuinely contains `[{"sourceId":"src_mock_5","locator":{"type":"page",
+  "value":1}}, {"sourceId":"src_mock_5","locator":{"type":"page","value":2}}, {"sourceId":
+  "src_mock_6","locator":{"type":"timestamp","value":"0:00"}}, ...]` — queried directly via
+  `node:sqlite`, not asserted from a unit test alone — real, distinct locators stored as real,
+  distinct entries, exactly as designed.
+- **Then started a real production server (`npm run build && npm run start`) against that same
+  database and fetched `/courses/<that real course id>` over real HTTP** — the raw, real
+  server-rendered HTML genuinely contains `(pdf, page 1, credibility 0.85)` and `(video, 4:32,
+  credibility 0.85)` inside the actual `SourceCitations` markup, confirmed by locating that exact
+  text in the response body, not by trusting the component's logic alone. This is the DoD's
+  "rendered HTML, not just a passing test" bar, for a course reached through the goal-path flow
+  specifically (not just standalone `/new`).
+- **The incidental `pdf-parse`/`next dev` fix, confirmed the same way**: reproduced the crash on
+  `/courses/[id]` under `next dev --webpack` before the fix (`GET ... 500`, `Object.defineProperty
+  called on non-object`), confirmed the fix (`GET ... 200`, no error) after adding `pdf-parse` to
+  `serverExternalPackages`, on a real running dev server.
+- **Backward compatibility, unit-tested directly**: a lesson whose `sourceRefs` is still the OLD
+  bare-string-array shape (constructed by deliberately bypassing the now-updated insert type, the
+  same way earlier phases construct hard-to-naturally-produce real fixtures) reads back correctly
+  as a locator-less citation, with no crash, through both `getLessonWithSources()` and
+  `getCourseDetail()` — the Course view's own read path.
+- `npm audit` shows only the documented, accepted `esbuild`/`drizzle-kit` finding remaining.
+  `.env.example` includes `GRAPHITI_MCP_URL`.
+- All existing tests pass; new tests added for `generateTopicCourse`'s mind map step (mocked, same
+  injection pattern as its other three steps, plus a degrade-on-failure case), the migrated
+  `sourceRefs` shape's real read/write round-trip (including two distinct locators on the same
+  source, and an exact-repeat collapsing to one entry), and old-shape backward-compatible reads in
+  both `getLessonWithSources()` and `getCourseDetail()`. Full suite: 356/356 passing.
+  `npm run typecheck` clean (both configs), `npm run lint` clean, `npm run build` succeeds.
+- No changes to Course Builder's own lesson-insert logic (still correctly leaves `sourceRefs: []`
+  at insert time — verified this stays true, not modified), the Memory Graph, Quiz/Practice
+  Engines, or any new screen/agent/data-model beyond `LessonSourceRefEntry` itself.
+
+### Documented gaps
+
+- **No real, live (non-dry-run/non-mocked) goal-path generation** — same root cause as every prior
+  phase: no `TAVILY_API_KEY` in this environment. The scripted demonstration above is real code
+  (`generateTopicCourse`, `generateMindMap`, the full locator-threading path) exercising a real
+  DB write/read/render round trip; only the search results themselves are canned.
+- **The mind map's interactive React Flow canvas itself remains unverified in a real browser** —
+  the same honest gap Phase 8 already documented (no browser automation tooling in this
+  environment); this addition only closes the "does a goal-path course even GET a mind map row"
+  gap, not Phase 8's own pre-existing rendering-verification gap.
 
 ## LLM provider swap (added mid-Phase-2, not in the original kickoff prompt)
 

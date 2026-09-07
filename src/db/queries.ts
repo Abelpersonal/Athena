@@ -11,8 +11,10 @@ import {
   mindMaps,
   lessonUpdates,
   activityEvents,
+  normalizeSourceRefEntry,
   type MindMapGraph,
 } from "./schema.js";
+import type { Locator } from "../shared/locator.js";
 import { computeStreak, selectWeakestConceptLesson, isPathInactive, type StreakResult, type ReentryOffer } from "../motivation/pure.js";
 import { DEFAULT_WEAK_CONCEPT_THRESHOLD } from "../quizEngine/index.js";
 import { getRecentCourseDomains, isDomainClusterNarrow } from "../continuousLearning/index.js";
@@ -144,8 +146,10 @@ export async function getCourseDetail(courseId: string, options: { db?: TeacherD
     const detailLessons: CourseDetailLesson[] = [];
     for (const l of lessonRows) {
       const [mastery] = await db.select().from(masteryState).where(eq(masteryState.conceptNodeId, l.id));
-      const sourceRows =
-        l.sourceRefs.length > 0 ? await db.select().from(sources).where(inArray(sources.id, l.sourceRefs)) : [];
+      const refEntries = l.sourceRefs.map(normalizeSourceRefEntry);
+      const sourceIds = [...new Set(refEntries.map((r) => r.sourceId))];
+      const sourceRows = sourceIds.length > 0 ? await db.select().from(sources).where(inArray(sources.id, sourceIds)) : [];
+      const sourceById = new Map(sourceRows.map((s) => [s.id, s]));
       detailLessons.push({
         id: l.id,
         title: l.title,
@@ -154,7 +158,7 @@ export async function getCourseDetail(courseId: string, options: { db?: TeacherD
         sourceStatus: l.sourceStatus,
         knowledgeScore: mastery?.knowledgeScore ?? null,
         experienceScore: mastery?.experienceScore ?? null,
-        sourceRefs: sourceRows.map((s) => ({ id: s.id, url: s.url, type: s.type, credibilityScore: s.credibilityScore })),
+        sourceRefs: refEntriesToLessonSourceRefs(refEntries, sourceById),
       });
     }
     detailModules.push({ id: m.id, title: m.title, description: m.description, order: m.order, lessons: detailLessons });
@@ -188,6 +192,35 @@ export interface LessonSourceRef {
   url: string;
   type: "article" | "pdf" | "video" | "other" | "unreachable" | "low_confidence";
   credibilityScore: number;
+  /** Present when a key point cited this source at a specific page/timestamp (Source Diversity phase) — absent for an article, or a pdf/video source no key point happened to cite with a locator. */
+  locator?: Locator;
+}
+
+/**
+ * Joins normalized `LessonSourceRefEntry`s against their real `sources` rows, producing one
+ * `LessonSourceRef` per entry — NOT deduped by source id, since two distinct locators on the same
+ * source are meant to render as two separate citations (see `materialAggregator/index.ts`'s
+ * `buildSourceRefEntries`, the writer this mirrors). An entry whose source id has no matching row
+ * (should not happen for real data, but old/inconsistent data is exactly what this whole
+ * normalization exists for) is silently dropped rather than rendered with missing fields.
+ */
+function refEntriesToLessonSourceRefs(
+  refEntries: Array<{ sourceId: string; locator?: Locator }>,
+  sourceById: Map<string, typeof sources.$inferSelect>
+): LessonSourceRef[] {
+  return refEntries.flatMap((ref) => {
+    const row = sourceById.get(ref.sourceId);
+    if (!row) return [];
+    return [
+      {
+        id: row.id,
+        url: row.url,
+        type: row.type,
+        credibilityScore: row.credibilityScore,
+        ...(ref.locator ? { locator: ref.locator } : {}),
+      },
+    ];
+  });
 }
 
 export interface LessonWithSources {
@@ -212,15 +245,17 @@ export async function getLessonWithSources(
   const [course] = await db.select().from(courses).where(eq(courses.id, mod.courseId));
   if (!course) return null;
 
-  const sourceRows =
-    lesson.sourceRefs.length > 0 ? await db.select().from(sources).where(inArray(sources.id, lesson.sourceRefs)) : [];
+  const refEntries = lesson.sourceRefs.map(normalizeSourceRefEntry);
+  const sourceIds = [...new Set(refEntries.map((r) => r.sourceId))];
+  const sourceRows = sourceIds.length > 0 ? await db.select().from(sources).where(inArray(sources.id, sourceIds)) : [];
+  const sourceById = new Map(sourceRows.map((s) => [s.id, s]));
 
   return {
     lesson,
     moduleId: mod.id,
     courseId: course.id,
     courseTopic: course.topic,
-    sourceRefs: sourceRows.map((s) => ({ id: s.id, url: s.url, type: s.type, credibilityScore: s.credibilityScore })),
+    sourceRefs: refEntriesToLessonSourceRefs(refEntries, sourceById),
   };
 }
 
