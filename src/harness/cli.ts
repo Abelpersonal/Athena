@@ -16,7 +16,7 @@ import { slugify } from "../shared/ids.js";
 import {
   createMockOrchestratorRun,
   createMockSearchProvider,
-  mockFetchAndClean,
+  createMockFetchAndCleanWithSourceDiversity,
   createMockMaterialFetchAndClean,
   createMockBackfillSubtopic,
 } from "./mocks.js";
@@ -178,7 +178,7 @@ async function runResearchCommand(args: string[]): Promise<void> {
         ? {
             orchestratorRun: createMockOrchestratorRun(),
             searchProvider: createMockSearchProvider(),
-            fetchAndClean: mockFetchAndClean,
+            fetchAndClean: createMockFetchAndCleanWithSourceDiversity(),
           }
         : {}),
     });
@@ -222,7 +222,11 @@ async function runBuildCommand(args: string[]): Promise<void> {
     course = await runResearchPipeline(topic, {
       onProgress,
       ...(dryRun
-        ? { orchestratorRun: mockOrchestratorRun, searchProvider: createMockSearchProvider(), fetchAndClean: mockFetchAndClean }
+        ? {
+            orchestratorRun: mockOrchestratorRun,
+            searchProvider: createMockSearchProvider(),
+            fetchAndClean: createMockFetchAndCleanWithSourceDiversity(),
+          }
         : {}),
     });
   } catch (error) {

@@ -307,4 +307,56 @@ describe("runResearchPipeline", () => {
     expect(subtopic.sources.length).toBeGreaterThan(0);
     expect(subtopic.sources.every((s) => s.extractionConfidence >= 0.3)).toBe(true);
   });
+
+  it("threads a real locator from a chunked (pdf/video) source's excerpt through extract_grounded_key_points into the resulting course JSON's key points", async () => {
+    const inner = makeOrchestratorMock({ subtopics: [{ title: "Chunked Source Topic", description: "d" }] });
+    async function orchestratorRun<T = unknown>(
+      taskType: string,
+      context: Record<string, unknown>,
+      callingModule: string,
+      options?: RunOptions
+    ): Promise<OrchestratorResult<T>> {
+      if (taskType === "extract_grounded_key_points") {
+        const sources =
+          (context.sources as Array<{ source_id: string; locator?: { type: string; value: unknown } }>) ?? [];
+        const withLocator = sources.find((s) => s.locator);
+        return {
+          taskType,
+          promptVersion: "test",
+          data: {
+            keyPoints: [
+              {
+                point: "A point drawn from the PDF's page 1 excerpt.",
+                source_id: withLocator!.source_id,
+                locator: withLocator!.locator,
+              },
+            ],
+          } as unknown as T,
+          attempts: 1,
+          raw: "{}",
+        };
+      }
+      return inner<T>(taskType, context, callingModule, options);
+    }
+
+    const pdfFetchAndClean = async (): Promise<CleanedContent> => ({
+      text: "Real PDF body text long enough to pass the confidence floor. ".repeat(10),
+      title: "A Real PDF",
+      extractionConfidence: 0.9,
+      sourceType: "pdf",
+      chunks: [{ text: "Page one real text.", locator: { type: "page", value: 1 } }],
+      maxLocatorValue: 5,
+    });
+
+    const course = await runResearchPipeline("Some Topic", {
+      orchestratorRun,
+      searchProvider: fakeSearchProvider(),
+      fetchAndClean: pdfFetchAndClean,
+    });
+
+    const subtopic = course.subtopics[0]!;
+    expect(subtopic.keyPoints[0]!.locator).toEqual({ type: "page", value: 1 });
+    expect(subtopic.sources[0]!.chunks).toEqual([{ text: "Page one real text.", locator: { type: "page", value: 1 } }]);
+    expect(subtopic.sources[0]!.maxLocatorValue).toBe(5);
+  });
 });

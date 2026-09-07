@@ -20,8 +20,8 @@ functional gap.
 
 ## Contents
 
-- [Current status (Phase 11)](#current-status-phase-11) — what's built, what's real-verified vs.
-  dry-run/mocked, what's still genuinely outstanding
+- [Current status (Phase 11 + Source Diversity)](#current-status-phase-11--source-diversity) —
+  what's built, what's real-verified vs. dry-run/mocked, what's still genuinely outstanding
 - [Tech choices](#tech-choices)
 - [Setup](#setup)
 - [Running the harness](#running-the-harness)
@@ -36,28 +36,34 @@ functional gap.
 - [Phase 8: the Mind Map Agent, React Flow viewer, and starting menu](#phase-8-the-mind-map-agent-the-react-flow-viewer-and-the-starting-menu)
 - [Phase 9: the Motivation/Engagement Layer](#phase-9-the-motivationengagement-layer)
 - [Phase 10: Mobile — PWA, offline mode, background sync, and real push](#phase-10-mobile--pwa-offline-mode-background-sync-and-real-push)
-- [Phase 11: the polish pass](#phase-11-the-polish-pass) (this phase — loading/error boundaries,
-  accessibility, lint, this README rewrite)
+- [Phase 11: the polish pass](#phase-11-the-polish-pass) (loading/error boundaries, accessibility,
+  lint, README rewrite)
+- [Source Diversity: PDF + Video Transcript Support](#source-diversity-pdf--video-transcript-support-a-scoped-addition-not-a-numbered-phase)
+  (a scoped addition, not a numbered phase — real PDF/YouTube-transcript extraction, the optional
+  citation `locator`, the YouTube URL-routing bug fix)
 - [LLM provider swap](#llm-provider-swap-added-mid-phase-2-not-in-the-original-kickoff-prompt)
 - [Definition of done — status](#definition-of-done--status) (historical, Phases 1-3.5 only —
   each later phase's own "Definition of done" subsection is the record for that phase)
 - [Deviations from the spec (documented)](#deviations-from-the-spec-documented)
 
-## Current status (Phase 11)
+## Current status (Phase 11 + Source Diversity)
 
-All ten phases on the PRD's roadmap are built and individually tested; this eleventh phase is a
-polish pass, not a new feature phase (see its own section below). This is a **summary index**, not
-a re-verification — every claim here is a pointer to the fuller, phase-by-phase record already in
-this document; when in doubt, the linked phase section is the source of truth.
+All ten phases on the PRD's roadmap are built and individually tested; Phase 11 was a polish pass,
+and "Source Diversity" (below) is a scoped addition after it, not a new numbered phase — see their
+own sections below. This is a **summary index**, not a re-verification — every claim here is a
+pointer to the fuller, phase-by-phase record already in this document; when in doubt, the linked
+phase section is the source of truth.
 
 **What's built, end to end:** topic/goal intake with classify-confirm-override → multi-pass
-research with cited, volatility-tagged sources → five-layer course persistence → a Memory Graph
-of dated facts and mastery history → tiered quizzes and project/simulation/debate practice with
-auto-escalating difficulty → a goal/career Path Planner with cross-domain ordering and overlap
-detection → a Continuous Learning Agent (next-topic suggestions, verified book recommendations)
-and a Knowledge Update Agent (real-world drift detection, severity-routed digests) → a full
-Next.js frontend over all of the above → voice narration with lock-screen media controls → a
-per-course concept mind map and a fixed self-improvement starting menu → real activity tracking,
+research with cited, volatility-tagged sources (now including real PDF and YouTube-transcript
+sources with an optional page/timestamp citation locator, not just HTML articles) → five-layer
+course persistence → a Memory Graph of dated facts and mastery history → tiered quizzes and
+project/simulation/debate practice with auto-escalating difficulty → a goal/career Path Planner
+with cross-domain ordering and overlap detection → a Continuous Learning Agent (next-topic
+suggestions, verified book recommendations) and a Knowledge Update Agent (real-world drift
+detection, severity-routed digests) → a full Next.js frontend over all of the above → voice
+narration with lock-screen media controls → a per-course concept mind map and a fixed
+self-improvement starting menu → real activity tracking,
 momentum streaks, low-friction re-entry, boredom-proofing, and milestone celebration → PWA
 installability, explicit offline download, background sync of queued offline actions, and real
 Web Push for both PRD-named cases (major knowledge updates, an inactivity nudge).
@@ -3119,6 +3125,201 @@ server, and the accessibility/lint passes are real, automated, and numerically e
   feel, not explicitly audited against WCAG contrast ratios. Worth a real browser-based check.
 - **No CI pipeline** — `lint`/`typecheck`/`test` are real, working, independent scripts, but
   nothing runs them automatically on push/PR in this repo yet.
+
+## Source Diversity: PDF + Video Transcript Support (a scoped addition, not a numbered phase)
+
+Agreed in a separate planning conversation, done after Phase 11 and before moving to full
+real-API/real-device testing. The Research Agent's architecture was always meant to be extensible
+beyond HTML articles — `Source.type` (`src/db/schema.ts`) always included `"pdf"` and `"video"`,
+and `extraction/fetchAndClean.ts`'s `classifyNonHtmlContentType()` always detected them — but both
+branches just returned an empty, zero-confidence result. This closes that gap for exactly two
+source types: real PDF text extraction and real YouTube video transcripts. Podcasts, other video
+platforms, images/OCR are deliberately out of scope — not "not built yet," genuinely not attempted.
+
+### A real bug found and fixed: YouTube URLs were routed as HTML articles
+
+`classifyNonHtmlContentType()` only ever branched on the HTTP `Content-Type` header. A YouTube
+watch page's `Content-Type` is `text/html`, so every YouTube URL Tavily search surfaced — and it
+surfaces them constantly — fell straight into the Readability/JSDOM article path and either
+scraped garbage from the player page's chrome or came back empty, never reaching a transcript at
+all. Fixed with a URL-*pattern* check, `isYoutubeVideoUrl()` (`extraction/fetchAndClean.ts`),
+that runs before any HTTP request is even made — unlike PDF (which genuinely needs a real
+round-trip first; there's no reliable URL-only signal for "this is a PDF"), a video URL never
+needs its header sniffed. Recognized patterns: `youtube.com/watch`, `youtu.be/`, and
+`youtube.com/shorts/` (which redirects into the same watch flow) — documented here as the
+exhaustive list, not "at minimum" language inviting silent scope creep later.
+`tests/extraction.test.ts` proves the fix directly: a mocked transcript adapter is asserted
+called, and a `global.fetch` spy is asserted **never** called for a `youtube.com/watch` URL —
+not just "the right sourceType came back," which a coincidentally-passing article extraction
+could also produce.
+
+### Deliverable 1: an optional, additive `locator` on every citation
+
+`src/shared/locator.ts` defines `Locator = {type: "page", value: number} | {type: "timestamp",
+value: string}` — a neutral, dependency-free type (alongside `ids.ts`, `recheckInterval.ts`,
+`mastery.ts`) so `extraction/` (which has zero orchestrator dependency, by its own long-standing
+design) and `orchestrator/templates/extractGroundedKeyPoints.ts` can both depend on the same shape
+without either owning it. `ExtractGroundedKeyPointsOutputSchema`'s `keyPoints[]` gained an
+`locator: LocatorSchema.optional()` field, `SourceExcerpt` gained a matching optional `locator`
+(shown in each excerpt's header line, e.g. `... | page: 3 ---`), and the prompt now tells the
+model to copy an excerpt's locator verbatim when it draws a point from it, never invent one.
+`SourceRecord` (`research/types.ts`) gained an optional `chunks?: SourceChunk[]` (one chunk per
+page/timestamp window, each with its own optional locator) and `maxLocatorValue?: number` (the
+source's real known extent — total pages, or duration in seconds).
+
+**The grounding hard gate did not relax.** `createCitationValidator`'s source_id check
+(`research/grounding.ts`) is untouched, still the only thing that can trigger a retry — a locator
+is metadata on top of an already-valid citation, never a new pass/fail condition synthesis is
+scored against. Locator correctness gets its own function, `checkLocatorSanity`, a **soft**,
+log-only check: it warns when a cited page number exceeds a source's real known page count, or a
+cited timestamp exceeds a video's real known duration, and never returns anything the retry loop
+reads. `tests/grounding.test.ts` proves both halves: five new pure tests exercise
+`checkLocatorSanity` directly (real bound respected → silent; fabricated bound → one `console.warn`,
+never a thrown error or a failure result), while every pre-existing grounding test — including the
+two that drive a real retry loop through `orchestrator.run()` — passes completely unmodified.
+
+### Deliverable 2: real PDF extraction (`pdf-parse` v2)
+
+`src/extraction/fetchAndCleanPdf.ts`'s `parsePdf()` wraps `pdf-parse`'s real v2 `PDFParse` class
+API (the current major version — the class-based API, not v1's bare-function one). Before writing
+any integration code, the actual installed package's `.d.ts` files were read directly to confirm
+the real shape, and then verified further: a byte-accurate, valid, real 2-page PDF was hand-built
+(computing its xref table offsets programmatically, not hand-typed) and parsed for a real smoke
+test, confirming `new PDFParse({data}).getText()` returns `{pages: [{num, text}], text, total}`
+and that `getText({partial: [n]})` genuinely filters to one page. `getText()` with no filter
+already returns every page's text plus the real total page count in one call, so `parsePdf()`
+only ever needs that one call (`getText({partial})` per page was unnecessary). **Chunking
+granularity: one chunk per real page**, not grouped page ranges — the documents this project
+researches (papers, reports) are short enough that per-page is already a reasonable prompt-sized
+unit, and it's the PDF's own natural structural boundary, unlike video captions (see below). A
+scanned/image-only PDF is real, reachable, valid PDF bytes that `pdf-parse` (no OCR — genuinely
+not attempted, per scope) parses down to near-empty text per page; it's run through the exact same
+length-based confidence heuristic (`MIN_USABLE_TEXT_LENGTH`/`CONFIDENT_TEXT_LENGTH`) a thin HTML
+article already uses, degrading to `emptyResult("pdf")` — logged, excluded, never a crash. Every
+PDF-path test (`tests/extraction.test.ts`, `tests/fetchAndCleanPdf.test.ts`) mocks `PDFParse`/
+`parsePdf` — no real PDF is fetched or parsed in the test suite.
+
+### Deliverable 3: real YouTube transcript retrieval (`@sinco-lab/mcp-youtube-transcript`)
+
+`src/mcp/youtubeTranscript.ts` mirrors `mcp/webSearch.ts`'s `SearchProvider` pattern exactly:
+a `TranscriptProvider` interface, a `YoutubeTranscriptMCPProvider` class (same
+`client`/`connecting`/`ensureConnectedSafe`/`connect` shape), a module singleton, and a bare
+`getTranscript()` export — launched the same way Tavily's MCP server is, `npx -y <package>` over
+stdio, and **not** added as a `package.json` dependency, matching the existing convention
+(`tavily-mcp` isn't one either; `npx` fetches/caches it on demand). No API key needed for either
+new dependency. Rather than trust the kickoff's own description of the tool, the real published
+package was downloaded (`npm pack`) and its compiled source read directly — this is what revealed
+the correct tool is `get_timed_transcript` (not the more obviously-named `get_transcripts`, which
+returns non-timestamped prose), returning one text block (`"# {title}\n\n[HH:MM:SS.mmm]
+caption\n..."`) plus a `_meta.totalDuration` in seconds, parsed by regex rather than assumed to be
+JSON.
+
+**Caption chunking: grouped into ~3-minute windows, not one chunk per raw caption line.** A real
+transcript's raw lines are only a few seconds apart — a hand-typed first draft mapped each raw
+line directly to a chunk, which would fan out into hundreds of tiny `SourceExcerpt`s (mostly
+per-excerpt header overhead around a few words of real caption) for any real video longer than a
+few minutes; caught and fixed before shipping. `youtubeTranscript.ts`'s `groupIntoWindows()`
+concatenates consecutive raw caption lines into fixed 180-second windows (a judgment call,
+documented here rather than left implicit), each window's `text` the joined captions and its
+`timestamp` its first real caption's own timestamp — keeping a video's chunk count in the same
+rough ballpark as a PDF's page count. `TranscriptResult.segments` still preserves real timestamped
+structure (never flattened to one blob of prose) — grouped, not discarded. A captionless/private/
+age-restricted video degrades to `null` (logged, not thrown); `fetchAndClean.ts`'s
+`fetchAndCleanVideo` treats that the same as `emptyResult("video")`. `tests/youtubeTranscript.test.ts`
+mocks the MCP client and covers the real response parsing, the windowing behavior specifically
+(a dedicated test with raw lines placed to land in three different windows), the fallback total-
+duration computation, and every failure path — no real MCP server is ever launched in the test
+suite.
+
+No dedicated "search YouTube" retrieval path was built — Tavily's existing search already surfaces
+YouTube URLs organically (confirmed by this phase's own dry-run and by how often Tavily results
+already needed the URL-routing fix above). If real topics turn out to rarely surface video results
+in practice, a dedicated video-oriented query variant is a natural, cheap follow-up — noted, not
+built speculatively now.
+
+### Material Aggregator: confirmed unmodified, exactly as scoped
+
+`materialAggregator/index.ts` was read, not edited. Its `countValid()` only counts
+`type === "article"` sources for the below-threshold/backfill trigger — unrelated, pre-existing,
+unchanged behavior — while `insertSource()` persists **any** `cleaned.sourceType` unconditionally.
+A PDF/video source is therefore already correctly persisted as a real `sources` DB row with zero
+code changes here; it simply doesn't count toward the "valid sources per lesson" threshold, same
+as before this phase existed. Verified directly (see Definition of done below), not just reasoned
+about.
+
+### What was verified real vs. mocked
+
+- **Real, live-verified**: `pdf-parse` v2's actual API shape (read from installed `.d.ts` files)
+  and its actual parsing behavior (a hand-built, byte-accurate real PDF, parsed for a real smoke
+  test, both cleaned up afterward). `@sinco-lab/mcp-youtube-transcript`'s actual published,
+  compiled source (`npm pack` + extraction, read directly, cleaned up afterward) — confirming the
+  real tool name and real response text/metadata shape.
+- **Dry-run-seeded, not live**: same situation as every other phase in this README —
+  `TAVILY_API_KEY` has never been set in this environment (see "Current status" above), so a
+  genuinely real research run (a live Tavily search that happens to surface a real PDF and a real
+  YouTube video) has never been exercised. Instead, `npm run harness -- research --dry-run` and
+  `build --dry-run` were extended (`src/harness/mocks.ts`'s new
+  `createMockFetchAndCleanWithSourceDiversity`, layered on top of the existing canned mock wiring,
+  deterministic regardless of topic) to make two of the pipeline's canned mock-source URLs
+  resolve as a real-shaped chunked PDF and a real-shaped chunked video instead of a plain article.
+  Running `research --dry-run` produced a subtopic whose `sources[]` includes a real `chunks`
+  array (two page-locator chunks, `maxLocatorValue: 2`) and whose `keyPoints[]` include entries
+  citing it with a real `locator: {type: "page", value: 1}` / `{type: "page", value: 2}`, plus a
+  second source with three timestamp-locator chunks and matching `{type: "timestamp", value:
+  "4:32"}`-style key points — inspected directly from the written `output/*.dry-run.json`, not
+  asserted from memory. Running `build --dry-run` (which additionally runs Course Builder +
+  Material Aggregator, both real code, against an isolated `data/teacher.dry-run.db`) was then
+  queried directly (`node:sqlite`) and confirmed two real persisted `sources` rows with
+  `type = 'pdf'` and `type = 'video'` and real, non-empty `extracted_text` — the actual DB-level
+  proof, not an inference from the log line saying so. `knowledge-update --dry-run` deliberately
+  keeps using the original, unmodified `mockFetchAndClean` — this phase's mock changes are
+  additive to `research`/`build`, not something every dry-run entrypoint needed.
+
+### Definition of done — Source Diversity
+
+- [x] URL-routing bug fixed and proven by a real unit test (mocked transcript adapter called;
+      a `global.fetch` spy asserted never called for a YouTube URL), not just a passing sourceType
+      assertion.
+- [x] Real PDF text extraction, with per-page chunks/locators, backed by a real, verified
+      `pdf-parse` v2 integration; scanned/image-only PDFs degrade to excluded/low-confidence, no
+      OCR added.
+- [x] Real YouTube transcript retrieval via a verified MCP tool call, with captions grouped into
+      real, reasonably-sized (~3 min) timestamped chunks rather than one excerpt per raw line.
+- [x] `locator` is optional and additive everywhere it appears; `createCitationValidator`'s
+      source_id check is untouched and still the only hard grounding gate — proven by the full,
+      unmodified pre-existing `tests/grounding.test.ts` suite passing, plus new tests for the new
+      soft `checkLocatorSanity` check and its non-blocking behavior.
+- [x] Material Aggregator required zero code changes — confirmed by reading its code (the
+      `countValid()`/`insertSource()` distinction) and then confirmed for real: a `build --dry-run`
+      persisted real `sources` rows with `type = 'pdf'`/`type = 'video'`, queried directly from
+      the resulting SQLite file.
+- [x] A dry-run-seeded research run demonstrably produced a subtopic with a real chunked PDF
+      source and a key point citing `locator: {type: "page", ...}`, and a real chunked video
+      source with a key point citing `locator: {type: "timestamp", ...}` — inspected directly from
+      the written course JSON.
+- [x] All existing tests pass unmodified where the scope required it (`tests/grounding.test.ts`,
+      `tests/materialAggregator.test.ts`); new tests added for PDF extraction/confidence scoring,
+      the transcript adapter's real response parsing and its caption-windowing behavior, the
+      URL-routing fix, and optional-locator schema/soft-check handling. Full suite: 347/347
+      passing. `npm run typecheck` clean on both configs; `npm run lint` clean.
+- [x] No changes to Course Builder, Material Aggregator's persistence logic, the Memory Graph,
+      Quiz/Practice Engines, the Goal Planner, the Continuous Learning/Knowledge Update Agents, or
+      any frontend screen. The only files touched outside `src/research/`/`src/extraction/`/the
+      one new MCP adapter (`src/mcp/youtubeTranscript.ts`) are `src/shared/locator.ts` (a small,
+      neutral shared type, same convention as this directory's existing files) and
+      `src/harness/mocks.ts`/`src/harness/cli.ts` (the dry-run demonstration harness itself,
+      needed to seed the DoD's real-run demonstration given no live `TAVILY_API_KEY`).
+
+### Documented gaps
+
+- **No real, live (non-dry-run) research run** — same root cause as every other phase: no
+  `TAVILY_API_KEY` in this environment. The dry-run-seeded demonstration above is real code
+  exercising a real chunking/locator/persistence path end to end; only the search results
+  themselves are canned rather than a live Tavily response that happens to surface a PDF/video.
+- **No dedicated video-oriented search query variant** — noted as a candidate follow-up above,
+  not built now, since it wasn't yet clear real topics need it.
+- **Podcasts, other video platforms, images/OCR remain fully out of scope** — not partially built,
+  not stubbed, genuinely untouched, exactly as scoped.
 
 ## LLM provider swap (added mid-Phase-2, not in the original kickoff prompt)
 

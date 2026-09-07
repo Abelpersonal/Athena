@@ -2,6 +2,13 @@ import type { SynthesizeSubtopicOutput } from "../orchestrator/templates/synthes
 import type { RestructureLayersOutput } from "../orchestrator/templates/restructureLayers.js";
 import type { DepthAuditScoreOutput } from "../orchestrator/templates/depthAuditScore.js";
 import type { ExtractGroundedKeyPointsOutput } from "../orchestrator/templates/extractGroundedKeyPoints.js";
+import type { Locator } from "../shared/locator.js";
+
+/** One page (PDF)/timestamp segment (video) of a `SourceRecord`'s text, carrying the locator that anchors it — mirrors `extraction/fetchAndClean.ts`'s `ContentChunk`, kept as a separate type so `research/` doesn't import from `extraction/` for it. */
+export interface SourceChunk {
+  text: string;
+  locator?: Locator;
+}
 
 /** One piece of fetched-and-cleaned source material used to research a subtopic. */
 export interface SourceRecord {
@@ -15,6 +22,10 @@ export interface SourceRecord {
   query: string;
   role: "initial" | "contention";
   publishedDate?: string;
+  /** Per-page/per-timestamp-segment breakdown, present only for "pdf"/"video" sources — `pipeline.ts`'s `toSourceExcerpts` fans this out into multiple tagged `SourceExcerpt`s instead of the source's one flat `text` blob. Absent (undefined) for "article" sources, exactly like before this field existed. */
+  chunks?: SourceChunk[];
+  /** The source's own known real extent (PDF page count / video duration in seconds) — used only by `grounding.ts`'s soft `checkLocatorSanity` check, never for citation validation. */
+  maxLocatorValue?: number;
 }
 
 export interface AuditPassRecord {

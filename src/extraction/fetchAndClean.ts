@@ -1,5 +1,8 @@
 import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
+import type { Locator } from "../shared/locator.js";
+import { parsePdf as parsePdfDefault, type ParsePdfFn } from "./fetchAndCleanPdf.js";
+import { getTranscript as getTranscriptDefault, type TranscriptProvider } from "../mcp/youtubeTranscript.js";
 
 /**
  * Coarse, honestly-derived source category — grounded in what the fetch
@@ -14,6 +17,12 @@ import { Readability } from "@mozilla/readability";
  */
 export type SourceType = "article" | "pdf" | "video" | "other" | "unreachable" | "low_confidence";
 
+/** One real chunk of a "pdf"/"video" source's text — a page or a caption-timestamp window — with the locator that anchors it. Absent for "article"/"other" sources, exactly like today (a single flat `text` blob, no chunking concept at all). */
+export interface ContentChunk {
+  text: string;
+  locator?: Locator;
+}
+
 /**
  * Result of a content-extraction attempt. Always resolves — never rejects
  * and never returns null — so callers uniformly check extractionConfidence
@@ -26,15 +35,26 @@ export interface CleanedContent {
   title: string;
   extractionConfidence: number;
   sourceType: SourceType;
+  /** Per-page (PDF)/per-timestamp-segment (video) breakdown, when the source type supports it — threaded into `SourceRecord.chunks` (src/research/types.ts) by `research/pipeline.ts`, which fans it out into multiple tagged `SourceExcerpt`s for `extract_grounded_key_points` instead of one flat excerpt. */
+  chunks?: ContentChunk[];
+  /** The source's own known real extent (PDF page count / video duration in whole seconds) — carried alongside `chunks` purely for the locator sanity check (src/research/grounding.ts); never used for citation validation itself. */
+  maxLocatorValue?: number;
 }
 
 const FETCH_TIMEOUT_MS = 15_000;
 const USER_AGENT =
   "TeacherResearchBot/0.1 (+personal educational research project; single on-demand fetch, no crawling)";
-/** Below this, Readability's output is too thin to trust even if it "succeeded". */
+/** Below this, Readability's output is too thin to trust even if it "succeeded". Also reused for the PDF/video text-length confidence heuristic (Deliverables 2/3) — one definition of "usable enough to cite", not a second one that could drift. */
 const MIN_USABLE_TEXT_LENGTH = 200;
 /** At/above this length, confidence caps out at 1. */
 const CONFIDENT_TEXT_LENGTH = 3000;
+
+export interface FetchAndCleanOptions {
+  /** Injectable for tests. Default: the real `pdf-parse`-backed extractor (src/extraction/fetchAndCleanPdf.ts). */
+  parsePdf?: ParsePdfFn;
+  /** Injectable for tests. Default: the real YouTube transcript MCP adapter (src/mcp/youtubeTranscript.ts). */
+  getTranscript?: TranscriptProvider["getTranscript"];
+}
 
 function emptyResult(sourceType: SourceType): CleanedContent {
   return { text: "", title: "", extractionConfidence: 0, sourceType };
@@ -47,16 +67,113 @@ function classifyNonHtmlContentType(contentType: string): SourceType {
 }
 
 /**
- * Fetches a URL and extracts its main article content via Readability.js.
- * This is a lightweight, in-process version of what Phase 3's Material
- * Aggregator will later persist/cache — kept as a standalone module with
- * this exact signature so that phase can extend it (e.g. add a Trafilatura
- * fallback for low-confidence pages) rather than replace it.
+ * The real bug this phase fixes: a YouTube watch page's `Content-Type` is `text/html` — Tavily
+ * search surfaces YouTube URLs constantly, and before this check existed, one of those URLs fell
+ * straight into the Readability/article path below and got whatever garbage Readability scraped
+ * from a video player page's chrome (or a low-confidence empty result), never reaching the
+ * transcript adapter at all. Checked by URL PATTERN, before any HTTP request is even made — a
+ * video URL never needs its `Content-Type` header sniffed, unlike PDF (which genuinely does need
+ * a real HTTP round-trip first, since there's no reliable URL-only signal for "this is a PDF").
+ * `youtube.com/watch`, `youtu.be/` (and `/shorts/`, which redirects to the same watch flow) are
+ * the patterns recognized — documented here as the exhaustive list, not "at minimum" language
+ * that invites silent scope creep.
+ */
+function isYoutubeVideoUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  const host = parsed.hostname.replace(/^www\./, "");
+  if (host === "youtu.be") return parsed.pathname.length > 1;
+  if (host === "youtube.com" || host === "m.youtube.com") {
+    return parsed.pathname === "/watch" || parsed.pathname.startsWith("/shorts/");
+  }
+  return false;
+}
+
+async function fetchAndCleanVideo(url: string, getTranscript: TranscriptProvider["getTranscript"]): Promise<CleanedContent> {
+  const transcript = await getTranscript(url);
+  if (!transcript || transcript.segments.length === 0) {
+    console.warn(`[extraction] No transcript available for video ${url}`);
+    return emptyResult("video");
+  }
+
+  const text = transcript.segments.map((s) => s.text).join(" ");
+  const extractionConfidence = scoreConfidence(text, transcript.title);
+  if (extractionConfidence === 0) {
+    console.warn(`[extraction] Video transcript for ${url} was too short to be usable`);
+    return emptyResult("video");
+  }
+
+  return {
+    text,
+    title: transcript.title,
+    extractionConfidence,
+    sourceType: "video",
+    chunks: transcript.segments.map((s) => ({ text: s.text, locator: { type: "timestamp", value: s.timestamp } })),
+    maxLocatorValue: transcript.totalDurationSeconds,
+  };
+}
+
+async function fetchAndCleanPdfResponse(response: Response, parsePdf: ParsePdfFn): Promise<CleanedContent> {
+  let buffer: ArrayBuffer;
+  try {
+    buffer = await response.arrayBuffer();
+  } catch (error) {
+    console.warn(`[extraction] Failed to read PDF body: ${(error as Error).message}`);
+    return emptyResult("unreachable");
+  }
+
+  let parsed: Awaited<ReturnType<ParsePdfFn>>;
+  try {
+    parsed = await parsePdf(buffer);
+  } catch (error) {
+    console.warn(`[extraction] PDF parsing failed: ${(error as Error).message}`);
+    return emptyResult("pdf");
+  }
+
+  const text = parsed.text.trim();
+  const extractionConfidence = scoreConfidence(text, "");
+  if (extractionConfidence === 0) {
+    // Includes the scanned/image-only case: real, reachable PDF bytes that parse to near-empty
+    // text per page — no OCR here (scope boundary), so this degrades exactly like a thin HTML
+    // article does, excluded rather than failing the pipeline.
+    console.warn(`[extraction] PDF at produced too little extractable text (${text.length} chars) — likely scanned/image-only, no OCR performed`);
+    return emptyResult("pdf");
+  }
+
+  return {
+    text,
+    title: "",
+    extractionConfidence,
+    sourceType: "pdf",
+    chunks: parsed.chunks.map((c) => ({ text: c.text, locator: { type: "page", value: c.pageNumber } })),
+    maxLocatorValue: parsed.totalPages,
+  };
+}
+
+/**
+ * Fetches a URL and extracts its main content — article text via Readability.js, or (this
+ * phase's addition) real PDF text via `pdf-parse` / a real YouTube transcript via MCP, depending
+ * on what the URL/response actually is. This is a lightweight, in-process version of what Phase
+ * 3's Material Aggregator later persists/caches — kept as a standalone module with this exact
+ * signature (now with an additive, optional-only `options` param) so that phase can extend it
+ * rather than replace it; Material Aggregator itself needed ZERO changes for PDF/video support —
+ * it already just calls this same function and persists whatever `sourceType` comes back.
  *
  * No Trafilatura fallback in this phase (documented gap, not built) — a
  * low-confidence result is simply excluded from the caller's source set.
  */
-export async function fetchAndClean(url: string): Promise<CleanedContent> {
+export async function fetchAndClean(url: string, options: FetchAndCleanOptions = {}): Promise<CleanedContent> {
+  const getTranscript = options.getTranscript ?? getTranscriptDefault;
+  const parsePdf = options.parsePdf ?? parsePdfDefault;
+
+  if (isYoutubeVideoUrl(url)) {
+    return fetchAndCleanVideo(url, getTranscript);
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
@@ -67,7 +184,7 @@ export async function fetchAndClean(url: string): Promise<CleanedContent> {
       redirect: "follow",
       headers: {
         "User-Agent": USER_AGENT,
-        Accept: "text/html,application/xhtml+xml",
+        Accept: "text/html,application/xhtml+xml,application/pdf",
       },
     });
   } catch (error) {
@@ -84,8 +201,12 @@ export async function fetchAndClean(url: string): Promise<CleanedContent> {
 
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.includes("html")) {
+    const nonHtmlType = classifyNonHtmlContentType(contentType);
+    if (nonHtmlType === "pdf") {
+      return fetchAndCleanPdfResponse(response, parsePdf);
+    }
     console.warn(`[extraction] Skipping non-HTML content-type "${contentType}" for ${url}`);
-    return emptyResult(classifyNonHtmlContentType(contentType));
+    return emptyResult(nonHtmlType);
   }
 
   let html: string;
@@ -124,6 +245,8 @@ export async function fetchAndClean(url: string): Promise<CleanedContent> {
  * Confidence heuristic for v1: mostly a function of extracted text length,
  * with a small bonus for a non-empty title. Not a rigorous classifier —
  * good enough to gate "usable enough to cite" vs. "exclude this source".
+ * Reused as-is for PDF/video text (Deliverables 2/3) — one definition of
+ * "usable", not a second heuristic per source type.
  */
 function scoreConfidence(text: string, title: string): number {
   if (text.length < MIN_USABLE_TEXT_LENGTH) return 0;

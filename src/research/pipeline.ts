@@ -2,7 +2,7 @@ import { run as orchestratorRun } from "../orchestrator/index.js";
 import { webSearch } from "../mcp/webSearch.js";
 import type { SearchProvider, SearchResult } from "../mcp/webSearch.js";
 import { fetchAndClean as fetchAndCleanDefault } from "../extraction/fetchAndClean.js";
-import { createCitationValidator } from "./grounding.js";
+import { createCitationValidator, checkLocatorSanity } from "./grounding.js";
 import { assignUniqueIds } from "../shared/ids.js";
 import type { CourseJson, SourceRecord, SubtopicResult, AuditPassRecord } from "./types.js";
 import type { DecomposeTopicOutput } from "../orchestrator/templates/decomposeTopic.js";
@@ -293,7 +293,7 @@ async function gatherSources(input: ResearchPassInput): Promise<GatherSourcesRes
     const initialValidIds = new Set(initialSources.map((s) => s.source_id));
     const result = await run<ExtractGroundedKeyPointsOutput>(
       "extract_grounded_key_points",
-      { subtopicTitle: input.subtopicTitle, sources: initialSources.map(toSourceExcerpt), gapInstruction },
+      { subtopicTitle: input.subtopicTitle, sources: initialSources.flatMap(toSourceExcerpts), gapInstruction },
       "research-agent",
       {
         validateExtra: createCitationValidator(initialValidIds, (data) =>
@@ -302,6 +302,12 @@ async function gatherSources(input: ResearchPassInput): Promise<GatherSourcesRes
       }
     );
     extracted = result.data;
+
+    // Soft check only (never blocks/retries) — see grounding.ts's checkLocatorSanity doc comment.
+    const maxLocatorValueBySourceId = new Map(
+      initialSources.filter((s) => s.maxLocatorValue !== undefined).map((s) => [s.source_id, s.maxLocatorValue!])
+    );
+    checkLocatorSanity(extracted.keyPoints, maxLocatorValueBySourceId);
   }
 
   // 2e: contention-focused queries
@@ -352,7 +358,7 @@ async function researchPass(input: ResearchPassInput): Promise<ResearchPassResul
     {
       subtopicTitle: input.subtopicTitle,
       groundedKeyPoints: keyPoints,
-      contentionMaterial: contentionSources.map(toSourceExcerpt),
+      contentionMaterial: contentionSources.flatMap(toSourceExcerpts),
       validSourceIds: [...allValidIds],
       gapInstruction,
       goalContext: input.goalContext,
@@ -530,6 +536,8 @@ async function fetchAndCleanResults(
         query: r.query,
         role,
         ...(r.publishedDate ? { publishedDate: r.publishedDate } : {}),
+        ...(content.chunks ? { chunks: content.chunks } : {}),
+        ...(content.maxLocatorValue !== undefined ? { maxLocatorValue: content.maxLocatorValue } : {}),
       };
     })
   );
@@ -549,13 +557,31 @@ function truncateForPrompt(text: string): string {
   return `${text.slice(0, MAX_SOURCE_TEXT_CHARS)}\n...[truncated]`;
 }
 
-function toSourceExcerpt(source: SourceRecord): SourceExcerpt {
-  return {
+/**
+ * A chunked (PDF/video) source fans out into one `SourceExcerpt` per chunk — each tagged with the
+ * same `source_id` (grounding validates against that, unchanged) but its own `locator`, so the
+ * model can cite a specific page/timestamp rather than the source as an undifferentiated whole.
+ * A source with no `chunks` (every article, and any pdf/video that degraded to flat text) falls
+ * back to exactly one excerpt with no locator — byte-identical to the old `toSourceExcerpt()`.
+ */
+function toSourceExcerpts(source: SourceRecord): SourceExcerpt[] {
+  if (!source.chunks || source.chunks.length === 0) {
+    return [
+      {
+        source_id: source.source_id,
+        url: source.url,
+        title: source.title,
+        text: truncateForPrompt(source.text),
+      },
+    ];
+  }
+  return source.chunks.map((chunk) => ({
     source_id: source.source_id,
     url: source.url,
     title: source.title,
-    text: truncateForPrompt(source.text),
-  };
+    text: truncateForPrompt(chunk.text),
+    ...(chunk.locator ? { locator: chunk.locator } : {}),
+  }));
 }
 
 function extractSynthesisCitations(data: unknown): string[] {

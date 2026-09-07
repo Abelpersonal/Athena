@@ -46,6 +46,75 @@ export async function mockFetchAndClean(url: string): Promise<CleanedContent> {
 }
 
 /**
+ * Real-shaped canned PDF (n === 5) / video (n === 6) content for mock-source URLs, shared by
+ * `createMockFetchAndCleanWithSourceDiversity` (the research pipeline's own fetch pass) and
+ * `createMockMaterialFetchAndClean` (Material Aggregator's independent re-fetch-and-persist
+ * pass) below, so both dry-run paths demonstrate the SAME two sources landing as real `type:
+ * "pdf"`/`type: "video"` — one in the course JSON's key points (with a real page/timestamp
+ * locator), the other in the persisted `sources` DB row (with a real `type` column value) — for
+ * the source-diversity phase's DoD. Returns null for any other n, telling the caller to fall back
+ * to its own default (plain article) behavior.
+ */
+function mockPdfOrVideoContent(n: number, url: string): CleanedContent | null {
+  if (n === 5) {
+    const pageText = (page: number) =>
+      `Canned mock PDF page ${page} text standing in for real extracted PDF content at ${url}. `.repeat(10);
+    return {
+      text: `${pageText(1)}\n${pageText(2)}`,
+      title: `Mock PDF for ${url}`,
+      extractionConfidence: 0.85,
+      sourceType: "pdf",
+      chunks: [
+        { text: pageText(1), locator: { type: "page", value: 1 } },
+        { text: pageText(2), locator: { type: "page", value: 2 } },
+      ],
+      maxLocatorValue: 2,
+    };
+  }
+
+  if (n === 6) {
+    const segments = [
+      { timestamp: "0:00", text: "Canned mock caption introducing the topic." },
+      { timestamp: "4:32", text: "Canned mock caption standing in for the video's main point." },
+      { timestamp: "9:15", text: "Canned mock caption wrapping up the video." },
+    ];
+    return {
+      text: segments.map((s) => s.text).join(" "),
+      title: `Mock Video for ${url}`,
+      extractionConfidence: 0.85,
+      sourceType: "video",
+      chunks: segments.map((s) => ({ text: s.text, locator: { type: "timestamp", value: s.timestamp } })),
+      maxLocatorValue: 600,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * A drop-in variant of `mockFetchAndClean` for the research pipeline's own fetch pass in
+ * `npm run harness -- research --dry-run "<topic>"` and `build --dry-run "<topic>"`
+ * (source-diversity phase demo) — `knowledge-update --dry-run` keeps using the plain
+ * `mockFetchAndClean` above, unmodified, so its existing wiring demonstration is unaffected.
+ *
+ * With the fixed 3-subtopic, 2-query-per-pass mock wiring (see createMockOrchestratorRun) and
+ * "Mock Subtopic One"'s forced first-audit-failure (also below), that subtopic's SURVIVING
+ * research pass (the retry — the failed first attempt's sources are discarded, never reaching the
+ * final course JSON) always consumes mock-source-5 through mock-source-8. mock-source-5/6 (both in
+ * that retry's INITIAL pass, which is what feeds extract_grounded_key_points and thus keyPoints)
+ * becoming a real-shaped PDF and video source (see mockPdfOrVideoContent above) is deterministic
+ * on every run regardless of topic, and demonstrates both flowing all the way through to the final
+ * CourseJson's key points with a real page/timestamp locator — the source-diversity phase's DoD.
+ */
+export function createMockFetchAndCleanWithSourceDiversity(): FetchAndCleanFn {
+  return async (url: string): Promise<CleanedContent> => {
+    const match = /mock-source-(\d+)/.exec(url);
+    const n = match ? Number(match[1]) : 0;
+    return mockPdfOrVideoContent(n, url) ?? mockFetchAndClean(url);
+  };
+}
+
+/**
  * Forces the pipeline's FIRST subtopic to fail its depth audit on the first
  * pass and pass on the retry, so a dry run visibly demonstrates the audit
  * retry path (step 3/4) rather than only ever taking the happy path.
@@ -83,9 +152,17 @@ export function createMockOrchestratorRun(): OrchestratorRunFn {
         return respond({ queries: ["mock query one", "mock query two"] });
 
       case "extract_grounded_key_points": {
-        const sources = (context.sources as Array<{ source_id: string }>) ?? [];
+        // Mirrors the real prompt's instruction: copy the excerpt's own locator (if it has one)
+        // verbatim onto the key point, rather than inventing one — same real source_diversity
+        // behavior a real model is asked for, applied here to the canned excerpts.
+        const sources =
+          (context.sources as Array<{ source_id: string; locator?: { type: string; value: unknown } }>) ?? [];
         return respond({
-          keyPoints: sources.map((s, i) => ({ point: `Mock key point ${i + 1}`, source_id: s.source_id })),
+          keyPoints: sources.map((s, i) => ({
+            point: `Mock key point ${i + 1}`,
+            source_id: s.source_id,
+            ...(s.locator ? { locator: s.locator } : {}),
+          })),
         });
       }
 
@@ -308,7 +385,13 @@ export function createMockGutenbergProvider(): CheckGutenbergFn {
  * starts at 9. Those four (9-12) are deliberately forced "unreachable" here
  * so that lesson lands at 0 valid sources and the backfill trigger actually
  * fires during a dry run, demonstrating that path without spending real
- * API/search calls. Every other source re-fetches as a normal valid article.
+ * API/search calls. mock-source-5/6 (the same two the research pipeline's own
+ * `createMockFetchAndCleanWithSourceDiversity` treats as a PDF/video, see
+ * above) are re-fetched here as the SAME pdf/video shapes, so Material
+ * Aggregator's own persistence path also demonstrates a real, persisted
+ * `sources` DB row with `type: "pdf"`/`type: "video"` — not just the research
+ * pipeline's in-memory CourseJson. Every other source re-fetches as a normal
+ * valid article.
  */
 export function createMockMaterialFetchAndClean(): FetchAndCleanFn {
   return async (url: string): Promise<CleanedContent> => {
@@ -317,12 +400,14 @@ export function createMockMaterialFetchAndClean(): FetchAndCleanFn {
     if (n >= 9 && n <= 12) {
       return { text: "", title: "", extractionConfidence: 0, sourceType: "unreachable" };
     }
-    return {
-      text: `Canned mock article text standing in for the real page at ${url}. `.repeat(30),
-      title: `Mock title for ${url}`,
-      extractionConfidence: 0.9,
-      sourceType: "article",
-    };
+    return (
+      mockPdfOrVideoContent(n, url) ?? {
+        text: `Canned mock article text standing in for the real page at ${url}. `.repeat(30),
+        title: `Mock title for ${url}`,
+        extractionConfidence: 0.9,
+        sourceType: "article",
+      }
+    );
   };
 }
 

@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createCitationValidator } from "../src/research/grounding.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { createCitationValidator, checkLocatorSanity } from "../src/research/grounding.js";
 import type { SynthesizeSubtopicOutput } from "../src/orchestrator/templates/synthesizeSubtopic.js";
 
 const mockCall = vi.fn();
@@ -40,6 +40,65 @@ describe("createCitationValidator (pure)", () => {
       // The invalid id should be named once, not three times.
       expect(result.error.match(/\bz\b/g)?.length).toBe(1);
     }
+  });
+});
+
+describe("checkLocatorSanity (pure, soft check — never a ValidateExtraResult, never blocks/retries)", () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it("does not warn for a real page locator within the source's known page count", () => {
+    checkLocatorSanity(
+      [{ source_id: "src_1", locator: { type: "page", value: 2 } }],
+      new Map([["src_1", 5]])
+    );
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not warn for a real timestamp locator within the source's known duration", () => {
+    checkLocatorSanity(
+      [{ source_id: "src_1", locator: { type: "timestamp", value: "4:32" } }],
+      new Map([["src_1", 600]])
+    );
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("logs a warning (does not throw, does not return a failure) for a fabricated page number beyond the source's real page count", () => {
+    expect(() =>
+      checkLocatorSanity(
+        [{ source_id: "src_1", locator: { type: "page", value: 99 } }],
+        new Map([["src_1", 5]])
+      )
+    ).not.toThrow();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0]?.[0]).toContain("page 99");
+  });
+
+  it("logs a warning for a fabricated timestamp beyond the video's real duration", () => {
+    checkLocatorSanity(
+      [{ source_id: "src_1", locator: { type: "timestamp", value: "59:00" } }],
+      new Map([["src_1", 600]])
+    );
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0]?.[0]).toContain("59:00");
+  });
+
+  it("skips key points with no locator and sources with no known bound, without warning", () => {
+    checkLocatorSanity(
+      [
+        { source_id: "src_1" },
+        { source_id: "src_unknown", locator: { type: "page", value: 999 } },
+      ],
+      new Map([["src_1", 5]])
+    );
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 });
 
