@@ -59,4 +59,15 @@ export interface CourseJson {
   generatedAt: string;
   /** Phase 5: the goal/domain framing this run was biased toward, when runResearchPipeline() was called with a goalContext option — undefined for every standalone Phase 1-4 call. Threaded through to buildCourse() -> courses.goalContext. */
   goalContext?: string;
+  /**
+   * The result of the decomposition-completeness audit (Coverage Completeness Audit addition) —
+   * a SEPARATE check from any per-subtopic `auditStatus` above: this one asks whether the proposed
+   * SUBTOPIC LIST itself was missing a whole sub-area, not whether one subtopic's content is deep
+   * enough. "gaps_noted_after_retry" means the audit still reported a real gap after one retry
+   * (which already appended whatever it found on the first attempt) — the course ships anyway,
+   * flagged, rather than looping indefinitely or blocking generation.
+   */
+  coverageStatus: "complete" | "gaps_noted_after_retry";
+  /** The completeness audit's own final assessment string, kept for operator/debug visibility of what "gaps_noted_after_retry" actually found — the same real text logged via onProgress during the run. */
+  coverageNotes?: string;
 }

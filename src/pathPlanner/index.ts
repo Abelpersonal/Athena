@@ -11,7 +11,12 @@ import {
   type DetermineCrossDomainDependenciesOutput,
   type CrossDomainTopicRef,
 } from "../orchestrator/templates/determineCrossDomainDependencies.js";
-import { computeCrossDomainOrder, PathPlannerError, type OrderableTopic } from "./ordering.js";
+import {
+  computeCrossDomainOrder,
+  partitionDomainsIntoPhases,
+  PathPlannerError,
+  type OrderableTopic,
+} from "./ordering.js";
 import {
   resolveOverlapForTopic as resolveOverlapForTopicDefault,
   type ResolveOverlapOptions,
@@ -83,20 +88,62 @@ export interface PersistedPathResult {
   topicCount: number;
 }
 
+export interface RawGoalDecompositionDomain {
+  tempId: string;
+  name: string;
+}
+
+export interface RawGoalDecompositionTopic {
+  tempId: string;
+  domainTempId: string;
+  topicName: string;
+  description: string;
+  order: number;
+  parallelGroup: string;
+}
+
 /**
- * Runs both of Deliverable 2's [LLM] steps (decompose into domains/topics,
- * then determine cross-domain dependency edges), turns the raw edges into
- * actual tiers/parallel groups via computeCrossDomainOrder() (code, no LLM
- * trusted with the aggregate), and persists Path/PathDomain/PathTopic rows
- * with course_id null and status "pending" for every topic — overlap
- * detection (runOverlapDetectionForPath) runs as a separate pass afterward.
+ * Everything needed to persist a goal decomposition WITHOUT re-running either of its two [LLM]
+ * calls — a fully plain, JSON-serializable snapshot (Graceful Over-Large-Goal Handling addition),
+ * since whether/how to persist it (proceed as one Path / split into phased Paths / abort) is now a
+ * SEPARATE decision the caller makes, mirroring classifyInput()'s own "the caller decides, never
+ * applied silently" principle. `domainBreakdown` exists purely so a caller can show the user WHY a
+ * decomposition is large — it isn't used for persistence itself.
  */
-export async function decomposeAndPersistPath(
+export interface RawGoalDecomposition {
+  goalDescription: string;
+  domains: RawGoalDecompositionDomain[];
+  topics: RawGoalDecompositionTopic[];
+  topicCount: number;
+  hardLimit: number;
+  domainBreakdown: Array<{ name: string; topicCount: number }>;
+}
+
+export type DecomposeGoalResult =
+  | ({ outcome: "normal" } & RawGoalDecomposition)
+  | ({ outcome: "oversized" } & RawGoalDecomposition);
+
+export interface DecomposeGoalOptions {
+  orchestratorRun?: OrchestratorRunFn;
+  onProgress?: ProgressListener;
+}
+
+/**
+ * Deliverable 2's two [LLM] steps (decompose into domains/topics, then determine cross-domain
+ * dependency edges) plus the code-side ordering pass (computeCrossDomainOrder — never trusting the
+ * model with the aggregate) — WITHOUT any persistence. Graceful Over-Large-Goal Handling addition:
+ * this used to throw outright once topics.length reached PATH_TOPIC_COUNT_HARD_LIMIT; it no longer
+ * does. It always returns the full, real decomposition — "oversized" is just a flag the caller
+ * (the harness's `goal` command, `app/new`'s client flow) uses to decide what happens next (see
+ * persistDecomposedGoal below), mirroring classifyInput()'s own "the caller decides, never applied
+ * silently" principle. The original warning-only threshold (PATH_TOPIC_COUNT_WARNING_THRESHOLD)
+ * still just logs, unchanged.
+ */
+export async function decomposeGoal(
   goalDescription: string,
-  options: DecomposeAndPersistPathOptions = {}
-): Promise<PersistedPathResult> {
+  options: DecomposeGoalOptions = {}
+): Promise<DecomposeGoalResult> {
   const run = options.orchestratorRun ?? orchestratorRun;
-  const db = options.db ?? (await getDb());
   const onProgress = options.onProgress;
 
   onProgress?.(`Decomposing goal into domains and topics: "${goalDescription}"...`);
@@ -108,17 +155,10 @@ export async function decomposeAndPersistPath(
   );
   const { domains, topics } = decomposeResult.data;
 
-  if (topics.length >= PATH_TOPIC_COUNT_HARD_LIMIT) {
-    throw new PathPlannerError(
-      `decompose_goal_into_path returned ${topics.length} topics for "${goalDescription}" — this exceeds the ` +
-        `hard ceiling of ${PATH_TOPIC_COUNT_HARD_LIMIT} (3x the ${PATH_TOPIC_COUNT_WARNING_THRESHOLD}-topic ` +
-        "warning threshold). Refusing to persist an implausibly large path."
-    );
-  }
   if (topics.length >= PATH_TOPIC_COUNT_WARNING_THRESHOLD) {
     console.warn(
       `[path-planner] decompose_goal_into_path returned ${topics.length} topics for "${goalDescription}" — ` +
-        "unusually large for a single roadmap. Proceeding anyway (below the hard ceiling)."
+        "unusually large for a single roadmap."
     );
   }
 
@@ -146,40 +186,158 @@ export async function decomposeAndPersistPath(
   const ordered = computeCrossDomainOrder(orderable);
   const orderByTempId = new Map(ordered.map((o) => [o.tempId, o]));
 
-  const runSuffix = randomSuffix();
-  const pathId = `path_${assignUniqueIds([goalDescription], { fallback: "path" })[0]}_${runSuffix}`;
-  const domainIds = assignUniqueIds(domains.map((d) => d.name), { prefix: "dom_", fallback: "domain" }).map(
-    (id) => `${id}_${runSuffix}`
-  );
-  const tempIdToDomainId = new Map(domains.map((d, i) => [d.tempId, domainIds[i]!]));
-  const topicIds = assignUniqueIds(topics.map((t) => t.topicName), { prefix: "pt_", fallback: "topic" }).map(
-    (id) => `${id}_${runSuffix}`
-  );
-
-  onProgress?.(`Persisting path (${domains.length} domain(s), ${topics.length} topic(s))...`);
-  await db.transaction(async (tx) => {
-    await tx.insert(paths).values({ id: pathId, goalDescription, createdAt: new Date().toISOString(), status: "active" });
-    for (let i = 0; i < domains.length; i++) {
-      await tx.insert(pathDomains).values({ id: domainIds[i]!, pathId, name: domains[i]!.name, order: i });
-    }
-    for (let i = 0; i < topics.length; i++) {
-      const t = topics[i]!;
-      const o = orderByTempId.get(t.tempId)!;
-      await tx.insert(pathTopics).values({
-        id: topicIds[i]!,
-        pathId,
-        domainId: tempIdToDomainId.get(t.domainTempId)!,
-        topicName: t.topicName,
-        description: t.description,
-        order: o.order,
-        parallelGroup: o.parallelGroup,
-        courseId: null,
-        status: "pending",
-      });
-    }
+  const rawTopics: RawGoalDecompositionTopic[] = topics.map((t) => {
+    const o = orderByTempId.get(t.tempId)!;
+    return {
+      tempId: t.tempId,
+      domainTempId: t.domainTempId,
+      topicName: t.topicName,
+      description: t.description,
+      order: o.order,
+      parallelGroup: o.parallelGroup,
+    };
   });
 
-  return { pathId, domainCount: domains.length, topicCount: topics.length };
+  const topicCountByDomain = new Map<string, number>();
+  for (const t of rawTopics) {
+    topicCountByDomain.set(t.domainTempId, (topicCountByDomain.get(t.domainTempId) ?? 0) + 1);
+  }
+  const domainBreakdown = domains.map((d) => ({
+    name: d.name,
+    topicCount: topicCountByDomain.get(d.tempId) ?? 0,
+  }));
+
+  const outcome: "normal" | "oversized" = topics.length >= PATH_TOPIC_COUNT_HARD_LIMIT ? "oversized" : "normal";
+  if (outcome === "oversized") {
+    onProgress?.(
+      `Decomposition is unusually large (${topics.length} topics, hard ceiling is ` +
+        `${PATH_TOPIC_COUNT_HARD_LIMIT}) — not persisting yet. The caller decides how to proceed ` +
+        "(proceed as-is / split into phases / abort), never applied silently."
+    );
+  }
+
+  return {
+    outcome,
+    goalDescription,
+    domains: domains.map((d) => ({ tempId: d.tempId, name: d.name })),
+    topics: rawTopics,
+    topicCount: topics.length,
+    hardLimit: PATH_TOPIC_COUNT_HARD_LIMIT,
+    domainBreakdown,
+  };
+}
+
+export interface PersistDecomposedGoalOptions {
+  db?: TeacherDb;
+  onProgress?: ProgressListener;
+}
+
+/**
+ * Persists an already-decomposed goal (decomposeGoal's own output — no LLM calls happen here).
+ * `action: "proceed"` persists the WHOLE decomposition as one Path, exactly like this function's
+ * predecessor (the old decomposeAndPersistPath) always did. `action: "split"` (Graceful
+ * Over-Large-Goal Handling addition) partitions the EXISTING domains into up to 3 sequential
+ * phases along their own real prerequisite order (partitionDomainsIntoPhases, ordering.ts) —
+ * never re-decomposing anything — and persists each phase as its own separate Path, so a user
+ * facing a legitimately large goal gets a manageable, phased roadmap instead of one enormous Path
+ * or an outright refusal. `action: "abort"` isn't a case here at all — the caller simply never
+ * calls this function.
+ */
+export async function persistDecomposedGoal(
+  decomposition: RawGoalDecomposition,
+  action: "proceed" | "split",
+  options: PersistDecomposedGoalOptions = {}
+): Promise<PersistedPathResult[]> {
+  const db = options.db ?? (await getDb());
+  const onProgress = options.onProgress;
+
+  const domainGroups: string[][] =
+    action === "split"
+      ? partitionDomainsIntoPhases(
+          decomposition.domains.map((d) => d.tempId),
+          decomposition.topics.map((t) => ({ domainTempId: t.domainTempId, order: t.order })),
+          3
+        )
+      : [decomposition.domains.map((d) => d.tempId)];
+
+  const results: PersistedPathResult[] = [];
+  for (let phaseIndex = 0; phaseIndex < domainGroups.length; phaseIndex++) {
+    const domainTempIds = new Set(domainGroups[phaseIndex]!);
+    const phaseDomains = decomposition.domains.filter((d) => domainTempIds.has(d.tempId));
+    const phaseTopics = decomposition.topics.filter((t) => domainTempIds.has(t.domainTempId));
+    const phaseLabel = domainGroups.length > 1 ? ` — Phase ${phaseIndex + 1} of ${domainGroups.length}` : "";
+    const goalDescriptionForPhase = `${decomposition.goalDescription}${phaseLabel}`;
+
+    onProgress?.(
+      `Persisting${phaseLabel ? ` phase ${phaseIndex + 1}/${domainGroups.length}` : " path"} ` +
+        `(${phaseDomains.length} domain(s), ${phaseTopics.length} topic(s))...`
+    );
+
+    const runSuffix = randomSuffix();
+    const pathId = `path_${assignUniqueIds([goalDescriptionForPhase], { fallback: "path" })[0]}_${runSuffix}`;
+    const domainIds = assignUniqueIds(phaseDomains.map((d) => d.name), { prefix: "dom_", fallback: "domain" }).map(
+      (id) => `${id}_${runSuffix}`
+    );
+    const tempIdToDomainId = new Map(phaseDomains.map((d, i) => [d.tempId, domainIds[i]!]));
+    const topicIds = assignUniqueIds(phaseTopics.map((t) => t.topicName), { prefix: "pt_", fallback: "topic" }).map(
+      (id) => `${id}_${runSuffix}`
+    );
+
+    await db.transaction(async (tx) => {
+      await tx.insert(paths).values({
+        id: pathId,
+        goalDescription: goalDescriptionForPhase,
+        createdAt: new Date().toISOString(),
+        status: "active",
+      });
+      for (let i = 0; i < phaseDomains.length; i++) {
+        await tx.insert(pathDomains).values({ id: domainIds[i]!, pathId, name: phaseDomains[i]!.name, order: i });
+      }
+      for (let i = 0; i < phaseTopics.length; i++) {
+        const t = phaseTopics[i]!;
+        await tx.insert(pathTopics).values({
+          id: topicIds[i]!,
+          pathId,
+          domainId: tempIdToDomainId.get(t.domainTempId)!,
+          topicName: t.topicName,
+          description: t.description,
+          order: t.order,
+          parallelGroup: t.parallelGroup,
+          courseId: null,
+          status: "pending",
+        });
+      }
+    });
+
+    results.push({ pathId, domainCount: phaseDomains.length, topicCount: phaseTopics.length });
+  }
+
+  return results;
+}
+
+export type DecomposeAndPersistPathOutcome =
+  | ({ outcome: "persisted" } & PersistedPathResult)
+  | ({ outcome: "oversized" } & RawGoalDecomposition);
+
+/**
+ * Historical single-call convenience wrapper around decomposeGoal() + persistDecomposedGoal() —
+ * still the right choice for the common case (well under the hard ceiling: decompose, then
+ * persist immediately as one Path). Once a decomposition trips PATH_TOPIC_COUNT_HARD_LIMIT this no
+ * longer refuses outright (Graceful Over-Large-Goal Handling addition) — it returns the raw
+ * decomposition instead, unpersisted, for the caller to resolve via persistDecomposedGoal() with
+ * an explicit "proceed" or "split" once the user has actually decided; "abort" means the caller
+ * simply never calls persistDecomposedGoal() at all.
+ */
+export async function decomposeAndPersistPath(
+  goalDescription: string,
+  options: DecomposeAndPersistPathOptions = {}
+): Promise<DecomposeAndPersistPathOutcome> {
+  const decomposition = await decomposeGoal(goalDescription, options);
+  if (decomposition.outcome === "oversized") {
+    return decomposition;
+  }
+  const [persisted] = await persistDecomposedGoal(decomposition, "proceed", options);
+  return { outcome: "persisted", ...persisted! };
 }
 
 // ---------------------------------------------------------------------------

@@ -82,3 +82,49 @@ export function computeCrossDomainOrder(topics: OrderableTopic[]): OrderedTopic[
     return { tempId: t.tempId, order: topicOrder, parallelGroup: `tier_${topicOrder}` };
   });
 }
+
+export interface DomainTopicOrderRef {
+  domainTempId: string;
+  order: number;
+}
+
+/**
+ * Graceful Over-Large-Goal Handling addition: splits domains into up to `maxPhases` sequential
+ * groups, each becoming its own Path when a decomposition is too large to persist as one. Domains
+ * are sorted by their EARLIEST topic tier (computeCrossDomainOrder's own `order` above) and then
+ * chunked into contiguous, roughly-even-sized groups in that sorted order — a domain is never
+ * split across phases (this partitions strictly along existing domain boundaries, it never
+ * re-decomposes anything), and because domains are ordered by their real, already-computed
+ * prerequisite tier first, phase 1 always contains the domains whose topics are genuine
+ * prerequisites for later phases' domains, not an arbitrary grouping.
+ */
+export function partitionDomainsIntoPhases(
+  domainTempIds: string[],
+  topicRefs: DomainTopicOrderRef[],
+  maxPhases = 3
+): string[][] {
+  if (domainTempIds.length === 0) return [];
+
+  const minOrderByDomain = new Map<string, number>();
+  for (const t of topicRefs) {
+    const current = minOrderByDomain.get(t.domainTempId);
+    if (current === undefined || t.order < current) minOrderByDomain.set(t.domainTempId, t.order);
+  }
+
+  const sorted = [...domainTempIds].sort(
+    (a, b) => (minOrderByDomain.get(a) ?? 0) - (minOrderByDomain.get(b) ?? 0)
+  );
+
+  const phaseCount = Math.min(maxPhases, sorted.length);
+  const baseSize = Math.floor(sorted.length / phaseCount);
+  const remainder = sorted.length % phaseCount;
+
+  const phases: string[][] = [];
+  let cursor = 0;
+  for (let i = 0; i < phaseCount; i++) {
+    const size = baseSize + (i < remainder ? 1 : 0);
+    phases.push(sorted.slice(cursor, cursor + size));
+    cursor += size;
+  }
+  return phases;
+}

@@ -48,6 +48,10 @@ functional gap.
 - [Timeouts + Hard Cost Cap](#timeouts--hard-cost-cap-a-scoped-addition-not-a-numbered-phase)
   (a scoped addition, not a numbered phase — a shared timeout helper extended to every real LLM/
   MCP call, a hard Orchestrator session cost cap, and hard subtopic/topic-count ceilings)
+- [Coverage Completeness Audit + Graceful Over-Large-Goal Handling](#coverage-completeness-audit--graceful-over-large-goal-handling-a-scoped-addition-not-a-numbered-phase)
+  (a scoped addition, not a numbered phase — a new audit checking whether a subtopic decomposition
+  is actually complete, and real proceed/split/abort options for an over-large goal instead of an
+  outright refusal)
 - [LLM provider swap](#llm-provider-swap-added-mid-phase-2-not-in-the-original-kickoff-prompt)
 - [Definition of done — status](#definition-of-done--status) (historical, Phases 1-3.5 only —
   each later phase's own "Definition of done" subsection is the record for that phase)
@@ -56,25 +60,29 @@ functional gap.
 ## Current status (post-Phase-11 additions)
 
 All ten phases on the PRD's roadmap are built and individually tested; Phase 11 was a polish pass.
-Three scoped additions have followed it, each its own section below rather than a new numbered
+Four scoped additions have followed it, each its own section below rather than a new numbered
 phase: **Source Diversity** (real PDF/YouTube-transcript sources with a citation `locator`),
 **Pre-Real-Testing Gap Fixes** (the Goal Planner's missing mind map step, the locator finally
-persisted/rendered, an env var gap, a dependency audit), and **Timeouts + Hard Cost Cap** (a
-shared timeout on every real LLM/MCP call, a hard Orchestrator session cost cap, hard subtopic/
-topic-count ceilings). This is a **summary index**, not a re-verification — every claim here is a
+persisted/rendered, an env var gap, a dependency audit), **Timeouts + Hard Cost Cap** (a shared
+timeout on every real LLM/MCP call, a hard Orchestrator session cost cap, hard subtopic/topic-count
+ceilings), and **Coverage Completeness Audit + Graceful Over-Large-Goal Handling** (a new audit
+checking whether a decomposition is actually complete, and real proceed/split/abort options for an
+over-large goal). This is a **summary index**, not a re-verification — every claim here is a
 pointer to the fuller, phase-by-phase record already in this document; when in doubt, the linked
 phase section is the source of truth.
 
 **What's built, end to end:** topic/goal intake with classify-confirm-override → multi-pass
 research with cited, volatility-tagged sources (now including real PDF and YouTube-transcript
 sources with an optional page/timestamp citation locator that's now persisted AND rendered in the
-Course view, not just HTML articles) → five-layer course persistence → a real per-course concept
-mind map generated for a course reached through EITHER the standalone topic flow or a Goal/Path →
-a Memory Graph of dated facts and mastery history (now with a real request timeout so a hung graph
-server can't block course generation) → tiered quizzes and
+Course view, not just HTML articles), a decomposition-completeness audit above the existing
+per-subtopic depth audit → five-layer course persistence → a real per-course concept mind map
+generated for a course reached through EITHER the standalone topic flow or a Goal/Path → a Memory
+Graph of dated facts and mastery history (now with a real request timeout so a hung graph server
+can't block course generation) → tiered quizzes and
 project/simulation/debate practice with auto-escalating difficulty → a goal/career Path Planner
-with cross-domain ordering and overlap detection → a Continuous Learning Agent (next-topic
-suggestions, verified book recommendations) and a Knowledge Update Agent (real-world drift
+with cross-domain ordering and overlap detection (an over-large goal now offers real proceed/
+split-into-phases/abort choices instead of an outright refusal) → a Continuous Learning Agent
+(next-topic suggestions, verified book recommendations) and a Knowledge Update Agent (real-world drift
 detection, severity-routed digests) → a full Next.js frontend over all of the above → voice
 narration with lock-screen media controls → a fixed self-improvement starting menu → real activity tracking,
 momentum streaks, low-friction re-entry, boredom-proofing, and milestone celebration → PWA
@@ -3684,6 +3692,189 @@ against real Tavily infrastructure was never possible to begin with). Specifical
   Tavily/YouTube-transcript/Graphiti latency** — reasonable defaults documented with their
   reasoning above, not tuned against real observed p95 latencies this environment has never been
   able to produce.
+
+## Coverage Completeness Audit + Graceful Over-Large-Goal Handling (a scoped addition, not a numbered phase)
+
+A question worth taking seriously came up while reviewing the count ceilings the previous addition
+introduced: **the depth audit (Phase 2.5) has never checked whether a topic's *decomposition* is
+complete — only whether each subtopic it already identified is covered deeply enough.**
+`depthAuditScore.ts`'s four criteria (`prerequisitesCovered`, `misconceptionsAddressed`,
+`beyondIntroDepth`, `allLayersPresent`) are all about depth *within* an already-chosen subtopic.
+Nothing anywhere asked "for a course on X, is this list of subtopics actually complete?" — a course
+could pass every existing audit while silently missing a whole sub-area a competent teacher would
+have included, and nothing would ever notice.
+
+Separately, `SUBTOPIC_COUNT_HARD_LIMIT`/`PATH_TOPIC_COUNT_HARD_LIMIT` (the previous addition) both
+refuse outright when tripped — correct for a single topic decomposing into 45+ subtopics (almost
+certainly malformed), but the wrong response for a genuinely vast GOAL (the PRD's own example,
+"become a full-stack quant," spanning math/programming/finance/modeling, could plausibly approach
+the 120-topic path ceiling without anything actually being wrong). This addition gives the Goal
+Planner's ceiling real alternatives to outright refusal — deliberately leaving the Research Agent's
+single-topic ceiling as a hard refusal, per its own scope boundary (see below).
+
+### Deliverable 1: a new decomposition-completeness audit (Research Agent)
+
+A new `[LLM]` step, `audit_decomposition_completeness` (`orchestrator/templates/
+auditDecompositionCompleteness.ts`), runs right after step 1's `decompose_topic` call and BEFORE
+any per-subtopic research begins — it's given the proposed subtopic list itself (there's no
+fetched content yet at this point) and asked whether a competent curriculum designer would notice
+a missing sub-area. This is a **separate, additive audit above** the existing depth audit — it
+does not modify, absorb, or duplicate `depthAuditScore.ts`'s own criteria or scope; that one still
+only ever asks "is this subtopic's content deep enough," unchanged.
+
+Output mirrors the depth audit's own "name the specific failing criteria, not just try again"
+principle: `{complete: boolean, assessment: string, missingSubtopics: [{title, description}]}` —
+never a vague "this seems incomplete," always real, specific subtopics in the same shape
+`decompose_topic` itself produces, so they can be appended directly to the working list. On an
+"incomplete" verdict, the missing subtopics are appended and the audit re-runs **exactly once**
+(matching the depth audit's own single-retry default) against the grown list — then the pipeline
+proceeds regardless of that retry's own outcome (never looping further), setting the course's new
+`coverageStatus: "complete" | "gaps_noted_after_retry"` (`research/types.ts`'s `CourseJson`) rather
+than blocking generation. `coverageNotes` (optional) carries the audit's own final assessment
+string for operator/debug visibility. Per the kickoff's own resolved default, this is required at
+the *data* level only for this pass — a UI badge surfacing it is a reasonable follow-up, not built
+here.
+
+**The one place this audit touches the existing count ceilings**: since it can only ever GROW the
+subtopic list (append, never remove), `SUBTOPIC_COUNT_WARNING_THRESHOLD`/`SUBTOPIC_COUNT_HARD_LIMIT`
+are checked once at the original decomposition (as before) AND checked again after the audit's own
+retry, if that retry actually appended anything — a list that started safely under the hard ceiling
+could cross it only once grown, and that case must still be caught. `research/pipeline.ts`'s
+`checkSubtopicCountCeilings()` helper is shared by both checkpoints so the warn/throw logic isn't
+duplicated. `src/harness/mocks.ts`'s dry-run mock always reports the canned decomposition as
+complete — the (already-tested) depth-audit retry path is what that specific dry run demonstrates,
+not this new, separate audit.
+
+### Deliverable 2: graceful handling for an over-large (but legitimate) goal
+
+`decomposeAndPersistPath()` used to run both of the Goal Planner's `[LLM]` decomposition steps AND
+persist the result in one call, throwing `PathPlannerError` outright once `topics.length` reached
+`PATH_TOPIC_COUNT_HARD_LIMIT`. It's now split into two composable steps, mirroring
+`classifyInput()`'s own "the caller decides, never applied silently" principle:
+
+- **`decomposeGoal()`** runs the two `[LLM]` steps (`decompose_goal_into_path`,
+  `determine_cross_domain_dependencies`) plus the code-side ordering pass — no persistence, no
+  throwing on size. It always returns the full, real decomposition as a plain, JSON-serializable
+  `RawGoalDecomposition` (domains, topics with their real computed tier/parallelGroup, a real
+  per-domain topic-count breakdown), tagged `outcome: "normal" | "oversized"`.
+- **`persistDecomposedGoal(decomposition, action, options)`** persists an already-decomposed goal —
+  no LLM calls happen here. `action: "proceed"` persists the whole thing as one Path, exactly like
+  the old function always did. `action: "split"` partitions the *existing* domains into up to 3
+  sequential phases and persists each as its own separate Path.
+- **`decomposeAndPersistPath()`** is now a thin convenience wrapper composing the two for the
+  common (well under the ceiling) case: decompose, then persist immediately as one Path. Once
+  oversized, it returns the raw decomposition **unpersisted** instead of throwing, for the caller
+  to resolve explicitly.
+
+**Phased splitting, along real domain/dependency boundaries, never a re-decomposition**:
+`partitionDomainsIntoPhases()` (`pathPlanner/ordering.ts`, alongside `computeCrossDomainOrder`)
+sorts domains by their EARLIEST real topic tier (already computed, never re-derived) and chunks
+them into contiguous, roughly-even-sized groups in that order — a domain is never split across two
+phases, and because domains are tier-sorted first, phase 1 always contains the domains that are
+real prerequisites for later phases', not an arbitrary grouping. Verified directly against a real,
+file-based SQLite DB (not `:memory:`): a constructed 130-topic, 5-domain decomposition (over the
+120 hard limit) split into 3 real, correctly-partitioned Paths (2+2+1 domains, 52+52+26 topics),
+confirmed via a direct query — no domain name appeared in more than one persisted Path, and every
+topic was accounted for exactly once.
+
+**Real options, not just yes/no** — both the harness's `goal` command and `app/new`'s client UI now
+offer all three of:
+- **Proceed anyway** with the full decomposition as one large path.
+- **Split into phased sub-paths** (the recommended default) — 2-3 sequential Paths along existing
+  domain boundaries.
+- **Abort** — today's only option before this addition, still fully available; nothing is ever
+  persisted for an oversized decomposition until the user actively picks proceed or split.
+
+The harness's `goal` command prompts interactively (`rl.question`) exactly like its existing
+topic-vs-goal override prompt, then loops the SAME generation flow once per resulting Path (one
+phase at a time) when split produced more than one. `app/new/page.tsx` shows a real second confirm
+screen (domain breakdown, three real buttons) mirroring its own existing classify-confirm-override
+UI pattern — see "New API routes" below for how this works across the frontend's request/response
+boundary.
+
+**New API routes** (replacing the old single-shot `decompose-stream`): `POST /api/paths/decompose`
+is a quick, non-streamed call (two `[LLM]` calls, not the multi-minute research pipeline) that
+returns the decomposition's outcome plus a `decompositionId`; `GET /api/paths/persist-stream`
+(EventSource-compatible, matching every other SSE route in this app) takes that id plus the chosen
+`action` and does the actual persisting + per-Path overlap detection, streaming progress the whole
+time. The raw decomposition is stashed server-side between the two calls in a small, one-shot,
+TTL-bounded in-memory `Map` (`app/api/paths/_pendingDecompositions.ts`) rather than sent back and
+forth as a large query string — `EventSource`/GET (this app's established SSE mechanism, see
+`app/api/_sse.ts`) can't carry a request body or reliably carry a large payload as a query string,
+and an in-memory map is the same "single-process personal app, not a distributed system"
+reasoning `orchestrator/index.ts`'s own session-cost accumulator already uses.
+
+**A real, narrow `next dev`-only quirk, found and documented (not a production bug)**: on a
+*freshly started* dev server, the very first request to `/api/paths/persist-stream` — if it lands
+before that route has ever been compiled — can miss a decomposition `/api/paths/decompose`'s
+already-compiled bundle just stashed, because Next's webpack dev mode compiles each route
+on-demand and the very first compile of a not-yet-touched route can end up with a fresh module
+instance disconnected from one a sibling route's bundle already populated. Confirmed real and
+production-safe: a real `next build && next start` round trip (decompose → persist-stream, a real
+Gemini call, real Memory Graph overlap-detection calls) succeeded on the very first request with no
+warm-up at all. In `next dev`, the SAME real round trip failed once on a cold server, then
+succeeded reliably afterward once both routes had been hit at least once. This is the same category
+of dev-only bundling quirk as the `pdf-parse`/`next dev` finding from the Pre-Real-Testing Gap
+Fixes addition — documented here rather than worked around, since it's harmless in production and
+self-resolves after one cold request in dev.
+
+### Scope boundary: the single-topic hard limit stays a refusal
+
+Per the kickoff's own explicit instruction, `SUBTOPIC_COUNT_HARD_LIMIT`'s refuse-outright behavior
+in `research/pipeline.ts` is **unchanged** — a single topic decomposing into 45+ subtopics is a
+malformed-decomposition signal, not a legitimate-size signal, and stays a hard `ResearchPipelineError`.
+Its existing tests (including the ones the previous addition wrote) pass completely unmodified. If
+the single-topic case ever seems to deserve the same graceful treatment, that's a deliberate,
+separate, future decision — not something this addition silently widened into.
+
+### Definition of done — Coverage Completeness Audit + Graceful Over-Large-Goal Handling
+
+- [x] A constructed, deliberately incomplete decomposition (mocked LLM output) demonstrates: the
+      completeness audit catches it, the retry appends the missing subtopic, and the final course
+      JSON's `coverageStatus` reflects the outcome correctly for both "fixed on retry"
+      (`"complete"`) and "still incomplete after retry" (`"gaps_noted_after_retry"`) cases — the
+      latter confirmed to stop at exactly 2 audit calls (one retry), never looping further.
+- [x] A constructed already-complete decomposition demonstrates the audit passing on the first
+      attempt with no unnecessary retry (exactly 1 audit call).
+- [x] A constructed over-ceiling goal decomposition (mocked, 121+ topics) demonstrates no outright
+      refusal — a structured, unpersisted "oversized" result is returned instead, confirmed via a
+      direct DB query that nothing was persisted for that call.
+- [x] The split-into-phases option is demonstrated, against a real file-based SQLite DB, producing
+      multiple correctly-domain-partitioned Path rows (2+2+1 domains, 52+52+26 topics from one
+      130-topic/5-domain decomposition) — not a re-decomposition from scratch, confirmed via a
+      direct query showing no domain straddles two Paths and every topic is accounted for exactly
+      once.
+- [x] Both `/api/paths/decompose` + `/api/paths/persist-stream` (the "proceed" path) and the
+      harness's `goal` command's new decision prompt were exercised against a REAL Gemini call and
+      a real production server (`next build && next start`) — a real goal decomposed, persisted,
+      and overlap-detected successfully end to end.
+- [x] The single-topic `SUBTOPIC_COUNT_HARD_LIMIT`'s refuse-outright behavior is unchanged —
+      its existing tests pass unmodified.
+- [x] All existing tests still pass (392/392 total); `npm run typecheck` clean (both configs),
+      `npm run lint` clean, `npm run build` succeeds.
+- [x] README updated: this section, the completeness audit and its interaction with the count
+      thresholds, the `coverageStatus`/`coverageNotes` fields and where they're surfaced, the
+      graceful over-large-goal UX (all three options) and the new API routes, and the real
+      `next dev`-only quirk found while verifying it.
+
+### Documented gaps
+
+- **A UI badge for `coverageStatus` was not built** — required at the data level only for this
+  pass, per the kickoff's own resolved default; the field is real and queryable on the returned
+  `CourseJson`, just not yet rendered on any screen.
+- **No real LLM call ever produced a genuinely incomplete decomposition or a 120+-topic goal in
+  this environment** — both are, by construction, rare/hard-to-naturally-trigger real model
+  outputs; every completeness-audit-catches-a-gap and over-ceiling scenario is verified via a
+  constructed, mocked LLM response feeding entirely real downstream code (the audit retry loop,
+  the count-ceiling re-check, `partitionDomainsIntoPhases`, real DB persistence) — the same
+  "construct the hard-to-naturally-produce case" approach earlier phases already used for their
+  own rare branches.
+- **Cross-phase topic dependencies aren't enforced at generation time** — if a split's Phase 2
+  domain genuinely depended on a Phase 1 domain's topic, that dependency doesn't block Phase 2's
+  topics from being marked generatable (each phase is its own independent `Path`, and
+  `isTopicGeneratable()`'s ordering check is scoped to one Path's own topics, unchanged). Phase
+  ordering is a real, tier-respecting sequencing recommendation — the user is expected to tackle
+  phases in the order presented, not a hard technical gate preventing an out-of-order start.
 
 ## LLM provider swap (added mid-Phase-2, not in the original kickoff prompt)
 

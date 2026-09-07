@@ -6,6 +6,7 @@ import { createCitationValidator, checkLocatorSanity } from "./grounding.js";
 import { assignUniqueIds } from "../shared/ids.js";
 import type { CourseJson, SourceRecord, SubtopicResult, AuditPassRecord } from "./types.js";
 import type { DecomposeTopicOutput } from "../orchestrator/templates/decomposeTopic.js";
+import type { AuditDecompositionCompletenessOutput } from "../orchestrator/templates/auditDecompositionCompleteness.js";
 import type { SearchQueriesOutput } from "../orchestrator/templates/generateSearchQueries.js";
 import type {
   ExtractGroundedKeyPointsOutput,
@@ -21,6 +22,14 @@ export type FetchAndCleanFn = typeof fetchAndCleanDefault;
 export type ProgressListener = (message: string) => void;
 
 const DEFAULT_MAX_AUDIT_RETRIES = 1;
+/**
+ * Coverage Completeness Audit addition: how many times audit_decomposition_completeness re-runs
+ * after an initial "incomplete" verdict, matching the per-subtopic depth audit's own default
+ * (DEFAULT_MAX_AUDIT_RETRIES above) — one retry, then ship regardless of the outcome. Not exposed
+ * as a RunResearchPipelineOptions field (unlike maxAuditRetries) since the kickoff's own resolved
+ * default is a fixed "one retry, matching the depth audit," not something callers need to tune.
+ */
+const MAX_COMPLETENESS_AUDIT_RETRIES = 1;
 const DEFAULT_MAX_SOURCES_PER_PASS = 5;
 const DEFAULT_MIN_EXTRACTION_CONFIDENCE = 0.3;
 /** decompose_topic returning this many (or more) subtopics is a signal the topic is probably Goal/Syllabus-shaped (Phase 5), not a single course. */
@@ -116,28 +125,35 @@ export async function runResearchPipeline(
     "research-agent"
   );
   const { prerequisites, subtopics: rawSubtopics } = decompose.data;
+  checkSubtopicCountCeilings(rawSubtopics.length, topic);
 
-  if (rawSubtopics.length >= SUBTOPIC_COUNT_HARD_LIMIT) {
-    throw new ResearchPipelineError(
-      `decompose_topic returned ${rawSubtopics.length} subtopics for "${topic}" — this exceeds the hard ` +
-        `ceiling of ${SUBTOPIC_COUNT_HARD_LIMIT} (3x the ${SUBTOPIC_COUNT_WARNING_THRESHOLD}-subtopic warning ` +
-        "threshold). Refusing to proceed rather than running an implausibly large number of subtopics — this " +
-        "topic almost certainly needs Goal/Syllabus mode (Phase 5) instead of a single course."
-    );
+  // Coverage Completeness Audit addition: BEFORE any per-subtopic research begins, ask whether
+  // the proposed subtopic LIST itself is complete — the existing depth audit (step 3, below) only
+  // ever checks depth WITHIN an already-chosen subtopic and has no way to notice one that was
+  // never proposed at all. This audit can only ever GROW the list (append missing subtopics,
+  // never remove any) — so the count ceilings just checked above are re-checked below if the
+  // audit's retry actually appended anything, since a grown list could newly cross a threshold
+  // the original decomposition didn't.
+  deps.onProgress?.(`Checking subtopic decomposition completeness for "${topic}"...`);
+  const completeness = await auditDecompositionCompleteness({
+    run: deps.orchestratorRun,
+    topic,
+    prerequisites,
+    subtopics: rawSubtopics,
+    goalContext: options.goalContext,
+    onProgress: deps.onProgress,
+  });
+  if (completeness.subtopics.length !== rawSubtopics.length) {
+    checkSubtopicCountCeilings(completeness.subtopics.length, topic);
   }
-  if (rawSubtopics.length >= SUBTOPIC_COUNT_WARNING_THRESHOLD) {
-    console.warn(
-      `[research] decompose_topic returned ${rawSubtopics.length} subtopics for "${topic}" — this may be ` +
-        "too broad for a single course and might fit Goal/Syllabus mode (Phase 5) better. Proceeding anyway."
-    );
-  }
+  const auditedSubtopics = completeness.subtopics;
 
-  const ids = assignUniqueIds(rawSubtopics.map((s) => s.title), { fallback: "subtopic" });
+  const ids = assignUniqueIds(auditedSubtopics.map((s) => s.title), { fallback: "subtopic" });
   const subtopics: SubtopicResult[] = [];
-  for (let i = 0; i < rawSubtopics.length; i++) {
-    const raw = rawSubtopics[i]!;
+  for (let i = 0; i < auditedSubtopics.length; i++) {
+    const raw = auditedSubtopics[i]!;
     const id = ids[i]!;
-    deps.onProgress?.(`--- Subtopic ${i + 1}/${rawSubtopics.length}: ${raw.title} ---`);
+    deps.onProgress?.(`--- Subtopic ${i + 1}/${auditedSubtopics.length}: ${raw.title} ---`);
     subtopics.push(
       await processSubtopic({
         id,
@@ -157,8 +173,91 @@ export async function runResearchPipeline(
     prerequisites,
     subtopics,
     generatedAt: new Date().toISOString(),
+    coverageStatus: completeness.coverageStatus,
+    ...(completeness.assessment ? { coverageNotes: completeness.assessment } : {}),
     ...(options.goalContext ? { goalContext: options.goalContext } : {}),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Coverage Completeness Audit addition: subtopic-count ceilings + the new
+// decomposition-completeness audit that sits above the existing per-subtopic depth audit.
+// ---------------------------------------------------------------------------
+
+function checkSubtopicCountCeilings(subtopicCount: number, topic: string): void {
+  if (subtopicCount >= SUBTOPIC_COUNT_HARD_LIMIT) {
+    throw new ResearchPipelineError(
+      `decompose_topic returned ${subtopicCount} subtopics for "${topic}" — this exceeds the hard ` +
+        `ceiling of ${SUBTOPIC_COUNT_HARD_LIMIT} (3x the ${SUBTOPIC_COUNT_WARNING_THRESHOLD}-subtopic warning ` +
+        "threshold). Refusing to proceed rather than running an implausibly large number of subtopics — this " +
+        "topic almost certainly needs Goal/Syllabus mode (Phase 5) instead of a single course."
+    );
+  }
+  if (subtopicCount >= SUBTOPIC_COUNT_WARNING_THRESHOLD) {
+    console.warn(
+      `[research] decompose_topic returned ${subtopicCount} subtopics for "${topic}" — this may be ` +
+        "too broad for a single course and might fit Goal/Syllabus mode (Phase 5) better. Proceeding anyway."
+    );
+  }
+}
+
+interface DecompositionCompletenessResult {
+  subtopics: DecomposeTopicOutput["subtopics"];
+  coverageStatus: "complete" | "gaps_noted_after_retry";
+  assessment?: string;
+}
+
+/**
+ * A NEW, separate audit above the existing per-subtopic depth audit (runDepthAudit, below) — that
+ * one only ever asks "is THIS subtopic's content deep enough?" once real content exists for it.
+ * This one runs first, before any research happens, against the proposed subtopic LIST itself
+ * (there's no fetched content yet at this point in the pipeline). Mirrors the depth audit's own
+ * single-retry shape exactly: one initial attempt, and on failure exactly one retry against the
+ * list grown with whatever the first attempt reported missing — then ship regardless of the
+ * retry's own outcome (never loops further), flagging `coverageStatus` rather than blocking course
+ * generation. Never modifies the depth audit's own scope/criteria.
+ */
+async function auditDecompositionCompleteness(input: {
+  run: OrchestratorRunFn;
+  topic: string;
+  prerequisites: string[];
+  subtopics: DecomposeTopicOutput["subtopics"];
+  goalContext?: string;
+  onProgress?: ProgressListener;
+}): Promise<DecompositionCompletenessResult> {
+  let subtopics = input.subtopics;
+  let attempt = 0;
+
+  for (;;) {
+    attempt += 1;
+    const result = await input.run<AuditDecompositionCompletenessOutput>(
+      "audit_decomposition_completeness",
+      { topic: input.topic, prerequisites: input.prerequisites, subtopics, goalContext: input.goalContext },
+      "research-agent"
+    );
+
+    if (result.data.complete) {
+      input.onProgress?.(
+        `Decomposition completeness audit passed on attempt ${attempt}: ${result.data.assessment}`
+      );
+      return { subtopics, coverageStatus: "complete", assessment: result.data.assessment };
+    }
+
+    const missingTitles = result.data.missingSubtopics.map((s) => s.title).join(", ") || "(none named)";
+    input.onProgress?.(
+      `Decomposition completeness audit FAILED on attempt ${attempt}: ${result.data.assessment} ` +
+        `(missing: ${missingTitles})`
+    );
+
+    if (attempt > MAX_COMPLETENESS_AUDIT_RETRIES) {
+      input.onProgress?.(
+        `Decomposition completeness audit exhausted its retry — shipping flagged as gaps_noted_after_retry.`
+      );
+      return { subtopics, coverageStatus: "gaps_noted_after_retry", assessment: result.data.assessment };
+    }
+
+    subtopics = [...subtopics, ...result.data.missingSubtopics];
+  }
 }
 
 // ---------------------------------------------------------------------------

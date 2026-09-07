@@ -3,12 +3,14 @@ import { eq } from "drizzle-orm";
 import {
   classifyInput,
   decomposeAndPersistPath,
+  persistDecomposedGoal,
   runOverlapDetectionForPath,
   loadPathRoadmap,
   isTopicGeneratable,
   generateTopicCourse,
   PathPlannerError,
   type GeneratableCheckTopic,
+  type RawGoalDecomposition,
 } from "../src/pathPlanner/index.js";
 import type { OverlapResult } from "../src/pathPlanner/overlap.js";
 import { getDb, resetDbCache } from "../src/db/client.js";
@@ -93,6 +95,8 @@ describe("decomposeAndPersistPath", () => {
     };
 
     const result = await decomposeAndPersistPath("become a full-stack quant", { db, orchestratorRun: mock as never });
+    expect(result.outcome).toBe("persisted");
+    if (result.outcome !== "persisted") throw new Error("expected a persisted outcome");
     expect(result.domainCount).toBe(2);
     expect(result.topicCount).toBe(2);
 
@@ -114,7 +118,7 @@ describe("decomposeAndPersistPath", () => {
     expect(linAlg.parallelGroup).not.toBe(numpy.parallelGroup);
   });
 
-  it("refuses to persist (PathPlannerError, not a warning) when decompose_goal_into_path returns an implausibly large number of topics (Timeouts + Hard Cost Cap, Deliverable 3)", async () => {
+  it("returns an unpersisted 'oversized' outcome (not a throw) when decompose_goal_into_path returns an implausibly large number of topics (Graceful Over-Large-Goal Handling)", async () => {
     const db = await getDb(":memory:");
     // PATH_TOPIC_COUNT_HARD_LIMIT is 3x the 40-topic warning threshold (120) — 121 exceeds it.
     const manyTopics = Array.from({ length: 121 }, (_, i) => ({
@@ -123,29 +127,32 @@ describe("decomposeAndPersistPath", () => {
       topicName: `Topic ${i}`,
       description: "d",
     }));
-    let determineDependenciesCalled = false;
     const mock: MockRun = async (taskType) => {
       if (taskType === "decompose_goal_into_path") {
         return respond(taskType, { domains: [{ tempId: "d1", name: "Domain" }], topics: manyTopics });
       }
       if (taskType === "determine_cross_domain_dependencies") {
-        determineDependenciesCalled = true;
         return respond(taskType, { dependencies: manyTopics.map((t) => ({ topicTempId: t.tempId, dependsOnTempIds: [] })) });
       }
       throw new Error(`No mock for task type "${taskType}"`);
     };
 
-    await expect(
-      decomposeAndPersistPath("an implausibly broad goal", { db, orchestratorRun: mock as never })
-    ).rejects.toThrow(PathPlannerError);
+    const result = await decomposeAndPersistPath("an implausibly broad goal", { db, orchestratorRun: mock as never });
 
-    // Refused before the 2nd LLM step even runs, and before anything is persisted.
-    expect(determineDependenciesCalled).toBe(false);
+    expect(result.outcome).toBe("oversized");
+    if (result.outcome !== "oversized") throw new Error("expected an oversized outcome");
+    expect(result.topicCount).toBe(121);
+    expect(result.hardLimit).toBe(120);
+    expect(result.domainBreakdown).toEqual([{ name: "Domain", topicCount: 121 }]);
+
+    // Nothing is persisted yet — the caller decides (proceed/split/abort) via persistDecomposedGoal().
     const persistedTopics = await db.select().from(pathTopics);
     expect(persistedTopics).toHaveLength(0);
+    const persistedPaths = await db.select().from(paths);
+    expect(persistedPaths).toHaveLength(0);
   });
 
-  it("still only warns (does not throw) just below the hard ceiling, at the existing warning threshold", async () => {
+  it("still only warns (does not throw, still persists normally) just below the hard ceiling, at the existing warning threshold", async () => {
     const db = await getDb(":memory:");
     const someTopics = Array.from({ length: 40 }, (_, i) => ({
       tempId: `t${i}`,
@@ -164,7 +171,101 @@ describe("decomposeAndPersistPath", () => {
     };
 
     const result = await decomposeAndPersistPath("a broad but plausible goal", { db, orchestratorRun: mock as never });
+    expect(result.outcome).toBe("persisted");
+    if (result.outcome !== "persisted") throw new Error("expected a persisted outcome");
     expect(result.topicCount).toBe(40);
+  });
+});
+
+describe("persistDecomposedGoal (Graceful Over-Large-Goal Handling)", () => {
+  beforeEach(() => {
+    resetDbCache();
+  });
+
+  function makeDecomposition(): RawGoalDecomposition {
+    // Three domains at three real tiers (Math -> Programming -> Finance, a genuine cross-domain
+    // chain), 2 topics each — enough to exercise a real 3-way phased split along real boundaries.
+    return {
+      goalDescription: "become a full-stack quant",
+      domains: [
+        { tempId: "d1", name: "Math" },
+        { tempId: "d2", name: "Programming" },
+        { tempId: "d3", name: "Finance" },
+      ],
+      topics: [
+        { tempId: "t1", domainTempId: "d1", topicName: "Linear Algebra", description: "d", order: 0, parallelGroup: "tier_0" },
+        { tempId: "t2", domainTempId: "d1", topicName: "Calculus", description: "d", order: 0, parallelGroup: "tier_0" },
+        { tempId: "t3", domainTempId: "d2", topicName: "NumPy", description: "d", order: 1, parallelGroup: "tier_1" },
+        { tempId: "t4", domainTempId: "d2", topicName: "Pandas", description: "d", order: 1, parallelGroup: "tier_1" },
+        { tempId: "t5", domainTempId: "d3", topicName: "Options Pricing", description: "d", order: 2, parallelGroup: "tier_2" },
+        { tempId: "t6", domainTempId: "d3", topicName: "Portfolio Theory", description: "d", order: 2, parallelGroup: "tier_2" },
+      ],
+      topicCount: 6,
+      hardLimit: 120,
+      domainBreakdown: [
+        { name: "Math", topicCount: 2 },
+        { name: "Programming", topicCount: 2 },
+        { name: "Finance", topicCount: 2 },
+      ],
+    };
+  }
+
+  it('"proceed" persists the WHOLE decomposition as exactly one Path, with every domain/topic intact', async () => {
+    const db = await getDb(":memory:");
+    const decomposition = makeDecomposition();
+
+    const results = await persistDecomposedGoal(decomposition, "proceed", { db });
+
+    expect(results).toHaveLength(1);
+    const [result] = results;
+    expect(result!.domainCount).toBe(3);
+    expect(result!.topicCount).toBe(6);
+
+    const persistedDomains = await db.select().from(pathDomains).where(eq(pathDomains.pathId, result!.pathId));
+    expect(persistedDomains.map((d) => d.name).sort()).toEqual(["Finance", "Math", "Programming"]);
+    const persistedTopics = await db.select().from(pathTopics).where(eq(pathTopics.pathId, result!.pathId));
+    expect(persistedTopics).toHaveLength(6);
+  });
+
+  it('"split" persists 2-3 correctly-domain-partitioned Paths — a domain never straddles two Paths — without re-decomposing anything', async () => {
+    const db = await getDb(":memory:");
+    const decomposition = makeDecomposition();
+
+    const results = await persistDecomposedGoal(decomposition, "split", { db });
+
+    // 3 domains -> up to 3 phases; each phase is its own real, persisted Path row.
+    expect(results.length).toBeGreaterThanOrEqual(2);
+    expect(results.length).toBeLessThanOrEqual(3);
+    expect(results.reduce((sum, r) => sum + r.topicCount, 0)).toBe(6); // every topic accounted for exactly once
+
+    const allPersistedTopicNames = new Set<string>();
+    const domainNamesByPath: string[][] = [];
+    for (const r of results) {
+      const persistedDomains = await db.select().from(pathDomains).where(eq(pathDomains.pathId, r.pathId));
+      const persistedTopics = await db.select().from(pathTopics).where(eq(pathTopics.pathId, r.pathId));
+      domainNamesByPath.push(persistedDomains.map((d) => d.name).sort());
+      for (const t of persistedTopics) allPersistedTopicNames.add(t.topicName);
+
+      // Every persisted topic's real domain (by name) is one of THIS path's own persisted domains
+      // — a phase never contains a topic whose domain wasn't assigned to it (no cross-phase leaks).
+      const domainIds = new Set(persistedDomains.map((d) => d.id));
+      expect(persistedTopics.every((t) => domainIds.has(t.domainId))).toBe(true);
+    }
+
+    // No domain name appears in more than one persisted Path — a domain is never split across phases.
+    const allDomainNames = domainNamesByPath.flat();
+    expect(new Set(allDomainNames).size).toBe(allDomainNames.length);
+    expect(allDomainNames.sort()).toEqual(["Finance", "Math", "Programming"]);
+
+    // Every real topic name from the original decomposition survived the split intact.
+    expect([...allPersistedTopicNames].sort()).toEqual(
+      ["Calculus", "Linear Algebra", "NumPy", "Options Pricing", "Pandas", "Portfolio Theory"].sort()
+    );
+
+    // Phase 1 (the earliest-tier domain, Math) really is presented/persisted first.
+    const [firstPhase] = results;
+    const firstPhaseDomains = await db.select().from(pathDomains).where(eq(pathDomains.pathId, firstPhase!.pathId));
+    expect(firstPhaseDomains.map((d) => d.name)).toContain("Math");
   });
 });
 
@@ -293,7 +394,7 @@ function makeMockPipeline(db: TeacherDb) {
   const runResearchPipelineFn = async (topic: string, options?: RunResearchPipelineOptions): Promise<CourseJson> => {
     capturedTopics.push(topic);
     capturedGoalContexts.push(options?.goalContext);
-    return { topic, prerequisites: [], subtopics: [], generatedAt: new Date().toISOString() };
+    return { topic, prerequisites: [], subtopics: [], generatedAt: new Date().toISOString(), coverageStatus: "complete" };
   };
   // Mirrors what the real buildCourse() does — inserts a real courses row, since pathTopics.courseId has a real FK to it.
   const buildCourseFn = async (course: CourseJson): Promise<BuildCourseResult> => {

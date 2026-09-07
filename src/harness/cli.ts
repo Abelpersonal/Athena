@@ -42,6 +42,7 @@ import {
 import {
   classifyInput,
   decomposeAndPersistPath,
+  persistDecomposedGoal,
   runOverlapDetectionForPath,
   loadPathRoadmap,
   isTopicGeneratable,
@@ -611,55 +612,97 @@ async function runGoalCommand(args: string[]): Promise<void> {
       `\n[goal-harness] Proceeding as a GOAL${answer && answer !== suggestedDefault ? " (user override)" : ""} — building a multi-domain path.\n`
     );
 
-    const persisted = await decomposeAndPersistPath(input, { db, onProgress });
-    console.log(
-      `\n[goal-harness] Path ${persisted.pathId}: ${persisted.domainCount} domain(s), ${persisted.topicCount} topic(s).`
-    );
+    const decomposed = await decomposeAndPersistPath(input, { db, onProgress });
 
-    console.log("\n[goal-harness] Running overlap detection against existing MasteryState/course data...");
-    let roadmap = await runOverlapDetectionForPath(persisted.pathId, { db, onProgress });
-    printRoadmap(roadmap);
+    let pathIds: string[];
+    if (decomposed.outcome === "persisted") {
+      console.log(
+        `\n[goal-harness] Path ${decomposed.pathId}: ${decomposed.domainCount} domain(s), ${decomposed.topicCount} topic(s).`
+      );
+      pathIds = [decomposed.pathId];
+    } else {
+      // Graceful Over-Large-Goal Handling: never applied silently — the same "confirm before
+      // acting" principle classifyInput()'s own doc comment already establishes for topic-vs-goal.
+      console.log(
+        `\n[goal-harness] This decomposition is unusually large: ${decomposed.topicCount} topic(s) ` +
+          `(hard ceiling: ${decomposed.hardLimit}). Nothing has been persisted yet.`
+      );
+      console.log("Domain breakdown:");
+      decomposed.domainBreakdown.forEach((d) => console.log(`  - ${d.name}: ${d.topicCount} topic(s)`));
 
-    for (;;) {
-      const generatable = roadmap.filter((t) => isTopicGeneratable(t, roadmap));
-      if (generatable.length === 0) {
-        const remaining = roadmap.filter((t) => t.status === "pending" || t.status === "delta_needed");
-        console.log(
-          remaining.length === 0
-            ? "\n[goal-harness] Every topic is linked/mastered — path complete."
-            : "\n[goal-harness] No topic is generatable right now (all remaining ones are waiting on an earlier tier)."
-        );
-        break;
+      const action = (
+        await rl.question(
+          "\nProceed as one large path, split into phased sub-paths, or abort? [proceed/split/abort] (default: split): "
+        )
+      )
+        .trim()
+        .toLowerCase();
+
+      if (action === "abort") {
+        console.log("\n[goal-harness] Aborted — nothing was persisted.");
+        return;
       }
 
-      console.log("\nGeneratable now:");
-      generatable.forEach((t, i) => console.log(`  ${i + 1}. [${t.domainName}] ${t.topicName} (${t.status})`));
-      const pick = (await rl.question('\nPick a number to generate, or "done" to stop: ')).trim().toLowerCase();
-      if (pick === "done" || pick === "") break;
+      const chosenAction = action === "proceed" ? "proceed" : "split";
+      const persistedPhases = await persistDecomposedGoal(decomposed, chosenAction, { db, onProgress });
+      console.log(`\n[goal-harness] Persisted ${persistedPhases.length} path(s):`);
+      persistedPhases.forEach((p, i) =>
+        console.log(`  ${i + 1}. ${p.pathId}: ${p.domainCount} domain(s), ${p.topicCount} topic(s).`)
+      );
+      pathIds = persistedPhases.map((p) => p.pathId);
+    }
 
-      const index = Number(pick) - 1;
-      const chosen = generatable[index];
-      if (!chosen) {
-        console.log("Not a valid choice — try again.");
-        continue;
+    for (let phaseIndex = 0; phaseIndex < pathIds.length; phaseIndex++) {
+      const pathId = pathIds[phaseIndex]!;
+      if (pathIds.length > 1) {
+        console.log(`\n[goal-harness] === Phase ${phaseIndex + 1} of ${pathIds.length}: ${pathId} ===`);
       }
 
-      try {
-        const result = await generateTopicCourse(chosen.id, { db, onProgress });
-        console.log(
-          `\n[goal-harness] Generated ${result.wasDelta ? "delta " : ""}course ${result.courseId} for "${chosen.topicName}" ` +
-            `(${result.moduleCount} module(s), ${result.lessonCount} lesson(s)).`
-        );
-      } catch (error) {
-        if (error instanceof ResearchPipelineError || error instanceof CourseBuilderError) {
-          console.error(`\n[goal-harness] Generation failed for "${chosen.topicName}": ${error.message}`);
-        } else {
-          throw error;
-        }
-      }
-
-      roadmap = await loadPathRoadmap(persisted.pathId, { db });
+      console.log("\n[goal-harness] Running overlap detection against existing MasteryState/course data...");
+      let roadmap = await runOverlapDetectionForPath(pathId, { db, onProgress });
       printRoadmap(roadmap);
+
+      for (;;) {
+        const generatable = roadmap.filter((t) => isTopicGeneratable(t, roadmap));
+        if (generatable.length === 0) {
+          const remaining = roadmap.filter((t) => t.status === "pending" || t.status === "delta_needed");
+          console.log(
+            remaining.length === 0
+              ? "\n[goal-harness] Every topic is linked/mastered — path complete."
+              : "\n[goal-harness] No topic is generatable right now (all remaining ones are waiting on an earlier tier)."
+          );
+          break;
+        }
+
+        console.log("\nGeneratable now:");
+        generatable.forEach((t, i) => console.log(`  ${i + 1}. [${t.domainName}] ${t.topicName} (${t.status})`));
+        const pick = (await rl.question('\nPick a number to generate, or "done" to stop: ')).trim().toLowerCase();
+        if (pick === "done" || pick === "") break;
+
+        const index = Number(pick) - 1;
+        const chosen = generatable[index];
+        if (!chosen) {
+          console.log("Not a valid choice — try again.");
+          continue;
+        }
+
+        try {
+          const result = await generateTopicCourse(chosen.id, { db, onProgress });
+          console.log(
+            `\n[goal-harness] Generated ${result.wasDelta ? "delta " : ""}course ${result.courseId} for "${chosen.topicName}" ` +
+              `(${result.moduleCount} module(s), ${result.lessonCount} lesson(s)).`
+          );
+        } catch (error) {
+          if (error instanceof ResearchPipelineError || error instanceof CourseBuilderError) {
+            console.error(`\n[goal-harness] Generation failed for "${chosen.topicName}": ${error.message}`);
+          } else {
+            throw error;
+          }
+        }
+
+        roadmap = await loadPathRoadmap(pathId, { db });
+        printRoadmap(roadmap);
+      }
     }
   } catch (error) {
     if (error instanceof PathPlannerError) {

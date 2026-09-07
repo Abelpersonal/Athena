@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { computeCrossDomainOrder, PathPlannerError } from "../src/pathPlanner/ordering.js";
+import { computeCrossDomainOrder, partitionDomainsIntoPhases, PathPlannerError } from "../src/pathPlanner/ordering.js";
 import type { OrderableTopic } from "../src/pathPlanner/ordering.js";
 
 function topic(tempId: string, dependsOnTempIds: string[] = []): OrderableTopic {
@@ -57,5 +57,49 @@ describe("computeCrossDomainOrder", () => {
   it("ignores an edge pointing at an unknown tempId rather than crashing", () => {
     const ordered = computeCrossDomainOrder([topic("a", ["does-not-exist"])]);
     expect(ordered[0]!.order).toBe(0);
+  });
+});
+
+describe("partitionDomainsIntoPhases (Graceful Over-Large-Goal Handling)", () => {
+  it("returns an empty array for no domains", () => {
+    expect(partitionDomainsIntoPhases([], [])).toEqual([]);
+  });
+
+  it("returns exactly one phase (no split at all) when there's only one domain", () => {
+    const phases = partitionDomainsIntoPhases(["d1"], [{ domainTempId: "d1", order: 0 }]);
+    expect(phases).toEqual([["d1"]]);
+  });
+
+  it("splits domains into contiguous, tier-ordered phases — never mixing a domain across phases", () => {
+    // d3's topics are earliest (tier 0), d1's are middle (tier 1), d2's are latest (tier 2) —
+    // phase order must follow real tier order, not input array order.
+    const phases = partitionDomainsIntoPhases(
+      ["d1", "d2", "d3"],
+      [
+        { domainTempId: "d1", order: 1 },
+        { domainTempId: "d2", order: 2 },
+        { domainTempId: "d3", order: 0 },
+      ],
+      3
+    );
+    expect(phases).toEqual([["d3"], ["d1"], ["d2"]]);
+    // Every domain appears in exactly one phase — never split, never duplicated.
+    expect(phases.flat().sort()).toEqual(["d1", "d2", "d3"]);
+  });
+
+  it("caps at maxPhases, grouping multiple domains per phase in tier order when there are more domains than phases", () => {
+    const domainTempIds = ["d1", "d2", "d3", "d4", "d5"];
+    const topicRefs = domainTempIds.map((id, i) => ({ domainTempId: id, order: i }));
+    const phases = partitionDomainsIntoPhases(domainTempIds, topicRefs, 3);
+
+    expect(phases).toHaveLength(3);
+    expect(phases.flat().sort()).toEqual(domainTempIds); // every domain placed exactly once
+    // Sizes are as even as possible: 5 domains / 3 phases -> [2, 2, 1].
+    expect(phases.map((p) => p.length).sort((a, b) => b - a)).toEqual([2, 2, 1]);
+  });
+
+  it("a domain with no topics at all sorts as if its earliest tier were 0, rather than crashing", () => {
+    const phases = partitionDomainsIntoPhases(["d1", "d2"], [{ domainTempId: "d1", order: 5 }], 2);
+    expect(phases.flat().sort()).toEqual(["d1", "d2"]);
   });
 });

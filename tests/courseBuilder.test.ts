@@ -85,6 +85,7 @@ function makeCourseJson(): CourseJson {
     prerequisites: ["Basic algebra"],
     subtopics: [makeSubtopic("sub-a", "Subtopic A"), makeSubtopic("sub-b", "Subtopic B"), makeSubtopic("sub-c", "Subtopic C")],
     generatedAt: new Date().toISOString(),
+    coverageStatus: "complete",
   };
 }
 

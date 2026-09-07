@@ -92,6 +92,7 @@ describe("aggregateMaterials", () => {
       prerequisites: [],
       subtopics: [makeSubtopic("sub-a", "Subtopic A", [srcA, srcB])],
       generatedAt: new Date().toISOString(),
+      coverageStatus: "complete",
     };
     const built = await seedCourse(db, course);
 
@@ -130,6 +131,7 @@ describe("aggregateMaterials", () => {
       prerequisites: [],
       subtopics: [makeSubtopic("sub-b", "Subtopic B", [srcA])],
       generatedAt: new Date().toISOString(),
+      coverageStatus: "complete",
     };
     const built = await seedCourse(db, course);
 
@@ -174,6 +176,7 @@ describe("aggregateMaterials", () => {
       prerequisites: [],
       subtopics: [makeSubtopic("sub-c", "Subtopic C", [srcA])],
       generatedAt: new Date().toISOString(),
+      coverageStatus: "complete",
     };
     const built = await seedCourse(db, course);
 
@@ -207,6 +210,7 @@ describe("aggregateMaterials", () => {
       prerequisites: [],
       subtopics: [makeSubtopic("sub-d", "Subtopic D", [makeSource("src_d1", "https://example.com/d1"), makeSource("src_d2", "https://example.com/d2")])],
       generatedAt: new Date().toISOString(),
+      coverageStatus: "complete",
     };
     const built = await seedCourse(db, course);
 
@@ -239,6 +243,7 @@ describe("aggregateMaterials", () => {
         makeSubtopic("sub-f", "Subtopic F", [sharedSourceInSubB, makeSource("src_f2", "https://example.com/f2")]),
       ],
       generatedAt: new Date().toISOString(),
+      coverageStatus: "complete",
     };
     const built = await seedCourse(db, course);
 
@@ -269,6 +274,7 @@ describe("aggregateMaterials", () => {
       prerequisites: [],
       subtopics: [makeSubtopic("sub-g", "Subtopic G", [src, makeSource("src_g2", "https://example.com/g2")])],
       generatedAt: new Date().toISOString(),
+      coverageStatus: "complete",
     };
     const built = await seedCourse(db, course);
 
@@ -309,6 +315,7 @@ describe("aggregateMaterials", () => {
         prerequisites: [],
         subtopics: [subtopic],
         generatedAt: new Date().toISOString(),
+        coverageStatus: "complete",
       };
       const built = await seedCourse(db, course);
 
@@ -348,6 +355,7 @@ describe("aggregateMaterials", () => {
         prerequisites: [],
         subtopics: [subtopic],
         generatedAt: new Date().toISOString(),
+        coverageStatus: "complete",
       };
       const built = await seedCourse(db, course);
 

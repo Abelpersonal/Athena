@@ -4,6 +4,7 @@
 import "./summarizeText.js";
 import "./extractKeyPoints.js";
 import "./decomposeTopic.js";
+import "./auditDecompositionCompleteness.js";
 import "./generateSearchQueries.js";
 import "./generateContentionQueries.js";
 import "./extractGroundedKeyPoints.js";
@@ -43,6 +44,7 @@ export * from "./registry.js";
 export * from "./summarizeText.js";
 export * from "./extractKeyPoints.js";
 export * from "./decomposeTopic.js";
+export * from "./auditDecompositionCompleteness.js";
 export * from "./generateSearchQueries.js";
 export * from "./extractGroundedKeyPoints.js";
 export * from "./synthesizeSubtopic.js";

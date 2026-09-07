@@ -147,6 +147,16 @@ export function createMockOrchestratorRun(): OrchestratorRunFn {
           ],
         });
 
+      // Coverage Completeness Audit addition: always reports the canned decomposition above as
+      // complete — a dry run demonstrates the (already-thoroughly-tested) retry path via the
+      // per-subtopic depth audit instead; this new, separate audit isn't the one being demoed here.
+      case "audit_decomposition_completeness":
+        return respond({
+          complete: true,
+          assessment: "Mock: the canned subtopic list is complete for dry-run wiring checks.",
+          missingSubtopics: [],
+        });
+
       case "generate_search_queries":
       case "generate_contention_queries":
         return respond({ queries: ["mock query one", "mock query two"] });

@@ -39,8 +39,18 @@ const fakeFetchAndClean = async (url: string): Promise<CleanedContent> => ({
 function makeOrchestratorMock(opts: {
   subtopics: Array<{ title: string; description: string }>;
   auditResultsByTitle?: Record<string, boolean[]>;
+  /**
+   * Coverage Completeness Audit addition: sequence of complete/incomplete verdicts for
+   * audit_decomposition_completeness, in call order (attempt 1, attempt 2 if retried). Defaults
+   * to always "complete" (no missing subtopics reported) so every existing test that doesn't care
+   * about this new audit is completely unaffected.
+   */
+  completenessAuditResults?: boolean[];
+  /** What to report as missing on an "incomplete" completeness-audit verdict. Defaults to one canned entry. */
+  missingSubtopicsOnIncomplete?: Array<{ title: string; description: string }>;
 }): OrchestratorRunFn {
   const auditCallCounts = new Map<string, number>();
+  let completenessAuditCallCount = 0;
 
   async function mockRun<T = unknown>(
     taskType: string,
@@ -59,6 +69,21 @@ function makeOrchestratorMock(opts: {
     switch (taskType) {
       case "decompose_topic":
         return respond({ prerequisites: ["prereq A"], subtopics: opts.subtopics });
+
+      case "audit_decomposition_completeness": {
+        completenessAuditCallCount += 1;
+        const sequence = opts.completenessAuditResults ?? [true];
+        const complete = sequence[Math.min(completenessAuditCallCount - 1, sequence.length - 1)] ?? true;
+        return respond({
+          complete,
+          assessment: complete
+            ? "Mock: the subtopic list looks complete."
+            : "Mock: the subtopic list is missing a real sub-area.",
+          missingSubtopics: complete
+            ? []
+            : (opts.missingSubtopicsOnIncomplete ?? [{ title: "Missing Mock Subtopic", description: "d" }]),
+        });
+      }
 
       case "generate_search_queries":
       case "generate_contention_queries":
@@ -386,5 +411,90 @@ describe("runResearchPipeline", () => {
     expect(subtopic.keyPoints[0]!.locator).toEqual({ type: "page", value: 1 });
     expect(subtopic.sources[0]!.chunks).toEqual([{ text: "Page one real text.", locator: { type: "page", value: 1 } }]);
     expect(subtopic.sources[0]!.maxLocatorValue).toBe(5);
+  });
+
+  describe("audit_decomposition_completeness (Coverage Completeness Audit addition)", () => {
+    it("passes on the first attempt with no unnecessary retry when the decomposition is already complete", async () => {
+      let completenessCalls = 0;
+      const inner = makeOrchestratorMock({ subtopics: [{ title: "Only Subtopic", description: "d" }] });
+      const orchestratorRun: OrchestratorRunFn = async (taskType, context, callingModule, options) => {
+        if (taskType === "audit_decomposition_completeness") completenessCalls += 1;
+        return inner(taskType, context, callingModule, options);
+      };
+
+      const course = await runResearchPipeline("A Well-Scoped Topic", {
+        orchestratorRun,
+        searchProvider: fakeSearchProvider(),
+        fetchAndClean: fakeFetchAndClean,
+      });
+
+      expect(completenessCalls).toBe(1); // no retry needed
+      expect(course.coverageStatus).toBe("complete");
+      expect(course.subtopics).toHaveLength(1); // nothing appended
+    });
+
+    it("catches a genuinely incomplete decomposition, appends the missing subtopic on retry, and ships coverageStatus: complete once the retry passes", async () => {
+      const orchestratorRun = makeOrchestratorMock({
+        subtopics: [{ title: "Subtopic A", description: "d" }],
+        completenessAuditResults: [false, true],
+        missingSubtopicsOnIncomplete: [{ title: "Subtopic B", description: "The genuinely missing sub-area." }],
+      });
+
+      const course = await runResearchPipeline("A Topic With A Real Gap", {
+        orchestratorRun,
+        searchProvider: fakeSearchProvider(),
+        fetchAndClean: fakeFetchAndClean,
+      });
+
+      expect(course.coverageStatus).toBe("complete");
+      expect(course.subtopics.map((s) => s.title).sort()).toEqual(["Subtopic A", "Subtopic B"]);
+    });
+
+    it("ships coverageStatus: gaps_noted_after_retry (not blocking generation, not looping) when the gap is still reported after the one retry", async () => {
+      let completenessCalls = 0;
+      const inner = makeOrchestratorMock({
+        subtopics: [{ title: "Subtopic A", description: "d" }],
+        completenessAuditResults: [false, false],
+        missingSubtopicsOnIncomplete: [{ title: "Subtopic B", description: "Still missing, even after the retry." }],
+      });
+      const orchestratorRun: OrchestratorRunFn = async (taskType, context, callingModule, options) => {
+        if (taskType === "audit_decomposition_completeness") completenessCalls += 1;
+        return inner(taskType, context, callingModule, options);
+      };
+
+      const course = await runResearchPipeline("A Topic With A Persistent Gap", {
+        orchestratorRun,
+        searchProvider: fakeSearchProvider(),
+        fetchAndClean: fakeFetchAndClean,
+      });
+
+      expect(completenessCalls).toBe(2); // exactly one retry — never loops further
+      expect(course.coverageStatus).toBe("gaps_noted_after_retry");
+      // The first attempt's missing subtopic IS appended and still gets researched — only the
+      // SECOND (retry) attempt's own verdict is what's merely noted, not chased with a 3rd call.
+      expect(course.subtopics.map((s) => s.title).sort()).toEqual(["Subtopic A", "Subtopic B"]);
+    });
+
+    it("re-checks the hard subtopic-count ceiling after the retry appends missing subtopics, since the audit can only grow the list", async () => {
+      // 44 initial subtopics is below SUBTOPIC_COUNT_HARD_LIMIT (45) but the retry's 2 appended
+      // subtopics push the real, final count to 46 — over the ceiling only once grown.
+      const manySubtopics = Array.from({ length: 44 }, (_, i) => ({ title: `Subtopic ${i}`, description: "d" }));
+      const orchestratorRun = makeOrchestratorMock({
+        subtopics: manySubtopics,
+        completenessAuditResults: [false, true],
+        missingSubtopicsOnIncomplete: [
+          { title: "Extra Subtopic 1", description: "d" },
+          { title: "Extra Subtopic 2", description: "d" },
+        ],
+      });
+
+      await expect(
+        runResearchPipeline("An Implausibly Large Topic With A Reported Gap", {
+          orchestratorRun,
+          searchProvider: fakeSearchProvider(),
+          fetchAndClean: fakeFetchAndClean,
+        })
+      ).rejects.toThrow(ResearchPipelineError);
+    });
   });
 });
