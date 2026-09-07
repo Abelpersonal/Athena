@@ -22,6 +22,7 @@ const { AnthropicProvider } = await import("../src/orchestrator/providers/anthro
 const { GeminiProvider } = await import("../src/orchestrator/providers/geminiProvider.js");
 const { getProvider, resetProviderCache } = await import("../src/orchestrator/providers/index.js");
 const { ApiError } = await import("@google/genai");
+const { TimeoutError } = await import("../src/shared/timeout.js");
 
 const baseParams = {
   model: "test-model",
@@ -87,6 +88,39 @@ describe("AnthropicProvider", () => {
     const provider = new AnthropicProvider();
     const result = await provider.call(baseParams);
     expect(result.finishReason).toBe("max_tokens");
+  });
+});
+
+describe("AnthropicProvider timeout (Timeouts + Hard Cost Cap, Deliverable 1)", () => {
+  beforeEach(() => {
+    mockAnthropicCreate.mockReset();
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("times out with a TimeoutError (not hanging forever) when messages.create never resolves", async () => {
+    mockAnthropicCreate.mockImplementation(() => new Promise(() => {})); // simulates a genuine hang
+
+    const provider = new AnthropicProvider();
+    const resultPromise = provider.call({ ...baseParams, timeoutMs: 5000 });
+    const assertion = expect(resultPromise).rejects.toBeInstanceOf(TimeoutError);
+    await vi.advanceTimersByTimeAsync(5000);
+    await assertion;
+  });
+
+  it("passes a real timeout + AbortSignal through to messages.create's RequestOptions", async () => {
+    mockAnthropicCreate.mockResolvedValueOnce({
+      content: [{ type: "text", text: "hello" }],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+
+    const provider = new AnthropicProvider();
+    await provider.call({ ...baseParams, timeoutMs: 12345 });
+
+    const [, options] = mockAnthropicCreate.mock.calls[0]!;
+    expect(options.timeout).toBe(12345);
+    expect(options.signal).toBeInstanceOf(AbortSignal);
   });
 });
 
@@ -240,6 +274,35 @@ describe("GeminiProvider retry on transient errors", () => {
 
     // 1 initial attempt + 3 retries = 4 total calls.
     expect(mockGeminiGenerateContent).toHaveBeenCalledTimes(4);
+  });
+
+  it("times out with a TimeoutError (not hanging forever, and not retried as if transient) when generateContent never resolves", async () => {
+    mockGeminiGenerateContent.mockImplementation(() => new Promise(() => {})); // simulates a genuine hang
+
+    const provider = new GeminiProvider("test-key");
+    const resultPromise = provider.call({ ...baseParams, timeoutMs: 5000 });
+    const assertion = expect(resultPromise).rejects.toBeInstanceOf(TimeoutError);
+    await vi.advanceTimersByTimeAsync(5000);
+    await assertion;
+
+    // A timeout is not an ApiError, so isRetryableError() correctly says no — retrying a genuine
+    // hang would just hang again for the same duration, not recover like a real transient 503 does.
+    expect(mockGeminiGenerateContent).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes a real timeout (httpOptions.timeout) + abortSignal through to generateContent's config", async () => {
+    mockGeminiGenerateContent.mockResolvedValueOnce({
+      text: "x",
+      usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 },
+      candidates: [{ finishReason: "STOP" }],
+    });
+
+    const provider = new GeminiProvider("test-key");
+    await provider.call({ ...baseParams, timeoutMs: 12345 });
+
+    const [callArgs] = mockGeminiGenerateContent.mock.calls[0]!;
+    expect(callArgs.config.httpOptions).toEqual({ timeout: 12345 });
+    expect(callArgs.config.abortSignal).toBeInstanceOf(AbortSignal);
   });
 });
 

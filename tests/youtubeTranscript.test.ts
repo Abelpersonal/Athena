@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockConnect = vi.fn().mockResolvedValue(undefined);
 const mockCallTool = vi.fn();
@@ -110,8 +110,23 @@ describe("YoutubeTranscriptMCPProvider", () => {
       expect.objectContaining({
         name: "get_timed_transcript",
         arguments: { url: "https://www.youtube.com/watch?v=abc123" },
-      })
+      }),
+      undefined,
+      expect.objectContaining({ timeout: expect.any(Number), signal: expect.any(AbortSignal) })
     );
+  });
+
+  it("passes a real timeout + AbortSignal through to callTool's RequestOptions", async () => {
+    mockCallTool.mockResolvedValueOnce({ isError: false, content: [realTimedTranscriptBlock()] });
+
+    const provider = new YoutubeTranscriptMCPProvider();
+    await provider.getTranscript("https://www.youtube.com/watch?v=abc123");
+
+    const [, resultSchema, options] = mockCallTool.mock.calls[0]!;
+    expect(resultSchema).toBeUndefined();
+    expect(typeof options.timeout).toBe("number");
+    expect(options.signal).toBeInstanceOf(AbortSignal);
+    expect(options.signal.aborted).toBe(false);
   });
 
   it("falls back to the last real caption's own timestamp when _meta.totalDuration is missing", async () => {
@@ -157,5 +172,24 @@ describe("YoutubeTranscriptMCPProvider", () => {
     const result = await provider.getTranscript("https://www.youtube.com/watch?v=abc123");
 
     expect(result).toBeNull();
+  });
+
+  describe("timeout (Timeouts + Hard Cost Cap, Deliverable 1)", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("degrades to null (not hanging forever) with a distinguishable timeout warning, when the MCP server never responds", async () => {
+      mockCallTool.mockImplementation(() => new Promise(() => {})); // simulates a genuine hang
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const provider = new YoutubeTranscriptMCPProvider();
+      const resultPromise = provider.getTranscript("https://www.youtube.com/watch?v=abc123");
+      const assertion = expect(resultPromise).resolves.toBeNull(); // getTranscript's own catch degrades a timeout the same as any other failure
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+
+      expect(warnSpy.mock.calls.some(([msg]) => typeof msg === "string" && msg.includes("timed out"))).toBe(true);
+      warnSpy.mockRestore();
+    });
   });
 });

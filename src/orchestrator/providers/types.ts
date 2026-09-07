@@ -8,6 +8,8 @@ export interface LLMCallParams {
   userPrompt: string;
   thinking: boolean;
   effort: EffortLevel;
+  /** Optional per-call timeout override, in milliseconds. Default (when absent): 60_000 — see each provider's own DEFAULT_TIMEOUT_MS. The Orchestrator always passes this explicitly (from ORCHESTRATOR_REQUEST_TIMEOUT_MS, or its own 60s default); it's optional here purely so existing tests that construct LLMCallParams directly don't need updating. */
+  timeoutMs?: number;
 }
 
 /**

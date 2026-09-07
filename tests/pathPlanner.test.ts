@@ -113,6 +113,59 @@ describe("decomposeAndPersistPath", () => {
     expect(numpy.order).toBeGreaterThan(linAlg.order); // the cross-domain dependency is reflected in the persisted order
     expect(linAlg.parallelGroup).not.toBe(numpy.parallelGroup);
   });
+
+  it("refuses to persist (PathPlannerError, not a warning) when decompose_goal_into_path returns an implausibly large number of topics (Timeouts + Hard Cost Cap, Deliverable 3)", async () => {
+    const db = await getDb(":memory:");
+    // PATH_TOPIC_COUNT_HARD_LIMIT is 3x the 40-topic warning threshold (120) — 121 exceeds it.
+    const manyTopics = Array.from({ length: 121 }, (_, i) => ({
+      tempId: `t${i}`,
+      domainTempId: "d1",
+      topicName: `Topic ${i}`,
+      description: "d",
+    }));
+    let determineDependenciesCalled = false;
+    const mock: MockRun = async (taskType) => {
+      if (taskType === "decompose_goal_into_path") {
+        return respond(taskType, { domains: [{ tempId: "d1", name: "Domain" }], topics: manyTopics });
+      }
+      if (taskType === "determine_cross_domain_dependencies") {
+        determineDependenciesCalled = true;
+        return respond(taskType, { dependencies: manyTopics.map((t) => ({ topicTempId: t.tempId, dependsOnTempIds: [] })) });
+      }
+      throw new Error(`No mock for task type "${taskType}"`);
+    };
+
+    await expect(
+      decomposeAndPersistPath("an implausibly broad goal", { db, orchestratorRun: mock as never })
+    ).rejects.toThrow(PathPlannerError);
+
+    // Refused before the 2nd LLM step even runs, and before anything is persisted.
+    expect(determineDependenciesCalled).toBe(false);
+    const persistedTopics = await db.select().from(pathTopics);
+    expect(persistedTopics).toHaveLength(0);
+  });
+
+  it("still only warns (does not throw) just below the hard ceiling, at the existing warning threshold", async () => {
+    const db = await getDb(":memory:");
+    const someTopics = Array.from({ length: 40 }, (_, i) => ({
+      tempId: `t${i}`,
+      domainTempId: "d1",
+      topicName: `Topic ${i}`,
+      description: "d",
+    }));
+    const mock: MockRun = async (taskType) => {
+      if (taskType === "decompose_goal_into_path") {
+        return respond(taskType, { domains: [{ tempId: "d1", name: "Domain" }], topics: someTopics });
+      }
+      if (taskType === "determine_cross_domain_dependencies") {
+        return respond(taskType, { dependencies: someTopics.map((t) => ({ topicTempId: t.tempId, dependsOnTempIds: [] })) });
+      }
+      throw new Error(`No mock for task type "${taskType}"`);
+    };
+
+    const result = await decomposeAndPersistPath("a broad but plausible goal", { db, orchestratorRun: mock as never });
+    expect(result.topicCount).toBe(40);
+  });
 });
 
 // ---------------------------------------------------------------------------

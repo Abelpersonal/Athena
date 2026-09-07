@@ -1,10 +1,13 @@
 import { GoogleGenAI, FinishReason, ThinkingLevel, ApiError } from "@google/genai";
+import { withTimeout } from "../../shared/timeout.js";
 import type { LLMProvider, LLMCallParams, LLMCallResult, LLMFinishReason } from "./types.js";
 
 /** HTTP statuses worth retrying: rate-limited or transient server/overload errors. */
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const MAX_TRANSIENT_RETRIES = 3;
 const BASE_BACKOFF_MS = 1000;
+/** Used when the Orchestrator doesn't pass an explicit timeoutMs (e.g. a test constructing LLMCallParams directly) — the real caller always supplies one via ORCHESTRATOR_REQUEST_TIMEOUT_MS. */
+const DEFAULT_TIMEOUT_MS = 60_000;
 
 function isRetryableError(error: unknown): boolean {
   return error instanceof ApiError && RETRYABLE_STATUSES.has(error.status);
@@ -53,6 +56,7 @@ export class GeminiProvider implements LLMProvider {
 
   async call(params: LLMCallParams): Promise<LLMCallResult> {
     const ai = this.getClient();
+    const timeoutMs = params.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
     // The Anthropic SDK retries transient 429/5xx errors by default; @google/genai
     // does not, so that behavior is replicated here rather than surfacing a
@@ -65,25 +69,38 @@ export class GeminiProvider implements LLMProvider {
         await sleep(BASE_BACKOFF_MS * 2 ** (attempt - 1));
       }
       try {
-        const response = await ai.models.generateContent({
-          model: params.model,
-          contents: params.userPrompt,
-          config: {
-            systemInstruction: params.systemPrompt,
-            maxOutputTokens: params.maxTokens,
-            // Best-effort JSON hint — the Orchestrator's own parse-and-validate-and-retry
-            // loop remains the actual enforcement mechanism (see validate.ts), so this
-            // isn't relied on for correctness, only for nudging the raw-text success rate up.
-            responseMimeType: "application/json",
-            // thinkingBudget: 0 is documented as DISABLED, but confirmed live (400
-            // invalid_argument) that at least gemini-3.6-flash rejects it outright —
-            // thinkingLevel: MINIMAL is the level-based control and is accepted, so
-            // that's used instead to keep cost/latency down on non-reasoning tasks.
-            // When the template wants thinking on, omit thinkingConfig entirely and
-            // let the model's own default apply, rather than guessing a specific level.
-            ...(params.thinking ? {} : { thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } }),
-          },
-        });
+        // Both `httpOptions.timeout` (the SDK's own internal enforcement, first line of defense
+        // on real infrastructure — confirmed live in its source: it arms its own
+        // setTimeout(() => controller.abort(), timeout) around the real fetch) and `abortSignal`
+        // (this attempt's own AbortController, sourced from withTimeout) are passed on the SAME
+        // GenerateContentConfig the SDK already exposes for exactly this purpose, not two
+        // competing mechanisms. `abortSignal` is what makes a genuine hang provably bounded under
+        // a mocked SDK in tests, where the SDK's own internal timeout (buried inside the real
+        // `generateContent()` we mock away) can't be exercised at all. A fresh signal/timer per
+        // retry attempt, matching the SDK's own "fresh signal per attempt" precedent.
+        const response = await withTimeout("Gemini generateContent", timeoutMs, (signal) =>
+          ai.models.generateContent({
+            model: params.model,
+            contents: params.userPrompt,
+            config: {
+              systemInstruction: params.systemPrompt,
+              maxOutputTokens: params.maxTokens,
+              // Best-effort JSON hint — the Orchestrator's own parse-and-validate-and-retry
+              // loop remains the actual enforcement mechanism (see validate.ts), so this
+              // isn't relied on for correctness, only for nudging the raw-text success rate up.
+              responseMimeType: "application/json",
+              httpOptions: { timeout: timeoutMs },
+              abortSignal: signal,
+              // thinkingBudget: 0 is documented as DISABLED, but confirmed live (400
+              // invalid_argument) that at least gemini-3.6-flash rejects it outright —
+              // thinkingLevel: MINIMAL is the level-based control and is accepted, so
+              // that's used instead to keep cost/latency down on non-reasoning tasks.
+              // When the template wants thinking on, omit thinkingConfig entirely and
+              // let the model's own default apply, rather than guessing a specific level.
+              ...(params.thinking ? {} : { thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } }),
+            },
+          })
+        );
 
         const usage = response.usageMetadata;
         return {

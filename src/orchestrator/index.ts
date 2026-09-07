@@ -8,6 +8,8 @@ import { getProvider } from "./providers/index.js";
 import type { OrchestratorResult } from "./types.js";
 
 const DEFAULT_MAX_RETRIES = Number(process.env.ORCHESTRATOR_MAX_RETRIES ?? 2);
+/** A real synthesis call can legitimately take a while; short enough to fail fast on a genuine hang. */
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
 export class OrchestratorError extends Error {
   constructor(
@@ -18,6 +20,48 @@ export class OrchestratorError extends Error {
     super(message);
     this.name = "OrchestratorError";
   }
+}
+
+/**
+ * Thrown by run() when ORCHESTRATOR_SESSION_BUDGET_USD is set and the running session total has
+ * already reached it — checked BEFORE the call is made (not after), so this call itself never
+ * runs up any additional real cost. `attempts`/`lastRaw` are always 0/"" here (inherited from
+ * OrchestratorError only to stay in the same error family for anything that already catches that
+ * broadly) since no LLM call attempt happens for a request blocked this way.
+ */
+export class OrchestratorBudgetExceededError extends OrchestratorError {
+  constructor(
+    message: string,
+    public readonly currentTotalUsd: number,
+    public readonly budgetUsd: number
+  ) {
+    super(message, 0, "");
+    this.name = "OrchestratorBudgetExceededError";
+  }
+}
+
+/**
+ * Process-lifetime running total of every orchestrator.run() call's real estimated cost so far —
+ * an in-memory module-level accumulator is sufficient (this is a single-process CLI/dev-server
+ * app, not a distributed system; no cross-process/persisted tracking is attempted). Updated in
+ * finalizeFailure() and the success path below so every real, billed attempt counts toward it
+ * regardless of whether that specific call ultimately succeeded or failed after retries.
+ */
+let sessionCostUsd = 0;
+
+/** The running total tracked so far this process. Exported for operator visibility/logging. */
+export function getSessionCost(): number {
+  return sessionCostUsd;
+}
+
+/** Test-only: resets the process-lifetime running cost total, mirroring resetDbCache()'s pattern (src/db/client.ts). */
+export function resetSessionCost(): void {
+  sessionCostUsd = 0;
+}
+
+/** Unset or "0" (the default) means no cap — an explicit opt-in for whoever is about to run real, billed traffic, never a silent trap sprung on existing dev/test workflows that don't set it. */
+function getSessionBudgetUsd(): number {
+  return Number(process.env.ORCHESTRATOR_SESSION_BUDGET_USD ?? 0);
 }
 
 export type ValidateExtraResult = { success: true } | { success: false; error: string };
@@ -59,10 +103,21 @@ export async function run<T = unknown>(
   callingModule: string,
   options: RunOptions = {}
 ): Promise<OrchestratorResult<T>> {
+  const budgetUsd = getSessionBudgetUsd();
+  if (budgetUsd > 0 && sessionCostUsd >= budgetUsd) {
+    throw new OrchestratorBudgetExceededError(
+      `Orchestrator session budget exceeded: $${sessionCostUsd.toFixed(4)} already spent, cap is ` +
+        `$${budgetUsd.toFixed(4)} (ORCHESTRATOR_SESSION_BUDGET_USD) — refusing to start task "${taskType}".`,
+      sessionCostUsd,
+      budgetUsd
+    );
+  }
+
   const template = getTemplate<Record<string, unknown>, T>(taskType);
   const provider = getProvider();
   const model = options.model || process.env.ORCHESTRATOR_MODEL || provider.defaultModel;
   const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
+  const timeoutMs = Number(process.env.ORCHESTRATOR_REQUEST_TIMEOUT_MS ?? DEFAULT_REQUEST_TIMEOUT_MS);
 
   const originalUserPrompt = template.buildUserPrompt(context);
   let userPrompt = originalUserPrompt;
@@ -74,13 +129,15 @@ export async function run<T = unknown>(
   const startedAt = Date.now();
 
   const finalizeFailure = async (error: string): Promise<void> => {
+    const costUsd = estimateCostUsd(model, totalInputTokens, totalOutputTokens);
+    sessionCostUsd += costUsd;
     await logOrchestratorCall({
       taskType,
       model,
       promptVersion: template.version,
       inputTokens: totalInputTokens,
       outputTokens: totalOutputTokens,
-      estimatedCostUsd: estimateCostUsd(model, totalInputTokens, totalOutputTokens),
+      estimatedCostUsd: costUsd,
       latencyMs: Date.now() - startedAt,
       attempts,
       success: false,
@@ -102,6 +159,7 @@ export async function run<T = unknown>(
         userPrompt,
         thinking: template.thinking ?? false,
         effort: template.effort ?? "low",
+        timeoutMs,
       });
     } catch (error) {
       await finalizeFailure(`API call failed: ${(error as Error).message}`);
@@ -137,13 +195,15 @@ export async function run<T = unknown>(
       // ever null when validation succeeded and validateExtra, if present,
       // also passed) but TS can't see that across the branch above.
       const data = (validation as { success: true; data: T }).data;
+      const costUsd = estimateCostUsd(model, totalInputTokens, totalOutputTokens);
+      sessionCostUsd += costUsd;
       await logOrchestratorCall({
         taskType,
         model,
         promptVersion: template.version,
         inputTokens: totalInputTokens,
         outputTokens: totalOutputTokens,
-        estimatedCostUsd: estimateCostUsd(model, totalInputTokens, totalOutputTokens),
+        estimatedCostUsd: costUsd,
         latencyMs: Date.now() - startedAt,
         attempts,
         success: true,

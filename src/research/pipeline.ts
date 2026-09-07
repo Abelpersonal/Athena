@@ -25,6 +25,15 @@ const DEFAULT_MAX_SOURCES_PER_PASS = 5;
 const DEFAULT_MIN_EXTRACTION_CONFIDENCE = 0.3;
 /** decompose_topic returning this many (or more) subtopics is a signal the topic is probably Goal/Syllabus-shaped (Phase 5), not a single course. */
 const SUBTOPIC_COUNT_WARNING_THRESHOLD = 15;
+/**
+ * A hard ceiling — 3x the warning threshold — beyond which the pipeline refuses to proceed rather
+ * than silently running an implausible number of subtopics (each its own multi-call research
+ * pass, plus possible depth-audit retries). A second, structural line of defense alongside the
+ * Orchestrator's own dollar cost cap (ORCHESTRATOR_SESSION_BUDGET_USD) — this one is free and
+ * fires before the run has spent anything on a runaway decomposition, whether or not a budget is
+ * even configured.
+ */
+const SUBTOPIC_COUNT_HARD_LIMIT = SUBTOPIC_COUNT_WARNING_THRESHOLD * 3;
 /** Per-source character cap fed into any prompt, so a handful of long articles doesn't blow the context/cost budget. */
 const MAX_SOURCE_TEXT_CHARS = 4000;
 
@@ -108,6 +117,14 @@ export async function runResearchPipeline(
   );
   const { prerequisites, subtopics: rawSubtopics } = decompose.data;
 
+  if (rawSubtopics.length >= SUBTOPIC_COUNT_HARD_LIMIT) {
+    throw new ResearchPipelineError(
+      `decompose_topic returned ${rawSubtopics.length} subtopics for "${topic}" — this exceeds the hard ` +
+        `ceiling of ${SUBTOPIC_COUNT_HARD_LIMIT} (3x the ${SUBTOPIC_COUNT_WARNING_THRESHOLD}-subtopic warning ` +
+        "threshold). Refusing to proceed rather than running an implausibly large number of subtopics — this " +
+        "topic almost certainly needs Goal/Syllabus mode (Phase 5) instead of a single course."
+    );
+  }
   if (rawSubtopics.length >= SUBTOPIC_COUNT_WARNING_THRESHOLD) {
     console.warn(
       `[research] decompose_topic returned ${rawSubtopics.length} subtopics for "${topic}" — this may be ` +

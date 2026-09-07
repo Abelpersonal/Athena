@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockConnect = vi.fn().mockResolvedValue(undefined);
 const mockCallTool = vi.fn();
@@ -148,7 +148,41 @@ describe("TavilyMCPSearchProvider", () => {
     await provider.search(["anything"]);
 
     expect(mockCallTool).toHaveBeenCalledWith(
-      expect.objectContaining({ name: "tavily_search" })
+      expect.objectContaining({ name: "tavily_search" }),
+      undefined,
+      expect.objectContaining({ timeout: expect.any(Number), signal: expect.any(AbortSignal) })
     );
+  });
+
+  it("passes a real timeout + AbortSignal through to callTool's RequestOptions", async () => {
+    mockCallTool.mockResolvedValueOnce({ isError: false, content: [] });
+
+    const provider = new TavilyMCPSearchProvider({ apiKey: "test-key" });
+    await provider.search(["anything"]);
+
+    const [, resultSchema, options] = mockCallTool.mock.calls[0]!;
+    expect(resultSchema).toBeUndefined();
+    expect(typeof options.timeout).toBe("number");
+    expect(options.signal).toBeInstanceOf(AbortSignal);
+    expect(options.signal.aborted).toBe(false);
+  });
+
+  describe("timeout (Timeouts + Hard Cost Cap, Deliverable 1)", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("degrades to an empty result (not hanging forever) with a distinguishable timeout warning, when the MCP server never responds", async () => {
+      mockCallTool.mockImplementation(() => new Promise(() => {})); // simulates a genuine hang
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const provider = new TavilyMCPSearchProvider({ apiKey: "test-key" });
+      const resultPromise = provider.search(["anything"]);
+      const assertion = expect(resultPromise).resolves.toEqual([]); // searchOne's own catch degrades a timeout the same as any other failure
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+
+      expect(warnSpy.mock.calls.some(([msg]) => typeof msg === "string" && msg.includes("timed out"))).toBe(true);
+      warnSpy.mockRestore();
+    });
   });
 });

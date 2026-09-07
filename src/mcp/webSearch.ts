@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { withTimeout } from "../shared/timeout.js";
+
+/** A real web search across multiple sources normally completes well within this — long enough for normal variance, short enough to fail fast on a genuinely hung MCP server/subprocess. */
+const SEARCH_TIMEOUT_MS = 20_000;
 
 /**
  * A single search result. source_id is a stable identifier this adapter
@@ -175,10 +179,19 @@ export class TavilyMCPSearchProvider implements SearchProvider {
 
   private async searchOne(client: Client, query: string): Promise<SearchResult[]> {
     try {
-      const result = await client.callTool({
-        name: "tavily_search",
-        arguments: { query, max_results: this.maxResultsPerQuery },
-      });
+      // `timeout` is the MCP SDK's own RequestOptions field (its documented, native mechanism —
+      // raises an McpError(RequestTimeout) from request() on real infrastructure); `signal` is
+      // this call's own AbortController, sourced from withTimeout, on the SAME RequestOptions
+      // object — not a second, competing mechanism. `signal` is what makes a genuine hang
+      // provably bounded under a fully-mocked Client in tests (this codebase's established MCP
+      // test convention), where the real request()'s own timeout enforcement can't be exercised.
+      const result = await withTimeout(`Tavily search "${query}"`, SEARCH_TIMEOUT_MS, (signal) =>
+        client.callTool(
+          { name: "tavily_search", arguments: { query, max_results: this.maxResultsPerQuery } },
+          undefined,
+          { timeout: SEARCH_TIMEOUT_MS, signal }
+        )
+      );
 
       if (result.isError) {
         console.warn(

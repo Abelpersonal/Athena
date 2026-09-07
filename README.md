@@ -20,7 +20,7 @@ functional gap.
 
 ## Contents
 
-- [Current status (Phase 11 + Source Diversity + Pre-Real-Testing Gap Fixes)](#current-status-phase-11--source-diversity--pre-real-testing-gap-fixes) —
+- [Current status (post-Phase-11 additions)](#current-status-post-phase-11-additions) —
   what's built, what's real-verified vs. dry-run/mocked, what's still genuinely outstanding
 - [Tech choices](#tech-choices)
 - [Setup](#setup)
@@ -45,25 +45,33 @@ functional gap.
   (a scoped addition, not a numbered phase — the Goal Planner's missing mind map step, the
   citation `locator` finally persisted and rendered, the `GRAPHITI_MCP_URL` env var gap, the
   dependency audit, and an incidentally-discovered `pdf-parse`/`next dev` bundling bug)
+- [Timeouts + Hard Cost Cap](#timeouts--hard-cost-cap-a-scoped-addition-not-a-numbered-phase)
+  (a scoped addition, not a numbered phase — a shared timeout helper extended to every real LLM/
+  MCP call, a hard Orchestrator session cost cap, and hard subtopic/topic-count ceilings)
 - [LLM provider swap](#llm-provider-swap-added-mid-phase-2-not-in-the-original-kickoff-prompt)
 - [Definition of done — status](#definition-of-done--status) (historical, Phases 1-3.5 only —
   each later phase's own "Definition of done" subsection is the record for that phase)
 - [Deviations from the spec (documented)](#deviations-from-the-spec-documented)
 
-## Current status (Phase 11 + Source Diversity + Pre-Real-Testing Gap Fixes)
+## Current status (post-Phase-11 additions)
 
-All ten phases on the PRD's roadmap are built and individually tested; Phase 11 was a polish pass,
-and "Source Diversity" and "Pre-Real-Testing Gap Fixes" (below) are scoped additions after it, not
-new numbered phases — see their own sections below. This is a **summary index**, not a
-re-verification — every claim here is a pointer to the fuller, phase-by-phase record already in
-this document; when in doubt, the linked phase section is the source of truth.
+All ten phases on the PRD's roadmap are built and individually tested; Phase 11 was a polish pass.
+Three scoped additions have followed it, each its own section below rather than a new numbered
+phase: **Source Diversity** (real PDF/YouTube-transcript sources with a citation `locator`),
+**Pre-Real-Testing Gap Fixes** (the Goal Planner's missing mind map step, the locator finally
+persisted/rendered, an env var gap, a dependency audit), and **Timeouts + Hard Cost Cap** (a
+shared timeout on every real LLM/MCP call, a hard Orchestrator session cost cap, hard subtopic/
+topic-count ceilings). This is a **summary index**, not a re-verification — every claim here is a
+pointer to the fuller, phase-by-phase record already in this document; when in doubt, the linked
+phase section is the source of truth.
 
 **What's built, end to end:** topic/goal intake with classify-confirm-override → multi-pass
 research with cited, volatility-tagged sources (now including real PDF and YouTube-transcript
 sources with an optional page/timestamp citation locator that's now persisted AND rendered in the
 Course view, not just HTML articles) → five-layer course persistence → a real per-course concept
 mind map generated for a course reached through EITHER the standalone topic flow or a Goal/Path →
-a Memory Graph of dated facts and mastery history → tiered quizzes and
+a Memory Graph of dated facts and mastery history (now with a real request timeout so a hung graph
+server can't block course generation) → tiered quizzes and
 project/simulation/debate practice with auto-escalating difficulty → a goal/career Path Planner
 with cross-domain ordering and overlap detection → a Continuous Learning Agent (next-topic
 suggestions, verified book recommendations) and a Knowledge Update Agent (real-world drift
@@ -230,6 +238,8 @@ Teacher's own `.env` (repo root):
 | `TAVILY_API_KEY` | Yes (for search) | — | Passed to the Tavily MCP server subprocess. |
 | `ORCHESTRATOR_MODEL` | No | the selected provider's own default (see below) | One-line override to change the model. |
 | `ORCHESTRATOR_MAX_RETRIES` | No | `2` | Retries after the first attempt before a hard failure. |
+| `ORCHESTRATOR_REQUEST_TIMEOUT_MS` | No | `60000` | Per-request timeout for every LLM call (both providers) — see "Timeouts + Hard Cost Cap" below. |
+| `ORCHESTRATOR_SESSION_BUDGET_USD` | No | unset (no cap) | Hard cumulative-cost cap for this process's lifetime — see "Timeouts + Hard Cost Cap" below. |
 | `ORCHESTRATOR_LOG_PATH` | No | `logs/orchestrator.jsonl` | Where the JSONL cost/latency log is written. |
 | `TEACHER_DB_PATH` | No | `data/teacher.db` | Override the SQLite file path (`getDb()`'s default parameter). |
 | `MATERIAL_MIN_VALID_SOURCES` | No | `2` | Minimum `type: "article"` sources a lesson needs before the Material Aggregator's backfill trigger fires. |
@@ -3493,6 +3503,187 @@ specific, not a real production bug: `npm run build && npm run start` never hit 
   the same honest gap Phase 8 already documented (no browser automation tooling in this
   environment); this addition only closes the "does a goal-path course even GET a mind map row"
   gap, not Phase 8's own pre-existing rendering-verification gap.
+
+## Timeouts + Hard Cost Cap (a scoped addition, not a numbered phase)
+
+Every real (non-mocked) I/O call in this codebase had, until this addition, only ever been
+exercised through `--dry-run`/mocked paths — so two real robustness gaps had never had a chance to
+surface: no request timeout on the calls most likely to hang against real infrastructure, and no
+cumulative cost cap on the Orchestrator despite it already computing a per-call cost estimate. Both
+matter specifically at the moment a real, live-billed `TAVILY_API_KEY` (and continued real
+`GEMINI_API_KEY`/`ANTHROPIC_API_KEY` usage) enters the picture — this is a robustness/safety-net
+pass, not a feature phase: every change below wraps or gates an existing call, none of them alter
+what that call does when it succeeds normally under budget and within time.
+
+### Deliverable 1: a shared timeout helper, extended to the four remaining real I/O boundaries
+
+`extraction/fetchAndClean.ts` already did this correctly for raw HTTP fetches — a real
+`AbortController` + a `setTimeout` that aborts it — but that protection had never been extended to
+the Orchestrator's LLM calls, Tavily search, the YouTube transcript MCP adapter, or the Memory
+Graph's MCP calls. `src/shared/timeout.ts`'s `withTimeout(label, timeoutMs, fn)` factors that exact
+shape into one reusable helper: it creates its own `AbortController`, arms a timer, hands `fn` the
+resulting `AbortSignal` to wire into whatever native cancellation the underlying SDK call supports,
+and races `fn`'s own promise against the timer — so a dependency that doesn't itself respect the
+signal (a test's mock, or a genuinely misbehaving real server) still can't hang the caller past
+`timeoutMs`. On timeout it rejects with a single shared `TimeoutError` (name, `label`, `timeoutMs`
+all inspectable) — one type, used identically at all four boundaries, so a caller or a test can
+tell "this timed out" apart from "this genuinely errored" via one `instanceof` check regardless of
+which boundary or vendor produced it.
+
+**Why both a native SDK option AND a self-managed signal, everywhere** — every one of the four call
+sites below passes BOTH the SDK's own native numeric timeout field (`timeout`/`httpOptions.timeout`
+— real, first-line-of-defense enforcement on real infrastructure, confirmed by reading each SDK's
+actual source, not assumed) AND `withTimeout`'s own `AbortSignal` (`signal`/`abortSignal`) on the
+exact same options object the SDK already exposes for cancellation. This is not two competing,
+redundant mechanisms — it's using two fields of the same SDK-native options object, both officially
+documented. The self-managed signal exists specifically because this codebase's established MCP
+test convention (`webSearch.test.ts`, `youtubeTranscript.test.ts`, `memoryGraph.test.ts`) fully
+mocks the `Client` class — which means the real SDK's own internal timeout enforcement (buried
+inside the real `request()`/`generateContent()`/`messages.create()` these mocks replace) can never
+actually be exercised by a unit test. `withTimeout`'s race is what makes "a genuine hang times out"
+provable against a promise that truly never resolves on its own, the way the Definition of Done
+below requires, rather than trusting an SDK's documented behavior without ever exercising it.
+
+| Boundary | File | Timeout | Why this value |
+|---|---|---|---|
+| Every LLM call (Anthropic + Gemini) | `orchestrator/providers/{anthropic,gemini}Provider.ts` | `ORCHESTRATOR_REQUEST_TIMEOUT_MS`, default 60s | A real synthesis call can legitimately take a while; short enough to fail fast on a genuine hang. Every agent's every step routes through this one gateway, making it the single most consequential of the four. |
+| Tavily search | `mcp/webSearch.ts` | 20s (`SEARCH_TIMEOUT_MS`) | A real web search across multiple sources normally completes well within this. |
+| YouTube transcript fetch | `mcp/youtubeTranscript.ts` | 30s (`TRANSCRIPT_TIMEOUT_MS`) | Fetching + formatting captions for a potentially long real video takes a bit longer than a search query. |
+| Memory Graph writes/reads | `memoryGraph/graphitiClient.ts` | 15s (`GRAPH_TIMEOUT_MS`) | Deliberately the shortest of the three MCP timeouts — Phase 3.5's whole design premise is "log and skip on failure, never block course generation" (every call site in `memoryGraph/index.ts` wraps this in try/catch); without a timeout, a hang defeats that design entirely (the call never fails, it just never returns). A short bound is what makes the intended degrade-gracefully behavior actually feel graceful under real network conditions. |
+
+Each of the three MCP-based SDK checks was done against the actually-installed
+`@modelcontextprotocol/sdk@1.30.0`, not assumed: `Client.callTool(params, resultSchema?, options?:
+RequestOptions)` — `RequestOptions.timeout` ("If exceeded, an McpError with code RequestTimeout
+will be raised from request()") and `RequestOptions.signal` ("Can be used to cancel an in-flight
+request. This will cause an AbortError to be raised from request()") are both real, documented
+fields, confirmed by reading `dist/esm/shared/protocol.d.ts` directly. `@anthropic-ai/sdk@0.117.1`'s
+`messages.create(params, options?: RequestOptions)` accepts both `timeout` and `signal` on the same
+`RequestOptions` object (`internal/request-options.d.ts`). `@google/genai@2.17.1`'s
+`GenerateContentConfig` accepts both `httpOptions: {timeout}` and a top-level `abortSignal` —
+reading its actual compiled source (`dist/node/index.cjs`) confirmed `httpOptions.timeout` is
+implemented internally as exactly the same `setTimeout(() => controller.abort(), timeout)` pattern
+`withTimeout` uses, with "a fresh signal per attempt" for its own internal retries — `withTimeout`
+mirrors that same per-attempt freshness for Gemini's own transient-error retry loop.
+
+**The Memory Graph fix is what actually makes Phase 3.5's design work under real conditions, not a
+new behavior** — every Memory Graph write/read was already wrapped in try/catch, logging and
+continuing on any error; without a timeout, a hang was never an "error" at all, it just never
+returned, silently defeating that design. Adding the timeout inside `GraphitiMCPClient.callTool()`
+(the single choke point every one of `memoryGraph/index.ts`'s functions calls through) means every
+existing try/catch now genuinely catches a hang the same way it already caught a real error — zero
+changes needed to `memoryGraph/index.ts` itself.
+
+### Deliverable 2: a hard, session-level cost cap in the Orchestrator
+
+`orchestrator/index.ts` already computed `estimatedCostUsd` per call (for the JSONL log) but never
+summed it across a run or gated on it — the only existing safety nets (the Research Agent's subtopic-
+count warning, the Goal Planner's topic-count warning) were both log-only, not hard stops. A module-
+level `sessionCostUsd` accumulator now tracks the running total for the current process's lifetime
+(an in-memory accumulator — this is a single-process CLI/dev-server app, not a distributed system;
+no cross-process/persisted tracking was built for this). `getSessionCost()`/`resetSessionCost()` are
+exported for operator visibility and tests, mirroring `resetDbCache()`'s existing "testable,
+injectable state" pattern (`db/client.ts`).
+
+`ORCHESTRATOR_SESSION_BUDGET_USD` (new env var) — **unset or `"0"` means no cap**, an explicit
+opt-in for whoever is about to run real, billed traffic, never a silent trap sprung on existing
+dev/test workflows that don't set it. When set, `run()` checks the running total **before** making
+a call (not after — the point is to prevent the next expensive call, not to log that the budget was
+already blown) and throws `OrchestratorBudgetExceededError` (naming the current total and the
+configured cap) rather than letting the call proceed. It extends `OrchestratorError` (an
+`OrchestratorError`-family error, per the kickoff's own framing) with `attempts: 0`/`lastRaw: ""`,
+since no LLM call attempt actually happens for a request blocked this way.
+
+**No caller needed special-casing** — a direct search confirmed nothing outside
+`orchestrator/index.ts` itself ever checks `instanceof OrchestratorError` today; every caller either
+lets Orchestrator failures propagate untouched (`research/pipeline.ts`, `courseBuilder/index.ts`)
+or catches its own domain-specific error type (`ResearchPipelineError`, `CourseBuilderError`,
+`PathPlannerError`) while re-throwing anything else, including a budget error, unchanged. The one
+place that DOES swallow any error broadly — `pathPlanner/index.ts`'s mind map generation step
+(Pre-Real-Testing Gap Fixes, above) — is intentionally degrading, by design, for that one
+enrichment step; a budget-exceeded mind map generation should indeed be logged and skipped exactly
+like a network failure would, not a caller obscuring something it shouldn't.
+
+### Deliverable 3: hard ceilings alongside the existing warning-only thresholds
+
+`SUBTOPIC_COUNT_WARNING_THRESHOLD` (Research Agent, 15) and `PATH_TOPIC_COUNT_WARNING_THRESHOLD`
+(Goal Planner, 40) both used to log-and-continue with no hard stop — the Goal Planner's own comment
+literally said "sanity check, not a hard cap." Each now has a companion hard ceiling at **3x** its
+warning threshold (`SUBTOPIC_COUNT_HARD_LIMIT` = 45, `PATH_TOPIC_COUNT_HARD_LIMIT` = 120) — a
+cheap, structural second line of defense alongside Deliverable 2's dollar cap: a runaway
+decomposition step now refuses to proceed (`ResearchPipelineError`/`PathPlannerError`, checked and
+thrown before either module's own next LLM call or any persistence happens) before it even has the
+chance to run up against the budget cap, and for free even when no budget is configured at all. The
+existing warning behavior at the original thresholds is unchanged.
+
+### What was verified real vs. mocked
+
+Every one of these three deliverables is, by its very nature, about behavior under a hang or a cost
+overrun — conditions that can only be meaningfully proven via simulation, never by trusting a real
+slow call to happen to demonstrate the failure mode on demand (and a genuinely real hang would
+require actually waiting the full timeout, or engineering a real network failure, neither of which
+belongs in an automated test suite). **Everything here was verified via simulated/mocked hangs and
+constructed overrun conditions, not a real slow call this session happened to observe** — consistent
+with this README's running theme (no `TAVILY_API_KEY` in this environment either, so a real hang
+against real Tavily infrastructure was never possible to begin with). Specifically:
+
+- Each of the four I/O boundaries has its own dedicated test using a mock that returns `new
+  Promise(() => {})` — a promise that truly never resolves on its own — combined with
+  `vi.useFakeTimers()`/`vi.advanceTimersByTimeAsync()` to prove the call rejects with a
+  `TimeoutError` (LLM providers) or degrades to an empty/null result with a logged "timed out"
+  warning (Tavily search, YouTube transcript) at exactly the configured timeout, not before and not
+  hanging past it.
+- The Memory Graph boundary gets the DoD's own explicitly-required, more concrete proof:
+  `tests/graphitiClient.test.ts` calls the real `writeTopic()` (the exact function
+  `courseBuilder/index.ts`'s Step 5 calls) with a client whose underlying MCP call never resolves,
+  and confirms `writeTopic()` still resolves normally (course generation proceeds) while logging the
+  failure via `console.error` — the concrete demonstration that the timeout is what actually
+  restores Phase 3.5's "log and skip, never block" design under real network conditions, not just a
+  theoretical claim about the try/catch already being there.
+- The session budget cap is proven with a constructed real-priced (`gemini-3.7-flash`) mock result
+  large enough (1M input/output tokens, ~$4.50/call) to cross a small test cap deterministically: one
+  call under the cap succeeds and accumulates cost, a second call over the cap is refused
+  (`OrchestratorBudgetExceededError`) with the underlying provider mock never even invoked for it — a
+  separate test confirms leaving the env var unset lets five such expensive calls all proceed
+  unblocked, preserving today's behavior exactly.
+- The hard subtopic/topic ceilings are proven by constructing a decomposition result just over each
+  ceiling (46 subtopics, 121 topics) and confirming a hard error — not just a console warning — with
+  the pipeline's next step (contention search / `determine_cross_domain_dependencies`) never
+  reached; a parallel test at exactly the original warning threshold (15 / 40) confirms that case
+  still only warns and proceeds, unchanged.
+
+### Definition of done — Timeouts + Hard Cost Cap
+
+- [x] A simulated hang (mocked provider/MCP client that never resolves) on each of the four I/O
+      boundaries is demonstrated to time out with a clear, distinguishable `TimeoutError` — a
+      dedicated test per boundary (`tests/providers.test.ts` x2, `tests/webSearch.test.ts`,
+      `tests/youtubeTranscript.test.ts`, `tests/graphitiClient.test.ts`), not one shared test.
+- [x] A simulated Memory Graph hang is demonstrated to still degrade gracefully — `writeTopic()`
+      resolves normally and logs the failure — rather than blocking indefinitely.
+- [x] `ORCHESTRATOR_SESSION_BUDGET_USD` set to a low value causes a subsequent call to be refused
+      with `OrchestratorBudgetExceededError` **before** it's made (the underlying mock is never
+      invoked for the refused call); a separate test confirms leaving it unset preserves today's
+      unlimited behavior exactly.
+- [x] The new hard subtopic/topic-count ceilings are demonstrated to actually stop the pipeline
+      (a thrown error, the next step never reached) — not just log — when exceeded, while the
+      original warning-only behavior at the original thresholds is unchanged.
+- [x] All existing tests still pass (381/381 total); `npm run typecheck` clean (both configs),
+      `npm run lint` clean, `npm run build` succeeds.
+- [x] README updated: this section, the four timeout locations/defaults/reasoning above, the two
+      new env vars (`ORCHESTRATOR_REQUEST_TIMEOUT_MS`, `ORCHESTRATOR_SESSION_BUDGET_USD`, both
+      added to `.env.example` and the "Environment variables" table), the new hard ceilings and
+      their values, and what was verified via simulation vs. any real slow call (none — see above).
+
+### Documented gaps
+
+- **No real hang against real infrastructure was ever observed or could be** — same root cause
+  threading through this whole README: no `TAVILY_API_KEY` in this environment, and a real LLM
+  hang isn't something you can wait around for on demand either. Every timeout's correctness rests
+  on (a) each SDK's own documented, source-verified behavior for its native `timeout`/`signal`
+  options, and (b) `withTimeout`'s own bounding logic, which IS fully, deterministically tested.
+- **The chosen MCP timeout values (20s/30s/15s) are judgment calls, not measured against real
+  Tavily/YouTube-transcript/Graphiti latency** — reasonable defaults documented with their
+  reasoning above, not tuned against real observed p95 latencies this environment has never been
+  able to produce.
 
 ## LLM provider swap (added mid-Phase-2, not in the original kickoff prompt)
 

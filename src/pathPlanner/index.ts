@@ -33,8 +33,17 @@ export type OrchestratorRunFn = typeof orchestratorRun;
 export type ProgressListener = (message: string) => void;
 export type PathTopicStatus = "pending" | "linked_existing" | "delta_needed" | "in_progress" | "mastered";
 
-/** Sanity-check only (not a hard cap) — this is a personal tool, not a system that needs to protect itself from its own user. */
+/** Sanity-check warning threshold. */
 const PATH_TOPIC_COUNT_WARNING_THRESHOLD = 40;
+/**
+ * A hard ceiling — 3x the warning threshold — beyond which the pipeline refuses to persist an
+ * implausibly large path rather than silently proceeding. This IS a real hard cap (unlike the
+ * warning threshold above, which stays log-only) — a genuinely broad goal that decomposes into
+ * this many topics would run this many topics' worth of course generations, each its own
+ * multi-call research pass, with no automatic circuit breaker otherwise. A second, structural
+ * line of defense alongside the Orchestrator's own dollar cost cap (ORCHESTRATOR_SESSION_BUDGET_USD).
+ */
+const PATH_TOPIC_COUNT_HARD_LIMIT = PATH_TOPIC_COUNT_WARNING_THRESHOLD * 3;
 
 function randomSuffix(): string {
   return randomBytes(3).toString("hex");
@@ -99,10 +108,17 @@ export async function decomposeAndPersistPath(
   );
   const { domains, topics } = decomposeResult.data;
 
+  if (topics.length >= PATH_TOPIC_COUNT_HARD_LIMIT) {
+    throw new PathPlannerError(
+      `decompose_goal_into_path returned ${topics.length} topics for "${goalDescription}" — this exceeds the ` +
+        `hard ceiling of ${PATH_TOPIC_COUNT_HARD_LIMIT} (3x the ${PATH_TOPIC_COUNT_WARNING_THRESHOLD}-topic ` +
+        "warning threshold). Refusing to persist an implausibly large path."
+    );
+  }
   if (topics.length >= PATH_TOPIC_COUNT_WARNING_THRESHOLD) {
     console.warn(
       `[path-planner] decompose_goal_into_path returned ${topics.length} topics for "${goalDescription}" — ` +
-        "unusually large for a single roadmap. Proceeding anyway (sanity check, not a hard cap)."
+        "unusually large for a single roadmap. Proceeding anyway (below the hard ceiling)."
     );
   }
 

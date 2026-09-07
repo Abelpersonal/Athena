@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockCall = vi.fn();
 
@@ -10,7 +10,9 @@ vi.mock("../src/orchestrator/providers/index.js", () => ({
   getProvider: () => ({ name: "mock", defaultModel: "mock-model", call: mockCall }),
 }));
 
-const { run, OrchestratorError } = await import("../src/orchestrator/index.js");
+const { run, OrchestratorError, OrchestratorBudgetExceededError, getSessionCost, resetSessionCost } = await import(
+  "../src/orchestrator/index.js"
+);
 
 function llmResult(text: string, finishReason: "end_turn" | "max_tokens" | "refusal" | "other" = "end_turn") {
   return { text, inputTokens: 10, outputTokens: 20, finishReason };
@@ -19,6 +21,7 @@ function llmResult(text: string, finishReason: "end_turn" | "max_tokens" | "refu
 describe("orchestrator retry logic", () => {
   beforeEach(() => {
     mockCall.mockReset();
+    resetSessionCost();
   });
 
   it("retries once on an invalid response, then succeeds", async () => {
@@ -103,5 +106,86 @@ describe("orchestrator retry logic", () => {
     ).rejects.toThrow(/No prompt template registered/);
 
     expect(mockCall).not.toHaveBeenCalled();
+  });
+});
+
+describe("orchestrator session cost budget cap (Timeouts + Hard Cost Cap, Deliverable 2)", () => {
+  const originalBudget = process.env.ORCHESTRATOR_SESSION_BUDGET_USD;
+
+  // A real, priced model (see src/orchestrator/pricing.ts) — the mocked provider's own
+  // "mock-model" has no pricing entry and would cost $0, which can't exercise a dollar cap.
+  const PRICED_MODEL = "gemini-3.7-flash";
+  // Real gemini-3.7-flash pricing ($0.75/$3.75 per 1M input/output tokens) with a deliberately
+  // huge token count so one call's real estimated cost ($4.50) is large enough to cross a small
+  // test budget cleanly, without the test depending on exact floating-point cost arithmetic.
+  const expensiveResult = () => ({
+    text: JSON.stringify({ summary: "A short summary.", wordCount: 3 }),
+    inputTokens: 1_000_000,
+    outputTokens: 1_000_000,
+    finishReason: "end_turn" as const,
+  });
+  const runPriced = (text: string) =>
+    run("summarize_text", { text }, "test-module", { model: PRICED_MODEL });
+
+  beforeEach(() => {
+    mockCall.mockReset();
+    resetSessionCost();
+  });
+
+  afterEach(() => {
+    resetSessionCost();
+    if (originalBudget === undefined) delete process.env.ORCHESTRATOR_SESSION_BUDGET_USD;
+    else process.env.ORCHESTRATOR_SESSION_BUDGET_USD = originalBudget;
+  });
+
+  it("leaving ORCHESTRATOR_SESSION_BUDGET_USD unset preserves today's unlimited behavior exactly — no call is ever blocked", async () => {
+    delete process.env.ORCHESTRATOR_SESSION_BUDGET_USD;
+    mockCall.mockResolvedValue(expensiveResult());
+
+    for (let i = 0; i < 5; i++) {
+      await runPriced("Some long text to summarize.");
+    }
+
+    expect(mockCall).toHaveBeenCalledTimes(5);
+    expect(getSessionCost()).toBeCloseTo(4.5 * 5, 5);
+  });
+
+  it("refuses a call BEFORE making it once the running total reaches the configured cap", async () => {
+    process.env.ORCHESTRATOR_SESSION_BUDGET_USD = "4"; // one $4.50 call already exceeds this
+    mockCall.mockResolvedValue(expensiveResult());
+
+    // First call: budget check passes (running total is still $0 < $4 cap) — proceeds normally.
+    const first = await runPriced("First call.");
+    expect(first.data).toEqual({ summary: "A short summary.", wordCount: 3 });
+    expect(mockCall).toHaveBeenCalledTimes(1);
+    expect(getSessionCost()).toBeCloseTo(4.5, 5);
+
+    // Second call: running total ($4.50) now exceeds the $4 cap — refused BEFORE the call is made.
+    await expect(runPriced("Second call.")).rejects.toBeInstanceOf(OrchestratorBudgetExceededError);
+    expect(mockCall).toHaveBeenCalledTimes(1); // still 1 — the second call never actually ran
+  });
+
+  it("OrchestratorBudgetExceededError names the current total and the configured cap", async () => {
+    process.env.ORCHESTRATOR_SESSION_BUDGET_USD = "4";
+    mockCall.mockResolvedValue(expensiveResult());
+    await runPriced("First call.");
+
+    const error: InstanceType<typeof OrchestratorBudgetExceededError> = await runPriced("Second call.").catch(
+      (e) => e
+    );
+
+    expect(error).toBeInstanceOf(OrchestratorBudgetExceededError);
+    expect(error.currentTotalUsd).toBeCloseTo(4.5, 5);
+    expect(error.budgetUsd).toBe(4);
+    expect(error.message).toContain("4.5");
+    expect(error.message).toContain("4.0000");
+  });
+
+  it("is an OrchestratorError-family error (a caller catching OrchestratorError broadly still catches this)", async () => {
+    process.env.ORCHESTRATOR_SESSION_BUDGET_USD = "4";
+    mockCall.mockResolvedValue(expensiveResult());
+    await runPriced("First call.");
+
+    await expect(runPriced("Second call.")).rejects.toBeInstanceOf(OrchestratorError);
   });
 });

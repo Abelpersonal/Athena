@@ -1,5 +1,9 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { withTimeout } from "../shared/timeout.js";
+
+/** Longer than the search timeout — fetching and formatting captions for a potentially long real video takes a bit more time than a search query, but should still fail fast on a genuinely hung MCP server/subprocess. */
+const TRANSCRIPT_TIMEOUT_MS = 30_000;
 
 /** One caption line, with its real, natural-format timestamp (e.g. "4:32", "1:04:32" once past an hour) — never flattened into plain prose, since the timestamp is exactly what the locator (src/shared/locator.ts) needs to anchor a citation. */
 export interface TranscriptSegment {
@@ -123,7 +127,17 @@ export class YoutubeTranscriptMCPProvider implements TranscriptProvider {
     if (!client) return null;
 
     try {
-      const result = await client.callTool({ name: "get_timed_transcript", arguments: { url: videoUrl } });
+      // Same rationale as webSearch.ts's searchOne(): `timeout` is the MCP SDK's own native
+      // RequestOptions field, `signal` is this call's own AbortController (from withTimeout) on
+      // the same options object — the latter is what makes a genuine hang provably bounded under
+      // a fully-mocked Client in tests, where the real request()'s own enforcement is bypassed.
+      const result = await withTimeout(`YouTube transcript for ${videoUrl}`, TRANSCRIPT_TIMEOUT_MS, (signal) =>
+        client.callTool(
+          { name: "get_timed_transcript", arguments: { url: videoUrl } },
+          undefined,
+          { timeout: TRANSCRIPT_TIMEOUT_MS, signal }
+        )
+      );
       if (result.isError) {
         console.warn(`[youtubeTranscript] get_timed_transcript returned an error for ${videoUrl}: ${JSON.stringify(result.content)}`);
         return null;

@@ -1,6 +1,17 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { withTimeout } from "../shared/timeout.js";
 import { isErrorResponse } from "./types.js";
+
+/**
+ * Deliberately the SHORTEST of the three MCP timeouts — Phase 3.5's whole design premise is
+ * "log and skip on failure, never block course generation" (every call site in
+ * `memoryGraph/index.ts` wraps this in try/catch); without a timeout, a hang defeats that design
+ * entirely (the call never fails, it just never returns). A short bound is what makes the
+ * intended degrade-gracefully behavior actually feel graceful under real network conditions,
+ * rather than adding a long stall to every subtopic/course write.
+ */
+const GRAPH_TIMEOUT_MS = 15_000;
 
 /**
  * Graphiti's MCP server (getzep/graphiti's mcp_server, run via
@@ -84,7 +95,14 @@ export class GraphitiMCPClient {
       throw new Error(`Not connected to the Graphiti MCP server (tool: "${name}").`);
     }
 
-    const result = await client.callTool({ name, arguments: args });
+    // Same rationale as webSearch.ts's searchOne()/youtubeTranscript.ts's getTranscript(): `timeout`
+    // is the MCP SDK's own native RequestOptions field, `signal` is this call's own
+    // AbortController (from withTimeout) on the same options object — the latter is what makes a
+    // genuine hang provably bounded under a fully-mocked Client in tests, and is what actually
+    // restores this module's "log and skip, never block" design under real network conditions.
+    const result = await withTimeout(`Graphiti ${name}`, GRAPH_TIMEOUT_MS, (signal) =>
+      client.callTool({ name, arguments: args }, undefined, { timeout: GRAPH_TIMEOUT_MS, signal })
+    );
     if (result.isError) {
       throw new Error(`Graphiti tool "${name}" returned an error: ${JSON.stringify(result.content)}`);
     }

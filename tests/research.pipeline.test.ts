@@ -308,6 +308,34 @@ describe("runResearchPipeline", () => {
     expect(subtopic.sources.every((s) => s.extractionConfidence >= 0.3)).toBe(true);
   });
 
+  it("refuses to proceed (ResearchPipelineError, not a warning) when decompose_topic returns an implausibly large number of subtopics (Timeouts + Hard Cost Cap, Deliverable 3)", async () => {
+    // SUBTOPIC_COUNT_HARD_LIMIT is 3x the 15-subtopic warning threshold (45) — 46 exceeds it.
+    const manySubtopics = Array.from({ length: 46 }, (_, i) => ({ title: `Subtopic ${i}`, description: "d" }));
+    const orchestratorRun = makeOrchestratorMock({ subtopics: manySubtopics });
+
+    await expect(
+      runResearchPipeline("An implausibly broad topic", {
+        orchestratorRun,
+        searchProvider: fakeSearchProvider(),
+        fetchAndClean: fakeFetchAndClean,
+      })
+    ).rejects.toThrow(ResearchPipelineError);
+  });
+
+  it("still only warns (does not throw) just below the hard ceiling, at the existing warning threshold", async () => {
+    // 15 subtopics hits the existing warning threshold but is far below the 45-subtopic hard limit.
+    const someSubtopics = Array.from({ length: 15 }, (_, i) => ({ title: `Subtopic ${i}`, description: "d" }));
+    const orchestratorRun = makeOrchestratorMock({ subtopics: someSubtopics });
+
+    const course = await runResearchPipeline("A broad but plausible topic", {
+      orchestratorRun,
+      searchProvider: fakeSearchProvider(),
+      fetchAndClean: fakeFetchAndClean,
+    });
+
+    expect(course.subtopics).toHaveLength(15);
+  });
+
   it("threads a real locator from a chunked (pdf/video) source's excerpt through extract_grounded_key_points into the resulting course JSON's key points", async () => {
     const inner = makeOrchestratorMock({ subtopics: [{ title: "Chunked Source Topic", description: "d" }] });
     async function orchestratorRun<T = unknown>(
