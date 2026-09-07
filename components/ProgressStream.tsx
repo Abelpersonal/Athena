@@ -23,6 +23,11 @@ export function useProgressStream<T>(url: string | null): ProgressStreamState<T>
 
   useEffect(() => {
     if (!url) return;
+    // Reviewed (Phase 11 lint pass): resetting local state when `url` changes, before opening a
+    // NEW real external connection (EventSource) for it, is the React-documented pattern for
+    // "resetting state when a prop changes" — without this, a second stream would render with
+    // the first one's stale lines/result/error still showing until the new events arrive.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLines([]);
     setResult(null);
     setError(null);
@@ -66,7 +71,11 @@ export function useProgressStream<T>(url: string | null): ProgressStreamState<T>
 export function ProgressLog({ lines }: { lines: string[] }) {
   if (lines.length === 0) return null;
   return (
-    <ul className="text-sm text-[var(--color-text-muted)] font-mono space-y-0.5 max-h-64 overflow-y-auto border border-[var(--color-border)] rounded-lg p-3 bg-[var(--color-surface)]">
+    <ul
+      role="log"
+      aria-live="polite"
+      className="text-sm text-[var(--color-text-muted)] font-mono space-y-0.5 max-h-64 overflow-y-auto border border-[var(--color-border)] rounded-lg p-3 bg-[var(--color-surface)]"
+    >
       {lines.map((line, i) => (
         <li key={i}>{line}</li>
       ))}

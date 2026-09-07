@@ -1,59 +1,108 @@
-# Teacher — Orchestrator, Search, the Research Agent, Course Persistence, the Memory Graph, Quiz/Practice Engines, and the Goal Planner
+# Athena
 
-Backend-first plumbing for a personal, single-user AI learning platform.
+A personal, single-user AI learning platform: give it a topic ("Special Relativity") or a goal
+("become a full-stack quant"), and it researches real, cited sources, builds a five-layer course
+(intuition → mechanics → formal → application → frontier), teaches it with voice narration and
+grounded Q&A, quizzes and coaches you through
+project/simulation/debate practice, tracks real mastery over time, decomposes a big goal into an
+ordered multi-domain path of topics with overlap detection against what you've already mastered,
+generates a concept mind map, watches its own content for real-world changes and pushes you an
+alert when something material shifts, notices when you've gone quiet and nudges you back once
+gently, and installs as an offline-capable PWA on a phone. Ten build phases plus this polish pass
+got it there — this README is the full build record, in the order it happened, plus (right below)
+a map of the document and an honest account of what's actually been verified versus what's still
+outstanding.
 
-- **Phase 1** built the two things every later agent depends on: **the Orchestrator**
-  (`src/orchestrator/`) — the single gateway every agent uses to call Claude — and **a web
-  search adapter** (`src/mcp/`) — Tavily's MCP server behind a small interface.
-- **Phase 2 + 2.5** build the **Research Agent** (`src/research/`) on top of Phase 1: a
-  multi-pass pipeline that decomposes a topic, researches and synthesizes each subtopic with
-  cited sources, self-audits its own depth and retries the subtopics that fall short, and tags
-  the topic's volatility. Its output is a structured "course JSON" — subtopics with layered,
-  cited content — ephemeral until Phase 3 persists it.
-- **Phase 3** turns that ephemeral JSON into real, persisted course data: the **Course Builder**
-  (`src/courseBuilder/`) sequences subtopics into modules and lessons respecting prerequisite
-  order and writes `Course`/`Module`/`Lesson` records to SQLite; the **Material Aggregator**
-  (`src/materialAggregator/`) re-fetches and permanently persists the sources cited during
-  research, links them to their lesson, and triggers a targeted re-search when a lesson lands
-  below the minimum valid-source count.
-- **Phase 3.5** stands up the real **Memory Graph** — Graphiti on FalkorDB, run as a separate
-  Docker service and reached over MCP (`src/memoryGraph/`) — and fills in Phase 3's stub exactly
-  at its Course Builder call site, plus writes Phase 2's grounded key points as dated episodic
-  facts once the Material Aggregator has persisted their real source ids.
-- **Phase 4** builds the two modules that turn "content was generated" into "the user actually
-  learned something": the **Quiz/Assessment Engine** (`src/quizEngine/`) generates tiered
-  (recall/application/transfer) questions grounded in a lesson's own persisted content, captures
-  answers via the CLI harness, scores objective questions in code and free-text answers
-  semantically via the Orchestrator, and persists `QuizResult` rows. The **Practice/Experience
-  Engine** (`src/practiceEngine/`) classifies a module's topic_type, selects and generates a
-  practice format (project/simulation/debate — simulation and debate run as real multi-turn CLI
-  dialogues), critiques the learner's actual output, and persists `PracticeAttempt` rows, with up
-  to `DEFAULT_ESCALATION_CAP` (3) attempts auto-escalating in difficulty. Both engines write to
-  the new `MasteryState` table — SQLite for queryable current state, and the Memory Graph for a
-  dated history of how each concept node's score changed — see "Phase 4" below for the full
-  writeup, including two documented deviations from the PRD's literal spec.
-- **Phase 5** adds the layer in front of the single-topic pipeline: the **Goal/Career Path
-  Planner** (`src/pathPlanner/`) classifies a raw input as a narrow topic or a broad goal
-  (CLI-confirmed, never applied silently), decomposes a goal into skill domains and topics with a
-  prerequisite order computed ACROSS domains (not just within one), runs overlap detection against
-  Phase 4's `MasteryState` and Phase 3.5's Memory Graph before generating anything, and generates
-  courses **on demand** — one topic at a time, picked by the user, respecting tier order — rather
-  than building the whole roadmap upfront. Introduces an original `Path`/`PathDomain`/`PathTopic`
-  data model (the PRD's Section 7 table has no Path entity, despite section 5.12a requiring one)
-  and one small additive parameter on the Research Agent for goal-scoped depth. See "Phase 5"
-  below for the full writeup, including two documented deviations from the PRD's literal spec.
+Originally built under the working name "Teacher"; renamed to Athena partway through — some older
+phase writeups below may still say "Teacher" or refer to the package as `teacher` (`package.json`'s
+`name` field is `athena`, matching the current name). This is a naming-history footnote, not a
+functional gap.
 
-There is no Mind Map generation (Phase 8), Teaching Engine/voice (Phase 7.5), or Continuous
-Learning/Knowledge Update Agents (Phase 6) here yet, and no frontend — everything through Phase 5
-is exercised via the CLI harness. **Important caveat, read before relying on the
-Definition-of-done checklists below:** this environment has no Docker installed, so the Memory
-Graph's Docker Compose setup, live MCP writes, and `inspect-graph` output could not be run or
-verified live here (Phase 3.5's gap, which also applies to Phase 4's and Phase 5's `MasteryState`
-Memory Graph mirroring) — see "The Docker verification gap" near the end of this README before
-treating those items as confirmed. This environment also has no `TAVILY_API_KEY` configured, so a
-real (non-mocked) `research`/`build` run — and therefore any course generation that needs real web
-search, including Phase 5's on-demand generation — could not be done either; see "The real-run
-blocker" below for how Phases 4 and 5 worked around this for their own demonstrations.
+## Contents
+
+- [Current status (Phase 11)](#current-status-phase-11) — what's built, what's real-verified vs.
+  dry-run/mocked, what's still genuinely outstanding
+- [Tech choices](#tech-choices)
+- [Setup](#setup)
+- [Running the harness](#running-the-harness)
+- [Running tests](#running-tests)
+- [Architecture](#architecture) (Phases 1-3.5: Orchestrator, Research Agent, Course Builder,
+  Material Aggregator, Memory Graph)
+- [Phase 4: the Quiz/Assessment Engine and Practice/Experience Engine](#phase-4-the-quizassessment-engine-and-practiceexperience-engine)
+- [Phase 5: the Goal/Career Path Planner](#phase-5-the-goalcareer-path-planner)
+- [Phase 6: the Continuous Learning Agent and the Knowledge Update Agent](#phase-6-the-continuous-learning-agent-and-the-knowledge-update-agent)
+- [Phase 7: the frontend (Next.js)](#phase-7-the-frontend-nextjs-against-the-real-phase-1-6-backend)
+- [Phase 7.5: the Teaching Engine voice layer](#phase-75-the-teaching-engine-voice-layer)
+- [Phase 8: the Mind Map Agent, React Flow viewer, and starting menu](#phase-8-the-mind-map-agent-the-react-flow-viewer-and-the-starting-menu)
+- [Phase 9: the Motivation/Engagement Layer](#phase-9-the-motivationengagement-layer)
+- [Phase 10: Mobile — PWA, offline mode, background sync, and real push](#phase-10-mobile--pwa-offline-mode-background-sync-and-real-push)
+- [Phase 11: the polish pass](#phase-11-the-polish-pass) (this phase — loading/error boundaries,
+  accessibility, lint, this README rewrite)
+- [LLM provider swap](#llm-provider-swap-added-mid-phase-2-not-in-the-original-kickoff-prompt)
+- [Definition of done — status](#definition-of-done--status) (historical, Phases 1-3.5 only —
+  each later phase's own "Definition of done" subsection is the record for that phase)
+- [Deviations from the spec (documented)](#deviations-from-the-spec-documented)
+
+## Current status (Phase 11)
+
+All ten phases on the PRD's roadmap are built and individually tested; this eleventh phase is a
+polish pass, not a new feature phase (see its own section below). This is a **summary index**, not
+a re-verification — every claim here is a pointer to the fuller, phase-by-phase record already in
+this document; when in doubt, the linked phase section is the source of truth.
+
+**What's built, end to end:** topic/goal intake with classify-confirm-override → multi-pass
+research with cited, volatility-tagged sources → five-layer course persistence → a Memory Graph
+of dated facts and mastery history → tiered quizzes and project/simulation/debate practice with
+auto-escalating difficulty → a goal/career Path Planner with cross-domain ordering and overlap
+detection → a Continuous Learning Agent (next-topic suggestions, verified book recommendations)
+and a Knowledge Update Agent (real-world drift detection, severity-routed digests) → a full
+Next.js frontend over all of the above → voice narration with lock-screen media controls → a
+per-course concept mind map and a fixed self-improvement starting menu → real activity tracking,
+momentum streaks, low-friction re-entry, boredom-proofing, and milestone celebration → PWA
+installability, explicit offline download, background sync of queued offline actions, and real
+Web Push for both PRD-named cases (major knowledge updates, an inactivity nudge).
+
+**Verified live vs. dry-run/mocked — the running themes across every phase, not repeated per item:**
+
+- **The Memory Graph (Graphiti/FalkorDB via Docker Compose) has never been reachable in any
+  environment this project has been built in, Phase 3.5 through Phase 11.** Every phase's Memory
+  Graph write is real code on a real, tested degrade-and-log path (confirmed live every single
+  time: a real connection attempt, a real logged failure, the calling operation still succeeding)
+  — but the actual graph writes themselves, and `inspect-graph`'s output, have never been
+  confirmed against a live Graphiti instance. See "The Docker verification gap" further down.
+- **`TAVILY_API_KEY` has never been set in this environment**, so real (non-mocked) web search —
+  and therefore a genuinely real `research`/`build`/`knowledge-update` run — has never been
+  exercised end-to-end either; every "real" course build referenced below used
+  `--dry-run`'s mocked search/extraction path. `GEMINI_API_KEY` (the default LLM provider) HAS
+  been real and working since Phase 6, subject to the Gemini free tier's real daily quota, which
+  this project's own testing has hit more than once (documented plainly where it happened, e.g.
+  Phase 10's download-route verification).
+- **`OPENAI_API_KEY` (Phase 7.5's TTS provider) has never been set**, so real synthesized audio
+  has never been generated in this environment — every voice-layer verification used
+  `TTS_PROVIDER=browser` (the zero-cost `window.speechSynthesis` stage), which is a real, working,
+  differently-verified code path, not a stand-in for the OpenAI path.
+- **No real mobile browser or device exists in this environment.** This is the sharpest edge of
+  Phase 10 (PWA installability, airplane-mode offline behavior, backgrounded-PWA audio, real push
+  delivery to a device) and it remains open after Phase 11's own attempt to close it — see Phase
+  10's and Phase 11's own Definition of Done sections for exactly what's independently verified
+  instead (real HTTP-level checks, unit tests, and live-confirmed logic against constructed data).
+- Every phase's own **"Definition of done"** subsection makes this same distinction explicit for
+  that phase's specific deliverables — read the phase section linked above for the real detail
+  behind any one claim.
+
+**What's still genuinely outstanding, going into any future work on this project:**
+
+1. A real Docker/Graphiti instance, run once, to confirm the Memory Graph's actual write/query
+   behavior beyond its (real, tested) degrade path.
+2. A real `TAVILY_API_KEY`, to run one genuinely real (non-dry-run) course build end to end.
+3. A real device pass for Phase 10's four still-open items (install, offline, backgrounded audio,
+   push delivery) — attempted again in Phase 11 with no real device available either.
+4. Real OpenAI TTS audio, generated at least once, to confirm Phase 7.5's Stage 2 path beyond its
+   already-real Stage 1 (`browser` mode) verification.
+
+None of these are code gaps — they're real-world verification this sandboxed build environment
+has never had the credentials or hardware to close, documented honestly at every phase rather than
+asserted away.
 
 ## Tech choices
 
@@ -2889,6 +2938,187 @@ delivery to the rest.
 - **Safari/iOS has no Background Sync API** — a permanent platform gap, not a version-lag issue.
   The `online`-event fallback (`ServiceWorkerRegister.tsx`) covers it, at the cost of only syncing
   while a tab is actually open on that platform, rather than in the background.
+
+## Phase 11: the polish pass
+
+The last item on the PRD's roadmap. All ten functional phases were built and individually
+verified; this phase is a fresh look at the whole app as one thing a real person uses daily — no
+new agents, screens, or data model, per its own explicit scope boundary. Every deliverable below
+came from an actual audit of the codebase as it stood after Phase 10, not a generic checklist.
+
+### Loading and error boundaries — and a real bug the restructuring caught
+
+`app/error.tsx`, `app/global-error.tsx`, and `app/not-found.tsx` now exist, styled in the existing
+design system. Loading UI turned out to need real care, not a mechanical `loading.tsx` per route:
+adding a route-level `app/loading.tsx` wraps that ENTIRE route segment in a React `<Suspense>`
+boundary, including any `redirect()`/`notFound()` call in the page above it — and once a Suspense
+boundary exists anywhere in the tree, Next flushes a 200 response immediately (to start streaming
+the fallback) rather than waiting to see if the page redirects or 404s first. Confirmed live, and
+it was a real regression: adding `app/loading.tsx` made a fresh, no-`UserProfile` `GET /` return
+**200 with the Dashboard's content** instead of the real `307` to `/onboarding` this app had
+returned at every prior phase's verification, and made `GET /courses/:bad-id` return 200 instead
+of a real 404 — both silently downgraded to a client-JS-driven "soft" navigation instead of a true
+HTTP status. Fixed by NOT giving the Dashboard, Course view, or Path view a route-level
+`loading.tsx` at all; the Dashboard instead does its fast, gating `getUserProfile()` check first
+(so a redirect still fires before any streaming starts), then wraps only the slow, non-gating
+content (`DashboardContent`, the real eight-way `Promise.all`) in its own inline `<Suspense>` —
+giving the slow part a real loading skeleton while keeping the redirect's real HTTP semantics.
+Confirmed via a real production build + server (`next build && next start`, not `next dev`, since
+dev mode's own error overlay masks this class of bug): `GET /` → real `307`, `GET
+/courses/does-not-exist` → real `404` with the styled `not-found.tsx` content actually present in
+the raw HTML. `error.tsx`'s own styled fallback is a CLIENT component by Next's own requirement,
+so it renders after hydration — confirmed via a real thrown error that a production build/server
+correctly wired to the compiled `error.tsx` bundle with a real error digest, but the actual
+rendered pixels need a real browser executing JS to see directly (documented as a gap below, same
+category as every prior phase's "no real browser" note).
+
+### Accessibility pass
+
+A manual review plus a real automated check — no Lighthouse (needs a real Chrome instance, absent
+in this environment, same as every prior phase's "no browser" note), so `axe-core` run directly
+against real server-rendered HTML (a production build/server, real pages fetched via HTTP, parsed
+into `jsdom`, `axe.run()` against the real resulting DOM) instead. This genuinely caught two real
+bugs, not just cosmetic labeling gaps:
+
+- **The Dashboard had no `<h1>` at all** (only `<h2>` section headers) — added a visually-hidden
+  `<h1>Dashboard</h1>`.
+- **The Lesson screen skipped a heading level** (`<h1>` lesson title straight to `<h3>` for
+  "Intuition"/"Mechanics"/etc. and "Ask a question") — a real `heading-order` violation `axe-core`
+  flagged directly, fixed by promoting those to `<h2>`; the Dashboard's "Completed courses" list
+  had the same `<h2>` → `<h4>` skip in `SuggestionsPanel`, fixed the same way.
+
+Beyond those two, added real `aria-label`s on every icon-abbreviated control (`AudioPlayer`'s
+Play/Pause/-10s/speed, `DownloadsManager`'s per-course Remove), `aria-live` regions for state that
+updates without a page navigation (`AudioPlayer`'s current-chunk announcement, the progress log,
+queued/pending states in `LessonQA`/`QuizClient`/download buttons), real `<label htmlFor>`/`id`
+pairings everywhere a `<label>` was a sibling rather than wrapping its input (onboarding's
+textareas, the Quiz screen's free-text answers, the `/new` and practice-turn inputs — none of
+these were programmatically associated before, despite looking correct visually), `role="alert"`
+on every error message across the app (previously color-only), and a `role="radiogroup"` +
+`aria-labelledby` pairing each multiple-choice question's options to its own prompt text.
+`components/PlaceholderPanel.tsx` — Phase 7's original stub, fully superseded by Phase 7.5/8/9's
+real UI and no longer referenced anywhere except historical comments — was deleted as a byproduct
+of this same pass, per this codebase's own "delete confirmed-unused code" convention.
+
+**Before/after, real numbers**: `axe-core` against 7 real representative pages (Dashboard,
+onboarding, `/new`, Course view, Lesson view, Quiz screen, Downloads) found **1 real violation**
+(the Lesson screen's `heading-order` skip) before this pass and **0 violations** after, across
+foundational rules — real DOM structure/semantics, not just visual similarity to an
+accessible-looking page. `color-contrast` was excluded from the automated run (deliberately, not
+silently): `jsdom` does no real CSS layout or paint, so a contrast check against it would report a
+misleading pass/fail rather than a real measurement — this needs a real browser to check
+honestly, and is the one accessibility area left to manual/future verification. Two `incomplete`
+(not failed) findings — `landmark-one-main` and `page-has-heading-one` — appeared on every single
+page, including ones manually confirmed to have both a real `<main>` (`app/layout.tsx`) and a real
+`<h1>`; this is `axe-core`'s own visibility-detection uncertainty under `jsdom`'s lack of real
+layout, not a real gap, and is called out here rather than silently treated as a pass.
+
+### Lint setup — two real, confirmed tooling incompatibilities, and a user-approved fix
+
+Confirmed gap: no `.eslintrc*`/`eslint.config*` and no `lint` script existed anywhere — this repo
+was hand-built, never scaffolded via `create-next-app`. Setting it up hit two real, back-to-back
+compatibility problems, not just "run install and go":
+
+1. **`typescript-eslint` doesn't support TypeScript 7.0** (this project's installed version) —
+   confirmed as a hard runtime check, not a warning, against the latest stable `typescript-eslint`
+   release at the time. This is a genuine, current ecosystem gap (TS 7 is a very recent Go-based
+   rewrite the JS tooling ecosystem hadn't caught up to yet), not a resolvable version pin. Given
+   the real tradeoff — downgrade a foundational devDependency vs. leave lint non-functional — this
+   was put to the user rather than decided unilaterally; **the user chose to downgrade**.
+   `typescript` is now pinned to `6.0.3` (the latest pre-7 stable release) — a dev-only,
+   easily-reversible change, verified safe by re-running the FULL typecheck and test suite
+   immediately after and confirming byte-identical results (still clean, still 323/323).
+2. **`eslint-config-next`'s flat configs can't be loaded through `@eslint/eslintrc`'s
+   `FlatCompat.extends()`** — that shim exists to translate legacy `.eslintrc`-shaped configs into
+   flat config, but this version of `eslint-config-next` already ships NATIVE flat config (each
+   subpath export, e.g. `eslint-config-next/core-web-vitals`, is already a flat config array), and
+   running an already-flat config back through the legacy-format translator produced a real
+   `TypeError: Converting circular structure to JSON` crash — confirmed by isolating it (removing
+   `next/typescript` didn't help; the crash came from `core-web-vitals` alone). Fixed by importing
+   the flat config subpaths directly (`import nextCoreWebVitals from "eslint-config-next/core-web-vitals"`)
+   instead of going through `FlatCompat` at all.
+
+With both resolved, `npm run lint` surfaced **26 real findings** on its first-ever run against
+this codebase (17 errors, 9 warnings) — genuinely fixed, not suppressed wholesale:
+
+- 6 `react/no-unescaped-entities` (literal `'`/`"` in JSX text) — trivial, safe entity-escape fixes.
+- 2 genuinely-unused imports (`eq` in `tests/engagementCheck.test.ts`, `RunOptions` in
+  `tests/materialAggregator.test.ts`) — removed.
+- 1 real `@typescript-eslint/no-explicit-any` in `src/orchestrator/templates/registry.ts` — this
+  one is a genuine, correct type-erasure boundary (a `Map` deliberately holding
+  `PromptTemplate<X,Y>` for many incompatible `X`/`Y` pairs; `unknown` isn't assignable here
+  because the type's input parameter is contravariant) — reviewed and left with a targeted,
+  documented `eslint-disable-next-line`, not changed.
+- 8 `react-hooks/set-state-in-effect` findings (`AudioPlayer` ×4, `CourseMindMap`,
+  `DownloadsManager`, `ProgressStream`, `PushNotificationToggle`) — this specific rule flags ANY
+  effect that calls `setState`, including well-established, correct React patterns (syncing to an
+  external system on mount, resetting state when a prop changes before starting a new operation,
+  triggering real media playback). Each was individually reviewed; all 8 are genuine, standard
+  patterns — restructuring `AudioPlayer` in particular around this single strict rule would have
+  meant reworking already-verified Phase 7.5/10 player logic well beyond what a lint pass
+  warrants, which Phase 10's own kickoff explicitly warned against for this exact component. Each
+  is a targeted, per-line `eslint-disable-next-line` with a specific one-line reason, not a
+  blanket rule disable — the rule stays fully active for any new code going forward.
+- The remaining warnings were the codebase's own pre-existing `_paramName` convention for an
+  intentionally-unused parameter in a shared callback signature (used across many test mocks since
+  Phase 4) — resolved with one targeted config addition
+  (`argsIgnorePattern`/`varsIgnorePattern: "^_"`), not a blanket rule change, and documented in
+  `eslint.config.mjs` itself as the one deliberate tweak beyond the Next.js default ruleset.
+
+`npm run lint` now runs clean (0 errors, 0 warnings, exit code 0). No CI pipeline exists in this
+repo to wire it into (no `.github/workflows/` or similar) — `lint`/`typecheck`/`test` are all
+plain `npm run` scripts a human or a future CI setup can call directly.
+
+### This README
+
+The title changed from "Teacher — Orchestrator, Search, the Research Agent..." (Phase 1's original
+working name and its own first-phase scope) to "Athena," and the intro now describes the finished
+v1 system end to end instead of narrating through Phase 5's plumbing. A "Contents" section and a
+"Current status" section were added at the top — a navigation aid and an honest summary of what's
+real-verified vs. dry-run/mocked across all eleven phases, each point linking back to the specific
+phase section that has the actual detailed record. Every phase's own documented decisions,
+deviations, and gaps stay exactly as written underneath — this pass adds an index and fixes a
+stale intro, it doesn't rewrite history.
+
+### Real-device verification — attempted, still not possible here
+
+Per this phase's own Deliverable 5, a real attempt was made to close Phase 10's four open items
+(PWA installability, airplane-mode offline behavior, backgrounded-PWA audio, real push delivery to
+a device) rather than silently re-documenting them as outstanding a third time. This environment
+has no real phone, tablet, or any device beyond the sandboxed Windows machine this whole project
+has been built on, and no teammate/friend's device was reachable from within it — so this remains
+genuinely not possible here, stated plainly rather than re-asserted as done. What COULD be
+verified instead (and was, in this same phase): the manifest and service worker serve correctly
+over real HTTP, `error.tsx`/`not-found.tsx`/the redirect fix are confirmed via a real production
+server, and the accessibility/lint passes are real, automated, and numerically evidenced above.
+
+### Definition of done — Phase 11
+
+- Loading/error/not-found boundaries exist and are demonstrated: a real thrown error and a real
+  bad course/lesson id, verified via a real production build + server (`next build && next
+  start`), not just file existence.
+- Accessibility: a real `axe-core` pass against 7 real rendered pages, with a concrete before
+  (1 violation) / after (0 violations) number, plus a documented list of what was manually fixed
+  and what `jsdom`'s lack of real layout genuinely can't check (color contrast).
+- `npm run lint` exists, runs clean, and every one of its first-run findings was either fixed for
+  real or left with a specific, reviewed, documented reason (never a blanket suppression).
+- This README's title and intro describe the finished v1 system, with a working Contents/status
+  section — every phase's own historical content is intact underneath.
+- Real-device verification was genuinely attempted and remains genuinely unavailable in this
+  environment — stated plainly, not silently inherited from Phase 10 unexamined.
+- All Phase 1-10 tests still pass (323/323); `npm run typecheck` clean on both configs after the
+  TypeScript 6.0.3 downgrade, confirmed identical before and after.
+- No new features, screens, agents, or data model changes anywhere in this phase's diff.
+
+### Documented gaps
+
+- **Real device verification remains closed** — see above. The single biggest remaining gap on
+  this whole project, carried forward honestly rather than worked around.
+- **Color contrast is unverified by automation** — `jsdom` can't measure real rendered contrast;
+  this design system's dark-mode tokens (`app/globals.css`) were chosen for a "calm, low-distraction"
+  feel, not explicitly audited against WCAG contrast ratios. Worth a real browser-based check.
+- **No CI pipeline** — `lint`/`typecheck`/`test` are real, working, independent scripts, but
+  nothing runs them automatically on push/PR in this repo yet.
 
 ## LLM provider swap (added mid-Phase-2, not in the original kickoff prompt)
 

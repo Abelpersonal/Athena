@@ -1,3 +1,4 @@
+import { Suspense } from "react";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import {
@@ -11,6 +12,7 @@ import {
 import { getWhatsNewDigest } from "../src/knowledgeUpdate/index.js";
 import { getUserProfile, getGoalConnectionMessage } from "../src/motivation/index.js";
 import { SuggestionsPanel } from "../components/SuggestionsPanel.js";
+import { LoadingSkeleton } from "../components/LoadingSkeleton.js";
 
 /**
  * Phase 10 fix (a real, pre-existing bug this build surfaced, predating this phase): every read
@@ -33,11 +35,35 @@ export const dynamic = "force-dynamic";
  * fires exactly once per install, not on every visit. Momentum/re-entry/boredom-proofing/goal-
  * connection (Deliverables 2-4) are all real reads against ActivityEvent/UserProfile, computed
  * fresh on every load — no separate cached state to keep in sync.
+ *
+ * Phase 11, Deliverable 1: the slow part (the real eight-way `Promise.all` below) is split into
+ * its own child component, `DashboardContent`, wrapped in a real `<Suspense>` HERE rather than via
+ * a route-level `app/loading.tsx` file — a route-level loading file wraps THIS ENTIRE component in
+ * Suspense, including the `redirect()` call above, and Next only sends a real HTTP 307 for a
+ * redirect thrown BEFORE the response has started streaming. Once a Suspense boundary exists
+ * anywhere in the tree, Next flushes a 200 immediately (to start streaming the fallback) and any
+ * later `redirect()`/`notFound()` degrades to a soft, client-JS-driven navigation instead — a real
+ * regression this exact restructuring was built to catch and fix (confirmed live: a route-level
+ * `app/loading.tsx` here made a fresh, no-profile `GET /` return 200 instead of the real 307 this
+ * app had every time before). Scoping the `<Suspense>` to ONLY the child that doesn't gate
+ * anything keeps the redirect's real HTTP semantics while still giving the slow content its own
+ * loading skeleton.
  */
 export default async function DashboardPage() {
   const profile = await getUserProfile();
   if (!profile) redirect("/onboarding");
 
+  return (
+    <div className="space-y-10">
+      <h1 className="sr-only">Dashboard</h1>
+      <Suspense fallback={<LoadingSkeleton lines={4} />}>
+        <DashboardContent />
+      </Suspense>
+    </div>
+  );
+}
+
+async function DashboardContent() {
   const [inProgress, completed, activePaths, digest, streak, reentryOffer, boredomSuggestions, goalConnection] = await Promise.all([
     getDashboardCourses(),
     getCompletedCourses(),
@@ -53,7 +79,7 @@ export default async function DashboardPage() {
   const continueCourse = inProgress[0];
 
   return (
-    <div className="space-y-10">
+    <>
       {streak.currentStreakDays > 0 && (
         <p className="text-sm text-[var(--color-accent)]">
           {streak.currentStreakDays} day{streak.currentStreakDays === 1 ? "" : "s"} of momentum
@@ -160,7 +186,7 @@ export default async function DashboardPage() {
       </section>
 
       <section>
-        <h2 className="text-lg font-medium mb-3">What's new</h2>
+        <h2 className="text-lg font-medium mb-3">What&apos;s new</h2>
         {digest.major.length === 0 && digest.moderate.length === 0 && digest.minor.length === 0 ? (
           <p className="text-[var(--color-text-muted)] text-sm">
             Nothing new — run <code>npm run knowledge-update</code> to check for updates.
@@ -209,6 +235,6 @@ export default async function DashboardPage() {
           Edit what you&apos;re working toward
         </Link>
       </p>
-    </div>
+    </>
   );
 }

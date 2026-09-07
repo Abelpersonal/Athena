@@ -55,7 +55,8 @@ export function SuggestionsPanel({ courseId }: { courseId: string }) {
       <button
         onClick={getSuggestions}
         disabled={loading}
-        className="text-sm px-3 py-1.5 rounded-md border border-[var(--color-border)] hover:border-[var(--color-accent)] disabled:opacity-50"
+        aria-busy={loading}
+        className="min-h-11 text-sm px-3 py-1.5 rounded-md border border-[var(--color-border)] hover:border-[var(--color-accent)] disabled:opacity-50"
       >
         {loading ? "Thinking…" : "Get suggestions"}
       </button>
@@ -64,11 +65,15 @@ export function SuggestionsPanel({ courseId }: { courseId: string }) {
 
   return (
     <div className="mt-3 space-y-3 text-sm">
-      {error && <p className="text-[var(--color-danger)]">{error}</p>}
+      {error && (
+        <p className="text-[var(--color-danger)]" role="alert">
+          {error}
+        </p>
+      )}
 
       {result.books.persisted.length > 0 && (
         <div>
-          <h4 className="text-[var(--color-text-muted)] mb-1">Worth reading next</h4>
+          <h3 className="text-[var(--color-text-muted)] mb-1">Worth reading next</h3>
           <ul className="space-y-1">
             {result.books.persisted.map((b) => (
               <li key={b.title}>
@@ -78,7 +83,7 @@ export function SuggestionsPanel({ courseId }: { courseId: string }) {
                     {" "}
                     (
                     <a href={b.gutenbergUrl} target="_blank" rel="noreferrer" className="text-[var(--color-accent)]">
-                      free text
+                      free text<span className="sr-only"> (opens in a new tab)</span>
                     </a>
                     )
                   </>
@@ -90,7 +95,7 @@ export function SuggestionsPanel({ courseId }: { courseId: string }) {
       )}
 
       <div>
-        <h4 className="text-[var(--color-text-muted)] mb-1">Where to go next</h4>
+        <h3 className="text-[var(--color-text-muted)] mb-1">Where to go next</h3>
         <p>
           <span className="text-[var(--color-text-faint)]">Deepen:</span> {result.topicSuggestions.deepen.topicName}
           {" — "}

@@ -36,7 +36,7 @@ export function LayerViewer({
   return (
     <div className="space-y-4">
       <section>
-        <h3 className="text-sm font-medium text-[var(--color-text-muted)] mb-1">Intuition</h3>
+        <h2 className="text-sm font-medium text-[var(--color-text-muted)] mb-1">Intuition</h2>
         <p className="leading-relaxed">{layers.intuition.text}</p>
       </section>
 
@@ -48,7 +48,7 @@ export function LayerViewer({
         <div className="mt-3 space-y-4">
           {DEEPER_LAYERS.map(({ key, label }) => (
             <section key={key}>
-              <h3 className="text-sm font-medium text-[var(--color-text-muted)] mb-1">{label}</h3>
+              <h2 className="text-sm font-medium text-[var(--color-text-muted)] mb-1">{label}</h2>
               <p className="leading-relaxed">{layers[key].text}</p>
             </section>
           ))}

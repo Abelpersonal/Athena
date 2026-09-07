@@ -24,7 +24,11 @@ export function PushNotificationToggle() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    // Reviewed (Phase 11 lint pass): feature-detecting a real browser API on mount — there's no
+    // server-known value to render this from (whether Push is supported is only knowable once
+    // the client mounts), so an effect syncing it into state is the correct, standard pattern.
     if (typeof window === "undefined" || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSupported(false);
       return;
     }
@@ -95,11 +99,16 @@ export function PushNotificationToggle() {
       <button
         onClick={() => (subscribed ? void unsubscribe() : void subscribe())}
         disabled={loading}
-        className="rounded-md border border-[var(--color-border)] px-3 py-2 text-sm hover:border-[var(--color-accent)] disabled:opacity-50"
+        aria-busy={loading}
+        className="min-h-11 rounded-md border border-[var(--color-border)] px-3 py-2 text-sm hover:border-[var(--color-accent)] disabled:opacity-50"
       >
-        {loading ? "…" : subscribed ? "Turn off notifications on this device" : "Turn on notifications on this device"}
+        {loading ? "Working…" : subscribed ? "Turn off notifications on this device" : "Turn on notifications on this device"}
       </button>
-      {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
+      {error && (
+        <p className="text-[var(--color-danger)] text-sm" role="alert">
+          {error}
+        </p>
+      )}
     </div>
   );
 }

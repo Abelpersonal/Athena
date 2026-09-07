@@ -33,12 +33,19 @@ export function DownloadPathButton({ courseIds }: { courseIds: string[] }) {
       <button
         onClick={start}
         disabled={status === "downloading"}
-        className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-sm hover:border-[var(--color-accent)] disabled:opacity-50"
+        aria-busy={status === "downloading"}
+        className="min-h-11 rounded-md border border-[var(--color-border)] px-3 py-1.5 text-sm hover:border-[var(--color-accent)] disabled:opacity-50"
       >
         {status === "downloading" ? "Downloading…" : `Download all ${courseIds.length} course(s) for offline`}
       </button>
       {progress && (
-        <p className={`text-xs ${status === "error" ? "text-[var(--color-danger)]" : "text-[var(--color-text-faint)]"}`}>{progress}</p>
+        <p
+          role={status === "error" ? "alert" : "status"}
+          aria-live="polite"
+          className={`text-xs ${status === "error" ? "text-[var(--color-danger)]" : "text-[var(--color-text-faint)]"}`}
+        >
+          {progress}
+        </p>
       )}
     </div>
   );

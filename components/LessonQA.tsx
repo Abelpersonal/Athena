@@ -108,7 +108,7 @@ export function LessonQA({ lessonId, ttsMode }: { lessonId: string; ttsMode: Aud
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-medium text-[var(--color-text-muted)]">Ask a question</h3>
+        <h2 className="text-sm font-medium text-[var(--color-text-muted)]">Ask a question</h2>
         <label className="flex items-center gap-1.5 text-xs text-[var(--color-text-faint)]">
           <input
             type="checkbox"
@@ -119,7 +119,11 @@ export function LessonQA({ lessonId, ttsMode }: { lessonId: string; ttsMode: Aud
         </label>
       </div>
       <form onSubmit={ask} className="flex gap-2">
+        <label htmlFor="lesson-question" className="sr-only">
+          Ask about this lesson
+        </label>
         <input
+          id="lesson-question"
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
           placeholder="Ask about this lesson…"
@@ -129,20 +133,25 @@ export function LessonQA({ lessonId, ttsMode }: { lessonId: string; ttsMode: Aud
         <button
           type="submit"
           disabled={asking || !question.trim()}
-          className="rounded-md border border-[var(--color-border)] px-3 py-2 text-sm hover:border-[var(--color-accent)] disabled:opacity-50"
+          aria-busy={asking}
+          className="min-h-11 rounded-md border border-[var(--color-border)] px-3 py-2 text-sm hover:border-[var(--color-accent)] disabled:opacity-50"
         >
-          {asking ? "…" : "Ask"}
+          {asking ? "Asking…" : "Ask"}
         </button>
       </form>
-      {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
+      {error && (
+        <p className="text-[var(--color-danger)] text-sm" role="alert">
+          {error}
+        </p>
+      )}
       {queued && (
-        <div className="rounded-lg border border-[var(--color-warn)]/40 p-3 text-sm">
+        <div className="rounded-lg border border-[var(--color-warn)]/40 p-3 text-sm" role="status" aria-live="polite">
           <p className="text-[var(--color-warn)] font-medium">Queued — will answer when back online</p>
           <p className="text-[var(--color-text-muted)] mt-1">&quot;{queued}&quot;</p>
         </div>
       )}
       {answer && (
-        <div className="rounded-lg border border-[var(--color-border)] p-3 text-sm">
+        <div className="rounded-lg border border-[var(--color-border)] p-3 text-sm" role="status" aria-live="polite">
           <p>{answer.answer}</p>
           {speaking && <p className="text-[var(--color-text-faint)] mt-1">Speaking…</p>}
           {answer.outsideLessonScope && (

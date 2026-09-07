@@ -147,11 +147,15 @@ export function PracticeClient({ moduleId, courseId }: { moduleId: string; cours
         <button
           onClick={start}
           disabled={loading}
-          className="rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
+          className="min-h-11 rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
         >
           {loading ? "Preparing…" : "Start practice"}
         </button>
-        {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
+        {error && (
+          <p className="text-[var(--color-danger)] text-sm" role="alert">
+            {error}
+          </p>
+        )}
       </div>
     );
   }
@@ -169,13 +173,13 @@ export function PracticeClient({ moduleId, courseId }: { moduleId: string; cours
           )}
           {session.format === "simulation" && session.simulation && (
             <p>
-              Scenario: {session.simulation.scenario} — you're talking with {session.simulation.personaName} (
+              Scenario: {session.simulation.scenario} — you&apos;re talking with {session.simulation.personaName} (
               {session.simulation.personaRole})
             </p>
           )}
           {session.format === "debate" && session.debate && (
             <p>
-              Claim: {session.debate.claim} — you're arguing <strong>{session.debate.userPosition}</strong>
+              Claim: {session.debate.claim} — you&apos;re arguing <strong>{session.debate.userPosition}</strong>
             </p>
           )}
         </div>
@@ -203,7 +207,11 @@ export function PracticeClient({ moduleId, courseId }: { moduleId: string; cours
               ))}
             </div>
             <form onSubmit={sendTurn} className="flex gap-2">
+              <label htmlFor="practice-turn-input" className="sr-only">
+                Your reply
+              </label>
               <input
+                id="practice-turn-input"
                 value={turnInput}
                 onChange={(e) => setTurnInput(e.target.value)}
                 className="flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm"
@@ -213,7 +221,7 @@ export function PracticeClient({ moduleId, courseId }: { moduleId: string; cours
               <button
                 type="submit"
                 disabled={loading || !turnInput.trim()}
-                className="rounded-md border border-[var(--color-border)] px-3 py-2 text-sm hover:border-[var(--color-accent)]"
+                className="min-h-11 rounded-md border border-[var(--color-border)] px-3 py-2 text-sm hover:border-[var(--color-accent)]"
               >
                 Send
               </button>
@@ -224,11 +232,15 @@ export function PracticeClient({ moduleId, courseId }: { moduleId: string; cours
         <button
           onClick={submitAttempt}
           disabled={loading || (session.format === "project" && !projectSubmission.trim())}
-          className="rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
+          className="min-h-11 rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
         >
           {loading ? "Submitting…" : "I'm done — submit for critique"}
         </button>
-        {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
+        {error && (
+          <p className="text-[var(--color-danger)] text-sm" role="alert">
+            {error}
+          </p>
+        )}
       </div>
     );
   }
@@ -243,8 +255,11 @@ export function PracticeClient({ moduleId, courseId }: { moduleId: string; cours
           <p>{submitResult.critique}</p>
         </div>
         <form onSubmit={reflect} className="space-y-2">
-          <label className="text-sm text-[var(--color-text-muted)]">{submitResult.reflectionPrompt}</label>
+          <label htmlFor="practice-reflection" className="text-sm text-[var(--color-text-muted)]">
+            {submitResult.reflectionPrompt}
+          </label>
           <textarea
+            id="practice-reflection"
             value={reflectionNotes}
             onChange={(e) => setReflectionNotes(e.target.value)}
             className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm"
@@ -253,12 +268,16 @@ export function PracticeClient({ moduleId, courseId }: { moduleId: string; cours
           <button
             type="submit"
             disabled={loading}
-            className="rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
+            className="min-h-11 rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
           >
             {loading ? "Recording…" : "Finish"}
           </button>
         </form>
-        {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
+        {error && (
+          <p className="text-[var(--color-danger)] text-sm" role="alert">
+            {error}
+          </p>
+        )}
       </div>
     );
   }

@@ -17,9 +17,13 @@ export function GenerateTopicButton({ pathId, topicId, topicName }: { pathId: st
   if (streamUrl) {
     return (
       <div className="mt-2 space-y-2">
-        <p className="text-sm text-[var(--color-text-muted)]">Generating "{topicName}"…</p>
+        <p className="text-sm text-[var(--color-text-muted)]">Generating &quot;{topicName}&quot;…</p>
         <ProgressLog lines={stream.lines} />
-        {stream.error && <p className="text-[var(--color-danger)] text-sm">{stream.error}</p>}
+        {stream.error && (
+          <p className="text-[var(--color-danger)] text-sm" role="alert">
+            {stream.error}
+          </p>
+        )}
       </div>
     );
   }
@@ -27,7 +31,8 @@ export function GenerateTopicButton({ pathId, topicId, topicName }: { pathId: st
   return (
     <button
       onClick={() => setStreamUrl(`/api/paths/${pathId}/topics/${topicId}/generate-stream`)}
-      className="text-sm px-2 py-1 rounded-md border border-[var(--color-border)] hover:border-[var(--color-accent)]"
+      aria-label={`Generate "${topicName}"`}
+      className="min-h-11 text-sm px-2 py-1 rounded-md border border-[var(--color-border)] hover:border-[var(--color-accent)]"
     >
       Generate
     </button>

@@ -62,6 +62,12 @@ export function AudioPlayer({
   // If the deeper layers collapse again while one of their chunks is playing, fall back to the
   // last intuition chunk rather than pointing at a chunk that's no longer "available".
   useEffect(() => {
+    // Reviewed (Phase 11 lint pass): clamping an index against a bound that just changed
+    // (deeper layers collapsing shrinks `availableChunks`) is the standard React-documented
+    // pattern for "adjusting state when a prop changes" — there's no prop/derived-value this
+    // could be computed from at render time instead, since `chunkPos` is the source of truth
+    // for which chunk is playing, not a value derived from `availableChunks` itself.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (chunkPos >= availableChunks.length) setChunkPos(Math.max(0, availableChunks.length - 1));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [availableChunks.length]);
@@ -77,7 +83,12 @@ export function AudioPlayer({
    * Blob URL if one exists — a harmless brief failed request if genuinely offline with no download.
    */
   useEffect(() => {
+    // Reviewed (Phase 11 lint pass): this effect's whole job is resolving `currentChunk`/`mode`
+    // into the real audio src (network URL first, then an async IndexedDB lookup) — every
+    // setState call here IS the synchronization work the effect exists to do, the textbook case
+    // an effect is actually for, not a substitute for a render-time computation.
     if (mode !== "server" || !currentChunk) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setResolvedSrc(null);
       return;
     }
@@ -95,7 +106,6 @@ export function AudioPlayer({
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentChunk, mode, lessonId]);
 
   useEffect(() => {
@@ -148,6 +158,11 @@ export function AudioPlayer({
 
   // Auto-play the newly-selected chunk (advance() lands here via chunkPos changing).
   useEffect(() => {
+    // Reviewed (Phase 11 lint pass): `play()` starts real media playback (an external system —
+    // the Web Speech API or an <audio> element), which is exactly what an effect is for; the
+    // setIsPlaying(true) inside it is a side effect of that real action, not a derived-state
+    // substitute for one.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (isPlaying) play();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chunkPos]);
@@ -188,8 +203,10 @@ export function AudioPlayer({
   useEffect(() => {
     if (mode === "server" && audioRef.current) audioRef.current.playbackRate = speed;
     if (mode === "browser" && isPlaying) {
-      // Web Speech has no live rate change mid-utterance — restart at the new rate.
+      // Web Speech has no live rate change mid-utterance — restart at the new rate. Reviewed
+      // (Phase 11 lint pass): same real-media-control case as the chunkPos effect above.
       window.speechSynthesis.cancel();
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       play();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -212,26 +229,35 @@ export function AudioPlayer({
       <div className="flex items-center gap-3 text-sm flex-wrap">
         <button
           onClick={() => (isPlaying ? pause() : play())}
+          aria-pressed={isPlaying}
+          aria-label={isPlaying ? "Pause" : "Play"}
           className="min-h-11 min-w-11 rounded-md border border-[var(--color-border)] px-3 py-1.5 hover:border-[var(--color-accent)]"
         >
           {isPlaying ? "Pause" : "Play"}
         </button>
         <button
           onClick={skipBack10}
+          aria-label="Skip back 10 seconds"
           className="min-h-11 min-w-11 rounded-md border border-[var(--color-border)] px-3 py-1.5 hover:border-[var(--color-accent)]"
         >
           -10s
         </button>
-        <select
-          value={speed}
-          onChange={(e) => setSpeed(Number(e.target.value) as Speed)}
-          className="min-h-11 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1.5"
-        >
-          <option value={1}>1x</option>
-          <option value={1.5}>1.5x</option>
-          <option value={2}>2x</option>
-        </select>
-        <span className="text-[var(--color-text-faint)]">
+        <label className="flex items-center gap-1.5">
+          <span className="sr-only">Playback speed</span>
+          <select
+            value={speed}
+            onChange={(e) => setSpeed(Number(e.target.value) as Speed)}
+            aria-label="Playback speed"
+            className="min-h-11 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1.5"
+          >
+            <option value={1}>1x</option>
+            <option value={1.5}>1.5x</option>
+            <option value={2}>2x</option>
+          </select>
+        </label>
+        {/* aria-live: a screen reader announces the chunk/playing-state change without needing focus moved to it — Phase 11's accessibility pass. */}
+        <span className="text-[var(--color-text-faint)]" aria-live="polite">
+          {isPlaying ? "Playing: " : "Paused: "}
           {chunkLabel(currentChunk)} ({chunkPos + 1}/{availableChunks.length})
         </span>
       </div>

@@ -13,6 +13,7 @@ export function SourceCitations({ sources }: { sources: LessonSourceRef[] }) {
           <li key={s.id} className="text-[var(--color-text-muted)]">
             <a href={s.url} target="_blank" rel="noreferrer" className="hover:text-[var(--color-accent)] break-all">
               {s.url}
+              <span className="sr-only"> (opens in a new tab)</span>
             </a>{" "}
             <span className="text-[var(--color-text-faint)]">
               ({s.type}, credibility {s.credibilityScore.toFixed(2)})

@@ -5,6 +5,7 @@ import type { PromptTemplate } from "../types.js";
  * own templates via registerTemplate() instead of adding cases to a switch
  * statement here.
  */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- a genuine type-erasure boundary: this Map deliberately holds PromptTemplate<X,Y> for many different, incompatible X/Y pairs (one per registered task type), and `unknown` isn't assignable here because PromptTemplate's input parameter is contravariant — `any` is the correct, standard escape hatch for a heterogeneous registry like this, not a shortcut around real typing.
 const registry = new Map<string, PromptTemplate<any, any>>();
 
 export function registerTemplate<TInput, TOutput>(

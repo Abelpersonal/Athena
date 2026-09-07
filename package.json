@@ -14,6 +14,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p tsconfig.backend.json && tsc --noEmit -p tsconfig.json",
+    "lint": "eslint .",
     "dev": "next dev --webpack",
     "build": "next build --webpack",
     "start": "next start",
@@ -44,10 +45,13 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "@types/web-push": "^3.6.4",
+    "axe-core": "^4.13.0",
     "drizzle-kit": "^0.31.10",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^16.3.4",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.23.12",
-    "typescript": "^7.0.2",
+    "typescript": "^6.0.3",
     "vitest": "^4.1.10"
   }
 }

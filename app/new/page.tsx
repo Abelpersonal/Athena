@@ -80,7 +80,11 @@ export default function NewEntryPage() {
           This takes a few minutes — multi-pass research and a depth audit run for every subtopic.
         </p>
         <ProgressLog lines={stream.lines} />
-        {stream.error && <p className="text-[var(--color-danger)] text-sm">{stream.error}</p>}
+        {stream.error && (
+          <p className="text-[var(--color-danger)] text-sm" role="alert">
+            {stream.error}
+          </p>
+        )}
       </div>
     );
   }
@@ -90,7 +94,11 @@ export default function NewEntryPage() {
       <h1 className="text-xl font-medium">What do you want to learn?</h1>
 
       <form onSubmit={submitInput} className="space-y-3">
+        <label htmlFor="new-entry-input" className="sr-only">
+          What do you want to learn?
+        </label>
         <input
+          id="new-entry-input"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder='e.g. "Special Relativity" or "become a full-stack quant"'
@@ -101,7 +109,8 @@ export default function NewEntryPage() {
           <button
             type="submit"
             disabled={classifying || !input.trim()}
-            className="rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
+            aria-busy={classifying}
+            className="min-h-11 rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
           >
             {classifying ? "Thinking…" : "Continue"}
           </button>
@@ -121,7 +130,7 @@ export default function NewEntryPage() {
                     type="button"
                     onClick={() => setInput(entry.prompt)}
                     disabled={classifying}
-                    className="text-xs px-2.5 py-1 rounded-full border border-[var(--color-border)] hover:border-[var(--color-accent)] disabled:opacity-50"
+                    className="min-h-11 text-xs px-2.5 py-1 rounded-full border border-[var(--color-border)] hover:border-[var(--color-accent)] disabled:opacity-50"
                   >
                     {entry.label}
                   </button>
@@ -132,7 +141,11 @@ export default function NewEntryPage() {
         </div>
       )}
 
-      {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
+      {error && (
+        <p className="text-[var(--color-danger)] text-sm" role="alert">
+          {error}
+        </p>
+      )}
 
       {classification && (
         <div className="rounded-lg border border-[var(--color-border)] p-4 space-y-3">
@@ -141,10 +154,11 @@ export default function NewEntryPage() {
           </p>
           <p className="text-sm">{classification.reasoning}</p>
 
-          <div className="flex gap-3 pt-2">
+          <div className="flex gap-3 pt-2" role="group" aria-label="Confirm or override the classification">
             <button
               onClick={() => setChoice("topic")}
-              className={`px-3 py-1.5 rounded-md border text-sm ${
+              aria-pressed={choice === "topic"}
+              className={`min-h-11 px-3 py-1.5 rounded-md border text-sm ${
                 choice === "topic" ? "border-[var(--color-accent)] text-[var(--color-accent)]" : "border-[var(--color-border)]"
               }`}
             >
@@ -152,7 +166,8 @@ export default function NewEntryPage() {
             </button>
             <button
               onClick={() => setChoice("goal")}
-              className={`px-3 py-1.5 rounded-md border text-sm ${
+              aria-pressed={choice === "goal"}
+              className={`min-h-11 px-3 py-1.5 rounded-md border text-sm ${
                 choice === "goal" ? "border-[var(--color-accent)] text-[var(--color-accent)]" : "border-[var(--color-border)]"
               }`}
             >
@@ -162,7 +177,7 @@ export default function NewEntryPage() {
 
           <button
             onClick={confirmAndGenerate}
-            className="mt-2 rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium"
+            className="min-h-11 mt-2 rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium"
           >
             Confirm and start
           </button>

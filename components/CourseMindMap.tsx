@@ -66,7 +66,14 @@ export function CourseMindMap({
   const [drawerOpen, setDrawerOpen] = useState(false);
 
   useEffect(() => {
+    // Reviewed (Phase 11 lint pass): syncing React state to a real external system
+    // (`window.matchMedia`) on mount, then subscribing to its changes, is the documented React
+    // pattern for external-store synchronization — the initial setState is what makes the
+    // subscription's starting value correct, not a substitute for a render-time computation
+    // (there's no server-known value to render synchronously from — the viewport is unknown
+    // until the client mounts).
     const mq = window.matchMedia("(max-width: 639px)");
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setIsNarrowViewport(mq.matches);
     const handler = (e: MediaQueryListEvent) => setIsNarrowViewport(e.matches);
     mq.addEventListener("change", handler);
@@ -133,11 +140,12 @@ export function CourseMindMap({
             <button
               key={m.id}
               onClick={() => toggleModule(m.id)}
-              className={`text-xs px-2.5 py-1 rounded-full border ${
+              aria-expanded={expanded}
+              className={`min-h-11 text-xs px-2.5 py-1 rounded-full border ${
                 expanded ? "border-[var(--color-accent)] text-[var(--color-accent)]" : "border-[var(--color-border)] text-[var(--color-text-muted)]"
               }`}
             >
-              {expanded ? "▾" : "▸"} {m.title} ({count})
+              <span aria-hidden="true">{expanded ? "▾" : "▸"}</span> {m.title} ({count})
             </button>
           );
         })}

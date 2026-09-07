@@ -62,22 +62,29 @@ export function OnboardingClient({ initialGoals }: { initialGoals: string[] }) {
         </p>
       </div>
       <form onSubmit={submit} className="space-y-4">
-        {PROMPTS.map((prompt, i) => (
-          <div key={prompt}>
-            <label className="block text-sm mb-1">{prompt}</label>
-            <textarea
-              value={answers[i]}
-              onChange={(e) => setAnswers((prev) => prev.map((a, idx) => (idx === i ? e.target.value : a)))}
-              className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm"
-              rows={2}
-            />
-          </div>
-        ))}
+        {PROMPTS.map((prompt, i) => {
+          const fieldId = `onboarding-prompt-${i}`;
+          return (
+            <div key={prompt}>
+              <label htmlFor={fieldId} className="block text-sm mb-1">
+                {prompt}
+              </label>
+              <textarea
+                id={fieldId}
+                value={answers[i]}
+                onChange={(e) => setAnswers((prev) => prev.map((a, idx) => (idx === i ? e.target.value : a)))}
+                className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm"
+                rows={2}
+              />
+            </div>
+          );
+        })}
         <div className="flex gap-3">
           <button
             type="submit"
             disabled={saving}
-            className="rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
+            aria-busy={saving}
+            className="min-h-11 rounded-md bg-[var(--color-accent)] text-[#0b0e12] px-4 py-2 font-medium disabled:opacity-50"
           >
             {saving ? "Saving…" : "Save"}
           </button>
@@ -86,7 +93,7 @@ export function OnboardingClient({ initialGoals }: { initialGoals: string[] }) {
               type="button"
               disabled={saving}
               onClick={() => router.push("/")}
-              className="text-sm px-4 py-2 rounded-md border border-[var(--color-border)] disabled:opacity-50"
+              className="min-h-11 text-sm px-4 py-2 rounded-md border border-[var(--color-border)] disabled:opacity-50"
             >
               Cancel
             </button>
@@ -95,13 +102,17 @@ export function OnboardingClient({ initialGoals }: { initialGoals: string[] }) {
               type="button"
               disabled={saving}
               onClick={() => void save([])}
-              className="text-sm px-4 py-2 rounded-md border border-[var(--color-border)] disabled:opacity-50"
+              className="min-h-11 text-sm px-4 py-2 rounded-md border border-[var(--color-border)] disabled:opacity-50"
             >
               Skip for now
             </button>
           )}
         </div>
-        {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
+        {error && (
+          <p className="text-[var(--color-danger)] text-sm" role="alert">
+            {error}
+          </p>
+        )}
       </form>
     </div>
   );

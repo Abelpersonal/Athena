@@ -5,7 +5,7 @@ import { aggregateMaterials } from "../src/materialAggregator/index.js";
 import { getDb, resetDbCache } from "../src/db/client.js";
 import { lessons, sources } from "../src/db/schema.js";
 import type { TeacherDb } from "../src/db/client.js";
-import type { OrchestratorResult, RunOptions } from "../src/orchestrator/index.js";
+import type { OrchestratorResult } from "../src/orchestrator/index.js";
 import type { CourseJson, SourceRecord, SubtopicResult } from "../src/research/types.js";
 import type { CleanedContent } from "../src/extraction/fetchAndClean.js";
 import type { BackfillSubtopicInput } from "../src/research/pipeline.js";

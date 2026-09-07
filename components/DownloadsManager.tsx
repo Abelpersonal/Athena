@@ -20,6 +20,10 @@ export function DownloadsManager() {
   }
 
   useEffect(() => {
+    // Reviewed (Phase 11 lint pass): fetch-on-mount from a real external system (IndexedDB) —
+    // the standard "load this client component's data" pattern; the actual setState happens
+    // asynchronously after the real read completes, not synchronously in the effect body.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void refresh();
   }, []);
 
@@ -36,7 +40,7 @@ export function DownloadsManager() {
   if (courses === null) return <p className="text-sm text-[var(--color-text-faint)]">Loading…</p>;
 
   if (courses.length === 0) {
-    return <p className="text-sm text-[var(--color-text-muted)]">Nothing downloaded yet — use "Download for offline" from a course or path.</p>;
+    return <p className="text-sm text-[var(--color-text-muted)]">Nothing downloaded yet — use &quot;Download for offline&quot; from a course or path.</p>;
   }
 
   const totalBytes = courses.reduce((sum, c) => sum + c.sizeBytes, 0);
@@ -56,7 +60,9 @@ export function DownloadsManager() {
             <button
               onClick={() => void remove(c.courseId)}
               disabled={removingId === c.courseId}
-              className="text-sm px-3 py-1.5 rounded-md border border-[var(--color-border)] hover:border-[var(--color-danger)] disabled:opacity-50"
+              aria-label={removingId === c.courseId ? `Removing ${c.topic}` : `Remove ${c.topic}`}
+              aria-busy={removingId === c.courseId}
+              className="min-h-11 text-sm px-3 py-1.5 rounded-md border border-[var(--color-border)] hover:border-[var(--color-danger)] disabled:opacity-50"
             >
               {removingId === c.courseId ? "Removing…" : "Remove"}
             </button>

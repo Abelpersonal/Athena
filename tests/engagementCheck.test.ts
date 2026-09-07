@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { eq } from "drizzle-orm";
 import { findInactivePathForNudge, runEngagementCheck } from "../src/engagementCheck/index.js";
 import { getDb, resetDbCache } from "../src/db/client.js";
 import { paths, pathDomains, pathTopics, courses, activityEvents, userProfile } from "../src/db/schema.js";

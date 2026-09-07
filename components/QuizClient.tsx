@@ -159,7 +159,11 @@ export function QuizClient({
         >
           {loading ? "Generating…" : isQuickCheckIn ? "Start 5-minute check-in" : "Start quiz"}
         </button>
-        {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
+        {error && (
+          <p className="text-[var(--color-danger)] text-sm" role="alert">
+            {error}
+          </p>
+        )}
       </div>
     );
   }
@@ -167,40 +171,44 @@ export function QuizClient({
   if (phase === "answering") {
     return (
       <div className="space-y-6">
-        {questions.map((q, i) => (
-          <div key={q.id} className="rounded-lg border border-[var(--color-border)] p-4">
-            <span className={`inline-block text-xs rounded-full border px-2 py-0.5 mb-2 ${TIER_COLOR[q.tier]}`}>
-              {q.tier}
-            </span>
-            <p className="mb-3">
-              {i + 1}. {q.prompt}
-            </p>
-            {q.type === "multiple_choice" ? (
-              <div className="space-y-1">
-                {q.options.map((opt, idx) => (
-                  <label key={idx} className="flex items-center gap-2 text-sm cursor-pointer py-1">
-                    <input
-                      type="radio"
-                      name={q.id}
-                      checked={answers[q.id] === idx}
-                      onChange={() => setAnswers((prev) => ({ ...prev, [q.id]: idx }))}
-                      className="w-5 h-5"
-                    />
-                    {opt}
-                  </label>
-                ))}
-              </div>
-            ) : (
-              <textarea
-                value={(answers[q.id] as string) ?? ""}
-                onChange={(e) => setAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))}
-                className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm"
-                rows={3}
-                placeholder="Your answer…"
-              />
-            )}
-          </div>
-        ))}
+        {questions.map((q, i) => {
+          const promptId = `quiz-prompt-${q.id}`;
+          return (
+            <div key={q.id} className="rounded-lg border border-[var(--color-border)] p-4">
+              <span className={`inline-block text-xs rounded-full border px-2 py-0.5 mb-2 ${TIER_COLOR[q.tier]}`}>
+                {q.tier}
+              </span>
+              <p id={promptId} className="mb-3">
+                {i + 1}. {q.prompt}
+              </p>
+              {q.type === "multiple_choice" ? (
+                <div className="space-y-1" role="radiogroup" aria-labelledby={promptId}>
+                  {q.options.map((opt, idx) => (
+                    <label key={idx} className="flex items-center gap-2 text-sm cursor-pointer py-1">
+                      <input
+                        type="radio"
+                        name={q.id}
+                        checked={answers[q.id] === idx}
+                        onChange={() => setAnswers((prev) => ({ ...prev, [q.id]: idx }))}
+                        className="w-5 h-5"
+                      />
+                      {opt}
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <textarea
+                  value={(answers[q.id] as string) ?? ""}
+                  onChange={(e) => setAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))}
+                  aria-labelledby={promptId}
+                  className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm"
+                  rows={3}
+                  placeholder="Your answer…"
+                />
+              )}
+            </div>
+          );
+        })}
         <button
           onClick={submit}
           disabled={loading || !allAnswered}
@@ -208,7 +216,11 @@ export function QuizClient({
         >
           {loading ? "Scoring…" : "Submit"}
         </button>
-        {error && <p className="text-[var(--color-danger)] text-sm">{error}</p>}
+        {error && (
+          <p className="text-[var(--color-danger)] text-sm" role="alert">
+            {error}
+          </p>
+        )}
       </div>
     );
   }
@@ -216,7 +228,7 @@ export function QuizClient({
   if (phase === "pending") {
     return (
       <div className="space-y-3">
-        <div className="rounded-lg border border-[var(--color-warn)]/40 p-4 space-y-1">
+        <div className="rounded-lg border border-[var(--color-warn)]/40 p-4 space-y-1" role="status" aria-live="polite">
           <p className="text-[var(--color-warn)] font-medium">Pending — will sync when back online</p>
           <p className="text-sm text-[var(--color-text-muted)]">
             You&apos;re offline, so this couldn&apos;t be scored for real yet. A quick estimate from the
