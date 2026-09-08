@@ -10,6 +10,8 @@
     "inspect-graph": "tsx src/harness/inspectGraph.ts",
     "knowledge-update": "tsx src/knowledgeUpdate/cli.ts",
     "engagement-check": "tsx src/engagementCheck/cli.ts",
+    "backup": "tsx src/harness/backup.ts",
+    "restore": "tsx src/harness/restore.ts",
     "db:generate": "drizzle-kit generate",
     "test": "vitest run",
     "test:watch": "vitest",

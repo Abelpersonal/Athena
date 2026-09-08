@@ -7,6 +7,7 @@ import { closeWebSearch } from "../mcp/webSearch.js";
 import { closeYoutubeTranscript } from "../mcp/youtubeTranscript.js";
 import { closeMemoryGraph } from "../memoryGraph/index.js";
 import { createMockOrchestratorRun, createMockSearchProvider, mockFetchAndClean } from "../harness/mocks.js";
+import { validateEnv } from "../shared/validateEnv.js";
 
 /**
  * The Knowledge Update Agent's standalone scheduled-job script (Phase 6, Deliverable 3) —
@@ -25,6 +26,7 @@ import { createMockOrchestratorRun, createMockSearchProvider, mockFetchAndClean 
 async function main(): Promise<void> {
   const dryRun = process.argv.includes("--dry-run");
   console.log(`[knowledge-update] Starting${dryRun ? " (--dry-run: mocked, no real API calls, isolated DB)" : ""}...`);
+  validateEnv({ skip: dryRun });
 
   resetDbCache();
   const db = await getDb(dryRun ? path.join(process.cwd(), "data", "teacher.dry-run.db") : undefined);

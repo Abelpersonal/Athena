@@ -13,6 +13,7 @@ import { aggregateMaterials } from "../materialAggregator/index.js";
 import { generateMindMap } from "../mindMap/index.js";
 import { getDb, resetDbCache } from "../db/client.js";
 import { slugify } from "../shared/ids.js";
+import { validateEnv } from "../shared/validateEnv.js";
 import {
   createMockOrchestratorRun,
   createMockSearchProvider,
@@ -93,6 +94,13 @@ import { createMockOpenLibraryProvider, createMockGutenbergProvider } from "./mo
  */
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+
+  // Startup Validation addition: checked once, here, before any subcommand dispatch — every
+  // subcommand that accepts `--dry-run` (research/build/suggest) mocks its LLM/search/extraction
+  // collaborators and needs no real key at all, so the flag is read generically off the whole argv
+  // rather than duplicated per-subcommand. quiz/practice/goal/whats-new have no dry-run mode (see
+  // this file's own top-of-file doc comment) and always need real keys, which this still enforces.
+  validateEnv({ skip: args.includes("--dry-run") });
 
   if (args[0] === "research") {
     await runResearchCommand(args.slice(1));

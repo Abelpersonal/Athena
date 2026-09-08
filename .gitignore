@@ -6,6 +6,7 @@ logs/
 output/
 data/*.db
 data/audio-cache/
+backups/
 .next/
 next-env.d.ts
 *.tsbuildinfo

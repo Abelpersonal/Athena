@@ -3,6 +3,7 @@ import "dotenv/config";
 import path from "node:path";
 import { runEngagementCheck } from "./index.js";
 import { getDb, resetDbCache } from "../db/client.js";
+import { validateEnv } from "../shared/validateEnv.js";
 
 /**
  * The engagement nudge's standalone scheduled-job script (Phase 10, Deliverable 5) —
@@ -19,6 +20,7 @@ import { getDb, resetDbCache } from "../db/client.js";
 async function main(): Promise<void> {
   const dryRun = process.argv.includes("--dry-run");
   console.log(`[engagement-check] Starting${dryRun ? " (--dry-run: mocked push send, isolated DB)" : ""}...`);
+  validateEnv({ skip: dryRun });
 
   resetDbCache();
   const db = await getDb(dryRun ? path.join(process.cwd(), "data", "teacher.dry-run.db") : undefined);

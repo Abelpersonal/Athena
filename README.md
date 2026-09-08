@@ -4067,6 +4067,215 @@ reconnects on the next call after closing rather than being left in a broken sta
   well-known private/reserved ranges; it doesn't attempt to distinguish "safe" public destinations
   from any other reachable public address, which was never in scope for this pass.
 
+## Startup Validation, Graph Drift Check, Backup/Export, Log Rotation (a scoped addition, not a numbered phase)
+
+Four operational/robustness additions found by thinking about what happens over *sustained* real
+usage — once a real course exists, real mastery data accumulates, and the app has been running for
+weeks — none of which any short, mocked, or dry-run session so far could have exercised. No changes
+to any agent's actual logic; all four are additive safety/debugging nets.
+
+### Deliverable 1: startup environment validation
+
+`src/shared/validateEnv.ts`'s `validateEnv()` checks, for whichever provider is actually selected,
+that its required key is present and non-empty — `LLM_PROVIDER=gemini` (default) needs
+`GEMINI_API_KEY`, `LLM_PROVIDER=anthropic` needs `ANTHROPIC_API_KEY`, `TTS_PROVIDER=openai`
+(default) needs `OPENAI_API_KEY` (`TTS_PROVIDER=browser` needs nothing) — and that VAPID push
+config is all-or-nothing: if any of `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY`/`VAPID_SUBJECT` is set,
+all three must be. `TAVILY_API_KEY` is the one deliberate exception: missing it only warns, never
+throws, since dry-run/mocked workflows are a legitimate, already-established use case that never
+touches real search. On failure, one error lists every unmet requirement by name — not a generic
+"config invalid" — so a `research`/`build` run that would otherwise fail with a cryptic 401 three
+calls into a real pipeline instead fails in under a second, at the very top, naming exactly what's
+missing.
+
+Called at the start of every real entry point:
+
+- `src/harness/cli.ts`'s `main()`, before subcommand dispatch — reads `--dry-run` generically off
+  the whole argv (rather than per-subcommand) since every subcommand that accepts it
+  (`research`/`build`/`suggest`) mocks its LLM/search/extraction collaborators and needs no real
+  key at all; `quiz`/`practice`/`goal`/`whats-new` have no dry-run mode (see this file's own doc
+  comment) and are always validated for real.
+- `src/knowledgeUpdate/cli.ts` and `src/engagementCheck/cli.ts`, skipped exactly when their own
+  `--dry-run` flag is passed.
+- A new root-level `instrumentation.ts` — Next.js's own stable, once-per-server-process startup
+  hook (no `experimental.instrumentationHook` flag needed on this Next version). This is a
+  genuinely new pattern for this codebase: nothing did eager startup validation before this — every
+  provider only ever discovered a missing key lazily, on its first real call. The root layout
+  (`app/layout.tsx`) was considered and rejected: it re-runs per request/navigation, the wrong shape
+  for "fail once, loudly, at boot." Guarded to `process.env.NEXT_RUNTIME === "nodejs"` since every
+  route in this app already pins `runtime = "nodejs"` — costs nothing today, protects against ever
+  double-running this on an edge runtime later. `instrumentation.ts` also had to be added to
+  `tsconfig.json`'s own `include` list — it lives at the repo root, outside every glob
+  (`app/**`, `components/**`, `lib/**`) that config previously checked, so `npm run typecheck`
+  was silently never actually type-checking it at all until this was added.
+
+**A real, discovered gap, not a hypothetical**: running this against this repo's own real `.env`
+immediately surfaced that `OPENAI_API_KEY` was never set, despite `TTS_PROVIDER` defaulting to
+`"openai"` — meaning lesson audio synthesis was already silently broken, the exact "confusing
+failure deep in a run" scenario this deliverable exists to catch, and (per `.env.example`'s own
+now-corrected comment — see below) `engagementCheck`'s real (non-dry-run) push-send path had no
+try/catch around it at all, unlike `knowledgeUpdate`'s: a partially-configured VAPID setup would
+have crashed that scheduled cron job uncaught, rather than degrading to a logged failure the way
+`.env.example` claimed for both scripts. `validateEnv()` now catches this class of problem for both
+scripts, at start, before either ever reaches that code path.
+
+### Deliverable 2: Memory Graph ↔ SQLite drift check
+
+Every Memory Graph write (`writeTopic`, `writeMasteryUpdate`, `writeSubtopicFacts`, ...) is
+designed to degrade silently on failure (log and skip, never block course generation — see the
+Phase 3.5 section above). Correct for keeping the app usable, but it means the graph can fall
+behind SQLite with nothing to notice or report it — and both the Goal Planner's overlap detection
+and the Knowledge Update Agent's delta detection read their history *from the graph*, so a silently
+diverged graph means those two agents could be working from stale data with no visible warning.
+
+`src/memoryGraph/driftCheck.ts`'s `checkGraphDrift()` is a **read-only diagnostic, not a repair
+tool** — it never re-writes anything into the graph, only reports what it finds, using exactly the
+two existing read functions the kickoff named (`getTopicHistory()`, `getCrossCourseConnections()`),
+not a new graph query. Two drift signals per course, deliberately kept structurally justified
+rather than guessed:
+
+- **`missing_from_graph`**: SQLite has a real course for this topic, but the graph reports zero
+  nodes AND zero facts for it — `writeTopic()` (called once, at Course Builder time, for every
+  course) apparently never landed, or the graph has lost it entirely. The reliable, primary signal.
+- **`possibly_stale`**: the topic has SOME graph presence (so it was written at build time), but
+  real mastery activity has since happened in SQLite (`masteryState` rows with a non-null score
+  exist for its lessons — every quiz/practice completion calls `writeMasteryUpdate()`) while the
+  graph reports zero facts at all. Named "possibly" deliberately: Graphiti's own fact-extraction
+  pipeline processes a freshly-written episode asynchronously, so a very recent update can
+  legitimately not be a searchable fact yet — not proof of a lost write the way `missing_from_graph`
+  is, just a real, worth-a-look signal.
+
+**What it deliberately does NOT attempt, and why**: per-lesson mastery freshness — there's no graph
+query scoped to a single lesson/`conceptNodeId`, only a topic string — and any staleness signal
+based on `episodes`, since `get_episodes` returns recent episodes **globally**, not scoped to a
+topic (confirmed in `getTopicHistory()`'s own doc comment), so a topic's episode count says nothing
+reliable about that topic specifically. `connectedTopicsInGraph` is surfaced per course purely as
+informational context (from the same best-effort regex-based match `getCrossCourseConnections()`
+already documents as only as precise as its own pattern) — a course with zero connections is
+completely normal, never drift, so it never affects `status`.
+
+Exposed via `npm run inspect-graph -- --drift`, extending the existing single-topic inspection
+command rather than a new sibling tool — they share the same "requires `docker compose up`,
+degrades to a clean message rather than crashing if it's not" shape, and `--drift` is this file's
+first flag-style argument, matching `knowledgeUpdate`/`engagementCheck`'s existing
+`process.argv.includes("--flag")` convention over introducing a real argv parser for one flag.
+Degrades exactly like every other Memory Graph read: if the graph is genuinely unreachable, the
+check stops as soon as the first `error` comes back (rather than retrying the same failing
+connection once per course) and reports `reachable: false` with whatever courses were genuinely
+checked before that — verified for real against this repo's own dry-run database with no Docker
+Graphiti instance running, producing a clean "could not check" report rather than a crash or a
+false "no drift found."
+
+### Deliverable 3: backup/export for the SQLite DB and audio cache
+
+`npm run backup` (`src/harness/backup.ts`) and `npm run restore -- <backup-file>`
+(`src/harness/restore.ts`). `node:sqlite` (this codebase's real driver — see the Phase 3 section
+above for why better-sqlite3 isn't used) has no dedicated `.backup()` API the way better-sqlite3
+does (confirmed directly: `'backup' in DatabaseSync.prototype` is `false` in the installed Node
+version) — what it does have is `.serialize()`/`.deserialize()`, SQLite's own C API for producing a
+byte-for-byte-consistent snapshot of a database's current state. `createDbBackup()` uses exactly
+that, on a fresh, separate, **read-only** connection to the source file, and writes the result to a
+timestamped `backups/teacher-<timestamp>.db` — genuinely respecting "a clean copy while no write is
+in progress" rather than a naive file copy that could catch the live file mid-write.
+`--include-audio` optionally also copies the entire `AUDIO_CACHE_DIR` tree; opt-in, not automatic,
+since it's pure regenerable derived data (re-synthesizable from lesson text) that can be large, so
+it's excluded from the default backup rather than silently ballooning every routine run. `restore`
+is deliberately the simplest thing that could work: it can't stop a running app for you (no
+process-management layer exists in this codebase to hook into), so it just warns loudly and copies
+the chosen backup file over the live `TEACHER_DB_PATH`.
+
+Verified as a real round-trip, not just "a file was created": backed up this repo's own real
+dry-run database, restored it to a fresh path, and confirmed the restored `courses` row is
+byte-for-byte identical to the original via a direct query against both files.
+
+**Deliberate scope decision, documented as such**: no cloud backup, no scheduled-backup
+infrastructure — a manual, on-demand command is the whole of this deliverable, the same
+"don't over-build for a personal, single-user, local-first app" call this project has made
+repeatedly (e.g. `knowledge-update`/`engagement-check` are meant to be wired to an external
+OS-level cron entry, never a daemon this app runs itself).
+
+### Deliverable 4: JSONL log rotation
+
+`src/orchestrator/logging.ts`'s `logOrchestratorCall()` (the cost/latency audit trail — one JSONL
+line per Orchestrator call) grew unbounded before this. It now checks the live file's size before
+every append and, once it crosses `ORCHESTRATOR_LOG_MAX_SIZE_MB` (default 50), renames the current
+file to a timestamped sibling (`orchestrator.jsonl` → `orchestrator.2026-09-08T07-16-18-806Z.jsonl`)
+so the very next append recreates a fresh, empty file at the original, unchanged `getLogPath()`
+location — exactly like the first write this process ever made. The 5 most recent rotated files are
+kept; older ones are deleted automatically (a plain constant, not a second env var — a personal
+app's local log doesn't need independently configurable retention on top of a configurable size
+threshold).
+
+**Rotation failures are swallowed, never propagated** — every real call site in
+`src/orchestrator/index.ts` awaits `logOrchestratorCall()` with no try/catch of its own (this file's
+write was always meant to be a fire-and-forget audit trail, never something that could break the
+LLM call it's recording), so a bug in rotation bookkeeping (a rename race, a `readdir`/`unlink`
+failure) degrades to "the log grows a bit past its threshold this once" and is logged to the
+console, never to a crashed real course-generation run. A non-numeric override
+(`ORCHESTRATOR_LOG_MAX_SIZE_MB=not-a-number`) falls back to the safe default rather than becoming
+`NaN` — an unguarded `stats.size < NaN` is always `false`, which would have rotated on *every single
+call* instead of never rotating, the opposite of a safe fallback.
+
+Verified both via `tests/logging.test.ts` (mocked nothing — real `node:fs` operations against a
+real temp directory, asserting the live file's exact contents post-rotation and the retained
+rotated files are genuinely the most recent ones, not an arbitrary subset) and a real, non-test run
+against an actual directory on disk, confirmed by listing the resulting files directly.
+
+### Definition of done — Startup Validation, Graph Drift Check, Backup/Export, Log Rotation
+
+- [x] Starting the app with a deliberately misconfigured provider (`LLM_PROVIDER=anthropic` with no
+      `ANTHROPIC_API_KEY`) fails immediately with a clear, specific error — demonstrated via a real
+      `src/harness/cli.ts` invocation, not just claimed. `--dry-run` confirmed to still bypass
+      validation entirely, exactly as before.
+- [x] A real `next dev` boot against this repo's own actual `.env` demonstrated the Next.js
+      `instrumentation.ts` path failing at startup over the real, previously-undiscovered missing
+      `OPENAI_API_KEY` gap described above — the exact "fails once, loudly, at boot" behavior this
+      deliverable exists to produce.
+- [x] A constructed scenario (mocked `getTopicHistory`/`getCrossCourseConnections`) where SQLite has
+      a topic/mastery update the graph doesn't reflect is demonstrated caught and reported by the
+      drift check (both `missing_from_graph` and `possibly_stale`), and a genuinely in-sync scenario
+      reports clean — plus a real `npm run inspect-graph -- --drift` run against this repo's own
+      dry-run database with no Graphiti Docker instance running, demonstrating the graceful
+      "couldn't check, graph unreachable" report rather than a crash or a false clean result.
+- [x] A real `npm run backup` run against this repo's own real (dry-run-seeded) local DB produced a
+      real backup file, genuinely restored via `npm run restore` to a fresh path, with the restored
+      data confirmed byte-for-byte identical to the original via a direct query — not just that a
+      file was created.
+- [x] The JSONL log demonstrated rotating when it crosses the configured size threshold (both in
+      `tests/logging.test.ts` and a real, non-test run against a real directory), with rotated files
+      beyond the configured retention count (5) confirmed cleaned up automatically.
+- [x] All existing tests still pass, plus 32 new tests (458/458 total) covering `validateEnv()`'s
+      branches (`tests/validateEnv.test.ts`), the drift check's comparison logic
+      (`tests/driftCheck.test.ts`), the backup round-trip (`tests/backup.test.ts`), and log
+      rotation's size-trigger and retention-cleanup logic (`tests/logging.test.ts`); `npm run
+      typecheck` clean (both configs, `instrumentation.ts` now genuinely included in the frontend
+      one), `npm run lint` clean, `npm run build` succeeds.
+- [x] README updated: this section.
+
+### Documented gaps
+
+- **This repo's own `.env` needs a real fix before `npm run dev` will boot again** — see the
+  Deliverable 1 discussion above. This isn't a code bug introduced by this pass; it's a real,
+  previously-silent gap this pass was specifically built to surface. Set `OPENAI_API_KEY` or switch
+  `TTS_PROVIDER=browser` for local dev without a key.
+- **The drift check cannot verify per-lesson mastery freshness or use `episodes` as a staleness
+  signal** — both are real limitations of the two exposed graph read functions (topic-scoped
+  search only, and a global rather than topic-scoped episode listing), not something a cleverer
+  heuristic could safely paper over without risking false positives. Documented as an accepted
+  constraint of a best-effort, read-only diagnostic, matching this project's existing honesty about
+  `getCrossCourseConnections()`'s own regex-based precision limit.
+- **No automated tests for `src/harness/restore.ts`'s CLI wrapper itself** (only the underlying
+  `createDbBackup()` logic in `src/harness/backup.ts` has unit tests) — per this deliverable's own
+  resolved scope, a real, demonstrated backup-then-restore round-trip (see above) was the bar, not
+  exhaustive CLI test coverage for what is, underneath, a single `fs.copyFile` call.
+- **`engagementCheck`'s real push-send path still has no try/catch of its own** — `validateEnv()`
+  now catches the all-or-nothing VAPID misconfiguration case at startup, but a fully-valid VAPID
+  config that fails for some OTHER reason at send time (an expired key, a webpush library error)
+  would still propagate uncaught out of a real cron run, unlike `knowledgeUpdate`'s already-wrapped
+  equivalent. Left as-is: fixing that specific asymmetry is a `src/engagementCheck/index.ts` change
+  unrelated to startup validation, outside this pass's stated scope, and is now at least documented
+  here instead of only being discoverable by reading both files side by side.
+
 ## LLM provider swap (added mid-Phase-2, not in the original kickoff prompt)
 
 Partway through Phase 2, the decision was made to make the Orchestrator's LLM vendor swappable
