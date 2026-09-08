@@ -3876,6 +3876,197 @@ separate, future decision — not something this addition silently widened into.
   ordering is a real, tier-respecting sequencing recommendation — the user is expected to tackle
   phases in the order presented, not a hard technical gate preventing an out-of-order start.
 
+## SSRF Guard, Idempotent Sync Endpoints, Missing MCP Cleanup (a scoped addition, not a numbered phase)
+
+Three additive safety/correctness nets found by tracing runtime behavior after the prior gap-fix
+passes — no change to successful-request behavior, no new screens, no new agents.
+
+### Deliverable 1: an SSRF guard on outbound source fetches
+
+`fetchAndClean()` (`src/extraction/fetchAndClean.ts`) fetches whatever URL Tavily search (or a
+harness `--url` argument) hands it — including, in principle, a URL crafted to point at an internal
+service (`http://169.254.169.254/...` for a cloud metadata endpoint, `http://localhost:6379/...`
+for a local Redis instance, etc.). Nothing previously stopped that fetch from going out.
+
+`src/shared/urlSafety.ts`'s `isSafeToFetch(url): Promise<boolean>` closes this: it resolves the
+URL's hostname via real DNS (`node:dns/promises`'s `lookup(hostname, { all: true })`) and checks
+**every** resolved address — not the hostname string, and not just the first address — against a
+`node:net` `BlockList` covering RFC 1918 private ranges, loopback, link-local (including the
+`169.254.169.254` cloud-metadata address), IPv6 loopback/unspecified/link-local/unique-local, and
+the `0.0.0.0/8` "this network" range. This is checked before the HTTP fetch, before the PDF path
+(the same fetch call, just routed differently after the response comes back), and before the
+YouTube-URL routing check — one guard covers all three paths that share `fetchAndClean`'s entry
+point. A rejected URL degrades exactly like an already-unreachable one (logged, excluded,
+`sourceType: "unreachable"`) rather than crashing anything.
+
+**Why resolved-address checking, not hostname checking, matters — DNS rebinding**: a hostname-only
+check (blocking literal strings like `"localhost"`) is trivially bypassed by a domain that
+legitimately resolves to a private address (a real, if unusual, DNS record) or one that resolves
+differently between an initial check and the actual fetch. `isSafeToFetch` always does a real DNS
+lookup and checks the address that lookup actually returns, and checks every address a
+round-robin/multi-A-record hostname resolves to, not just the first — a hostname resolving to
+`[203.0.113.5, 10.0.0.1]` is rejected even though the first address is public. It fails **closed**
+on any DNS resolution error or malformed URL.
+
+No hardcoded offset table or hand-rolled CIDR math — `BlockList.addSubnet`/`addAddress`, verified
+empirically (a live script, not just documentation) to correctly check an IPv4-mapped IPv6 address
+like `::ffff:10.0.0.1` against the registered IPv4 rules with no separate `::ffff:.../96` rule
+needed.
+
+Tested via `tests/urlSafety.test.ts` (17 tests): most cases mock `node:dns/promises`'s `lookup` (so
+the private-range/DNS-rebinding logic runs fast and deterministically), plus a small real-DNS
+integration block (`vi.doUnmock` + `vi.resetModules` + dynamic re-import) confirming a real public
+hostname resolves and passes, a real literal loopback address is rejected, and the real `"localhost"`
+hostname is rejected end-to-end (no mocking at all). `tests/extraction.test.ts` gained the same
+two-tier treatment: mocked-DNS tests confirming the guard runs before the YouTube-routing branch and
+before any HTTP request, plus two real (non-mocked) integration tests — a real fetch to
+`https://example.com/` still succeeds, and a real DNS resolution of a literal `127.0.0.1` URL is
+genuinely refused.
+
+### Deliverable 2: idempotency on the two sync endpoints Phase 10's offline outbox retries
+
+**Risk**: Phase 10's offline outbox retries `/api/quiz/[lessonId]/score` on reconnect. If a request
+already succeeded server-side (QuizResult rows written, MasteryState updated, ActivityEvent fired,
+milestone/course-completion checked) but its response never reached the client (dropped connection,
+a closed tab before the response arrived), a retry re-runs the whole thing — a duplicate QuizResult
+row, a double-fired ActivityEvent, a double-triggered milestone or course-completion check.
+
+**Mechanism**: a client-generated UUID (`crypto.randomUUID()`), minted once per quiz attempt at
+`start()` and stored in component state (`components/QuizClient.tsx`), sent as `idempotencyKey` on
+both the real `submit()` fetch and the payload queued into the offline outbox if that fetch fails —
+so a background-sync retry of the same attempt carries the identical key. `scoreAndRecordQuiz()`
+(`src/quizEngine/index.ts`) checks for an existing `quizResults` row with that key **before any
+scoring happens** — including before the real, billed `score_free_text_answer` LLM call, not just
+before the DB write, so a retry doesn't double-bill real API cost either. A genuine duplicate
+returns the original aggregate outcome: `tierScores`, `overallScore`, `masteryState`, and
+`transferHighScoreAchieved` are all exactly reconstructed from what's actually persisted.
+`questionResults` (the fine-grained per-question breakdown with free-text explanations) is the one
+field that comes back empty on a reconstructed duplicate — documented, accepted, and unavoidable
+without a schema change; it was never persisted anywhere by the original design (only the aggregate
+per-tier scores and `masteryState.knowledgeScore` survive). `courseCompleted` also comes back
+`undefined` on a duplicate — that event, if any, already fired on the original request and a retry
+must not re-report or re-trigger it.
+
+Schema: a nullable `idempotencyKey` column on `quizResults`, under a **composite** unique index
+`(idempotencyKey, tier)` — one legitimate quiz session inserts multiple rows (one per tier tested)
+that must all share the same key without conflicting with each other. SQLite's unique-index NULL
+semantics (verified with a live script before relying on it) mean any number of pre-existing rows
+with a `null` key coexist without conflict, so every quiz result recorded before this change is
+untouched. Migration: `drizzle/0007_dusty_hellion.sql`.
+
+**A self-identified correction to the kickoff's own framing, for `app/api/practice/[id]/submit/route.ts`**:
+the kickoff named `/submit` as the second endpoint needing idempotency, on the theory that it's "the
+exact scenario Phase 10's retry-on-reconnect design exists to handle." Tracing the actual code shows
+two things that don't hold up:
+
+1. `/submit` never calls `recordPracticeAttempt` — the real `practiceAttempts` DB write happens in
+   `app/api/practice/[id]/reflect/route.ts` instead (`/submit`'s own doc comment already says so:
+   "THEN recordPracticeAttempt runs — see /reflect"). Applying an idempotency check to `/submit`
+   would guard a route that never touches the table in question.
+2. Phase 10's offline outbox (`src/offline/outbox.ts`) only retries exactly two item types —
+   `"ask_question"` and `"quiz_score"` — per that file's own doc comment ("Exactly two outbox item
+   types exist, per PRD §6.4's own hard-boundary list"). There is no practice-related offline retry
+   path at all; practice submission was never actually exposed to the lost-response-then-retry
+   failure mode the kickoff described.
+
+Idempotency was still added to `/reflect` (the real write path) as general defense-in-depth — it
+protects against a double-click or a client-side retry bug even without offline-outbox involvement
+— but this is honestly a hardening measure, not a fix for an actively-exercised gap the way the
+quiz-score fix is.
+
+A second, real bug surfaced while implementing that hardening: `/reflect` deletes its in-memory
+practice session (`deletePracticeSession`) immediately after a successful `recordPracticeAttempt`
+call. If the client never saw that response and retried, `getPracticeSession(sessionId)` on the
+retry would return `undefined` and 404 — **before the route ever got a chance to recognize the
+retry as a duplicate**, breaking the "return the original result, not an error" requirement. Fixed
+by extracting `findExistingPracticeAttempt(idempotencyKey)` (`src/practiceEngine/index.ts`) as a
+standalone lookup that needs no `PracticeSession` at all — everything required to reconstruct the
+result (`moduleId` for `updatedLessonIds`, `attemptNumber` for `willEscalateNextAttempt`) is already
+on the stored `practiceAttempts` row — and calling it from the route **before** the
+`getPracticeSession` check, not after. The practice session's own `sessionId` (already a stable URL
+param across a client retry) doubles as the idempotency key here; no new client-generated value was
+needed, unlike quiz. Unlike quiz's partial reconstruction, practice's is fully faithful: one
+complete row per attempt, no per-tier aggregation to lose fidelity over.
+
+Schema: a nullable `idempotencyKey` column on `practiceAttempts`, under a **simple** unique index —
+one call inserts exactly one row, so no composite key is needed here.
+
+Tested via new `describe` blocks in `tests/quizEngine.test.ts` and `tests/practiceEngine.test.ts`
+(8 new tests total, against a real in-memory SQLite DB the same way every other DB-touching test in
+these files already does — no real network/LLM calls needed, this is pure DB-write-dedup logic): a
+duplicate key returns the original result with no second row, no re-scoring/re-mastery-write, and no
+second `ActivityEvent`; a different key for the same lesson/module records fully and normally (a
+genuine retake is never blocked); a call with no key at all behaves exactly as before (no dedup);
+and (practice only) `findExistingPracticeAttempt` is confirmed to reconstruct the original result
+from nothing but the key, matching the no-`PracticeSession` retry path `/reflect` actually exercises.
+
+### Deliverable 3: the missing `closeYoutubeTranscript()` MCP cleanup call
+
+This deliverable is explicitly a **correction to an earlier overstated finding**, not a "cleanup is
+dead code" discovery: `src/harness/cli.ts`'s `.finally()` block already correctly closes four MCP
+clients (`closeWebSearch`, `closeMemoryGraph`, `closeOpenLibrary`, `closeGutenberg`), and
+`src/knowledgeUpdate/cli.ts` already does the same for its two. The real, narrow gap: the YouTube
+transcript MCP client (`src/mcp/youtubeTranscript.ts`, added during the Source Diversity phase,
+after this cleanup list already existed) was never added to either list, so a harness run that
+actually fetched a video transcript left that MCP subprocess connection open on exit.
+
+Fixed by adding `closeYoutubeTranscript()` to **both** `.finally()` blocks — `src/harness/cli.ts`
+(the obvious one) and `src/knowledgeUpdate/cli.ts`, a second, self-discovered real entry point: it
+also calls the real `fetchAndClean` by default in its non-dry-run path
+(`src/knowledgeUpdate/index.ts`'s `options.fetchAndClean ?? fetchAndCleanDefault`), so a real
+knowledge-update run could just as easily spawn (and previously leak) that same subprocess.
+`src/harness/inspectGraph.ts` was checked and confirmed to only ever touch `memoryGraph` — no fix
+needed there. A repo-wide grep for every `closeWebSearch`/`closeMemoryGraph`/`closeYoutubeTranscript`/
+`closeOpenLibrary`/`closeGutenberg` call site confirmed no API route calls any of them — correct,
+since the Next.js server process is long-running and should keep MCP connections open across
+requests rather than closing per-request; adding cleanup calls there would have been the wrong fix.
+
+Tested via three new tests in `tests/youtubeTranscript.test.ts`: the close call actually closes an
+opened connection, is a safe no-op when nothing was ever opened, and the singleton correctly
+reconnects on the next call after closing rather than being left in a broken state.
+
+### Definition of done — SSRF Guard, Idempotent Sync Endpoints, Missing MCP Cleanup
+
+- [x] A constructed private/loopback/link-local fetch is demonstrated rejected, including the
+      DNS-rebinding case (a non-`"localhost"`-named hostname that resolves to a private address) —
+      both via mocked-DNS unit tests and a real, non-mocked DNS resolution in
+      `tests/urlSafety.test.ts` / `tests/extraction.test.ts`.
+- [x] A real, safe URL (`https://example.com/`) still fetches successfully end to end, unmocked.
+- [x] A duplicate quiz-score submission (same `idempotencyKey`) returns the original result with no
+      duplicate `QuizResult` row, no re-scoring LLM call, no double-fired `ActivityEvent`, and no
+      re-triggered milestone/course-completion check.
+- [x] A duplicate practice `/reflect` submission returns the original result even when the in-memory
+      session was already deleted by the first call — the actual retry scenario, not just the
+      easier case where the session still exists.
+- [x] A different idempotency key for the same lesson/module still records normally — a genuine
+      retake or next attempt is never blocked by the dedup logic.
+- [x] `closeYoutubeTranscript()` confirmed called in both real harness-adjacent cleanup entry points
+      (`src/harness/cli.ts` and the self-discovered `src/knowledgeUpdate/cli.ts`), and confirmed
+      absent from every API route (correct — a persistent server process keeps connections open).
+- [x] All existing tests still pass, plus 34 new tests across all three deliverables — SSRF-guard
+      unit tests (`tests/urlSafety.test.ts`) and `fetchAndClean` integration tests
+      (`tests/extraction.test.ts`), idempotency tests (`tests/quizEngine.test.ts` /
+      `tests/practiceEngine.test.ts`), and MCP-cleanup tests (`tests/youtubeTranscript.test.ts`) —
+      for 426/426 total; `npm run typecheck` clean (both configs), `npm run lint` clean, `npm run
+      build` succeeds.
+- [x] README updated: this section.
+
+### Documented gaps
+
+- **`questionResults` (per-question free-text explanations) is not reconstructable on a duplicate
+  quiz submission** — it was never persisted anywhere by the original design (only per-tier
+  aggregates and `masteryState.knowledgeScore` survive), so a reconstructed duplicate returns `[]`
+  for that one field. Every aggregate value the mechanism actually exists to protect —
+  `tierScores`, `overallScore`, `masteryState`, `transferHighScoreAchieved` — is fully and exactly
+  reconstructed.
+- **Practice idempotency on `/reflect` is defense-in-depth, not a fix for an actively-exercised
+  offline-retry gap** — Phase 10's offline outbox never retries practice submissions at all (only
+  `"ask_question"` and `"quiz_score"` exist as outbox item types). It still protects against
+  double-clicks and client-side retry bugs independent of the offline outbox.
+- **No IP-allowlist or per-request egress network policy** — the SSRF guard blocks the
+  well-known private/reserved ranges; it doesn't attempt to distinguish "safe" public destinations
+  from any other reachable public address, which was never in scope for this pass.
+
 ## LLM provider swap (added mid-Phase-2, not in the original kickoff prompt)
 
 Partway through Phase 2, the decision was made to make the Orchestrator's LLM vendor swappable

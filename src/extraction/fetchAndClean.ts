@@ -3,6 +3,7 @@ import { Readability } from "@mozilla/readability";
 import type { Locator } from "../shared/locator.js";
 import { parsePdf as parsePdfDefault, type ParsePdfFn } from "./fetchAndCleanPdf.js";
 import { getTranscript as getTranscriptDefault, type TranscriptProvider } from "../mcp/youtubeTranscript.js";
+import { isSafeToFetch } from "../shared/urlSafety.js";
 
 /**
  * Coarse, honestly-derived source category — grounded in what the fetch
@@ -169,6 +170,16 @@ async function fetchAndCleanPdfResponse(response: Response, parsePdf: ParsePdfFn
 export async function fetchAndClean(url: string, options: FetchAndCleanOptions = {}): Promise<CleanedContent> {
   const getTranscript = options.getTranscript ?? getTranscriptDefault;
   const parsePdf = options.parsePdf ?? parsePdfDefault;
+
+  // SSRF guard (src/shared/urlSafety.ts) — checked BEFORE the YouTube-routing branch below, so
+  // one check covers all three fetch paths that share this entry point (the main HTTP fetch, the
+  // PDF path, which is the same fetch just routed differently after the response comes back, and
+  // video URLs, which never reach an HTTP request at all). A rejected URL degrades exactly like an
+  // already-unreachable one — a new REASON a source gets excluded, not a new failure mode.
+  if (!(await isSafeToFetch(url))) {
+    console.warn(`[extraction] Refusing to fetch ${url} — it resolves to a private/reserved network address.`);
+    return emptyResult("unreachable");
+  }
 
   if (isYoutubeVideoUrl(url)) {
     return fetchAndCleanVideo(url, getTranscript);

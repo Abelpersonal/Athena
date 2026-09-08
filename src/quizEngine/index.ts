@@ -112,6 +112,8 @@ export interface QuizEngineOptions {
   recordActivityEvent?: RecordActivityEventFn;
   questionsPerTier?: number;
   weakConceptThreshold?: number;
+  /** Client-generated (a UUID minted once when the quiz attempt starts — see components/QuizClient.tsx), reused verbatim on a retry. Undefined for any caller that predates this (CLI/harness, older clients) — scoreAndRecordQuiz() then behaves exactly as it always did, with no dedup at all. */
+  idempotencyKey?: string;
   onProgress?: ProgressListener;
 }
 
@@ -216,6 +218,21 @@ export async function checkAndMarkCourseCompletion(lessonId: string, db: Teacher
  * MasteryState.knowledgeScore (an upsert that targets ONLY that column, so a
  * quiz run never touches experienceScore), mirror the update into the
  * Memory Graph as a new dated fact, and surface any weak concept node.
+ *
+ * SSRF Guard + Idempotent Sync Endpoints addition: `idempotencyKey` (optional — undefined for
+ * every direct/CLI caller that predates this, exactly today's behavior) is checked BEFORE any
+ * scoring happens — including the real, billed `score_free_text_answer` LLM call — since Phase
+ * 10's offline outbox retries this exact route on reconnect, and a request that already succeeded
+ * server-side but lost its response client-side must not be re-scored (real API cost) or
+ * re-recorded (a duplicate QuizResult row, a double-fired ActivityEvent, a double-triggered
+ * milestone/course-completion check) on that retry. A genuine duplicate returns the ORIGINAL
+ * aggregate outcome — `tierScores`/`overallScore`/`masteryState`/`transferHighScoreAchieved` are
+ * all real, exactly reconstructed from what's actually persisted. `questionResults` (per-question
+ * detail with free-text explanations) is the one field NOT reconstructable this way — it was never
+ * persisted anywhere, by original design — so a reconstructed duplicate returns `[]` for it rather
+ * than guessing; the aggregate outcome this whole mechanism protects is still fully correct.
+ * `courseCompleted` is always `undefined` on a reconstructed duplicate: that event, if any, already
+ * fired on the original request — a retry must not re-report (or re-trigger) it.
  */
 export async function scoreAndRecordQuiz(
   lessonId: string,
@@ -229,6 +246,27 @@ export async function scoreAndRecordQuiz(
   const recordActivity = options.recordActivityEvent ?? recordActivityEventDefault;
   const weakThreshold = options.weakConceptThreshold ?? DEFAULT_WEAK_CONCEPT_THRESHOLD;
   const onProgress = options.onProgress;
+  const idempotencyKey = options.idempotencyKey;
+
+  if (idempotencyKey) {
+    const existing = await db.select().from(quizResults).where(eq(quizResults.idempotencyKey, idempotencyKey));
+    if (existing.length > 0) {
+      onProgress?.(`Duplicate submission (idempotency key already recorded) for lesson ${lessonId} — returning the original result.`);
+      const tierScores: Partial<Record<QuizTier, number>> = {};
+      for (const row of existing) tierScores[row.tier] = row.score;
+      const [existingMastery] = await db.select().from(masteryState).where(eq(masteryState.conceptNodeId, lessonId));
+      const overallScore = existingMastery?.knowledgeScore ?? 0;
+      return {
+        lessonId,
+        tierScores,
+        overallScore,
+        questionResults: [],
+        weakConceptNodes: overallScore < weakThreshold ? [lessonId] : [],
+        masteryState: existingMastery ?? { conceptNodeId: lessonId, knowledgeScore: null, experienceScore: null, lastUpdated: "" },
+        transferHighScoreAchieved: isTransferHighScoreAchieved(tierScores),
+      };
+    }
+  }
 
   const answerByQuestionId = new Map(answers.map((a) => [a.questionId, a.answer]));
   const questionResults: QuizQuestionResult[] = [];
@@ -262,7 +300,14 @@ export async function scoreAndRecordQuiz(
     if (tierResults.length === 0) continue;
     const avg = tierResults.reduce((sum, r) => sum + r.score, 0) / tierResults.length;
     tierScores[tier] = avg;
-    await db.insert(quizResults).values({ id: `qr_${randomUUID()}`, lessonId, tier, score: avg, date: now });
+    await db.insert(quizResults).values({
+      id: `qr_${randomUUID()}`,
+      lessonId,
+      tier,
+      score: avg,
+      date: now,
+      idempotencyKey: idempotencyKey ?? null,
+    });
   }
 
   const overallScore =

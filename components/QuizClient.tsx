@@ -80,11 +80,20 @@ export function QuizClient({
   const [pendingScore, setPendingScore] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * SSRF Guard + Idempotent Sync Endpoints addition: minted once per attempt, at `start()` —
+   * not server-generated — so it's already known on the FIRST real `submit()` call and reused
+   * unchanged on any offline-outbox retry of that same attempt (the whole point: the server can
+   * recognize a retry as "the same attempt" rather than a new one). A fresh quiz generation
+   * (a genuine retake) always calls `start()` again first, which mints a new key.
+   */
+  const [idempotencyKey, setIdempotencyKey] = useState("");
   const isQuickCheckIn = Boolean(tiers && tiers.length === 1 && questionsPerTier === 1);
 
   async function start() {
     setLoading(true);
     setError(null);
+    setIdempotencyKey(crypto.randomUUID());
     try {
       const res = await fetch(`/api/quiz/${lessonId}/generate`, {
         method: "POST",
@@ -124,7 +133,7 @@ export function QuizClient({
       const res = await fetch(`/api/quiz/${lessonId}/score`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ questions, answers: payloadAnswers }),
+        body: JSON.stringify({ questions, answers: payloadAnswers, idempotencyKey }),
       });
       if (!res.ok) throw new Error("Failed to score the quiz.");
       setResult((await res.json()) as QuizResult);
@@ -136,7 +145,7 @@ export function QuizClient({
         id: `ob_${crypto.randomUUID()}`,
         type: "quiz_score",
         url: `/api/quiz/${lessonId}/score`,
-        payload: { questions, answers: payloadAnswers },
+        payload: { questions, answers: payloadAnswers, idempotencyKey },
         createdAt: new Date().toISOString(),
       });
       void registerBackgroundSync();

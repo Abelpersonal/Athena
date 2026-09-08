@@ -322,6 +322,131 @@ describe("scoreAndRecordQuiz", () => {
   });
 });
 
+describe("scoreAndRecordQuiz — idempotency (SSRF Guard + Idempotent Sync Endpoints)", () => {
+  beforeEach(() => resetDbCache());
+
+  function makeQuestions(): QuizQuestion[] {
+    return [
+      { id: "q-mc-correct", tier: "recall", type: "multiple_choice", prompt: "MC 1", options: ["a", "b"], correctOptionIndex: 1 },
+      { id: "q-ft-good", tier: "application", type: "free_text", prompt: "FT good", rubric: "r" },
+    ];
+  }
+
+  function makeScoringMock(): MockRun {
+    return async (taskType, context) => {
+      if (taskType === "score_free_text_answer") {
+        const isGood = context.userAnswer === "a genuinely correct explanation";
+        return respond(taskType, { score: isGood ? 0.9 : 0.1, explanation: isGood ? "Correct." : "Incorrect." });
+      }
+      throw new Error(`No mock for task type "${taskType}"`);
+    };
+  }
+
+  const answers: QuizAnswer[] = [
+    { questionId: "q-mc-correct", answer: 1 },
+    { questionId: "q-ft-good", answer: "a genuinely correct explanation" },
+  ];
+
+  it("a duplicate submission (same idempotencyKey) returns the original aggregate result without a second QuizResult row, without re-scoring, and without double-firing ActivityEvent", async () => {
+    const db = await getDb(":memory:");
+    const { lessonId } = await seedLesson(db);
+    const scoringCalls: string[] = [];
+    const activityCalls: string[] = [];
+    const key = "idem-key-1";
+
+    const first = await scoreAndRecordQuiz(lessonId, makeQuestions(), answers, {
+      db,
+      idempotencyKey: key,
+      orchestratorRun: (async (taskType: string, context: Record<string, unknown>) => {
+        scoringCalls.push(taskType);
+        return makeScoringMock()(taskType, context, "test");
+      }) as never,
+      writeMasteryUpdate: async () => {},
+      recordActivityEvent: async (eventType) => {
+        activityCalls.push(eventType);
+      },
+    });
+
+    const second = await scoreAndRecordQuiz(lessonId, makeQuestions(), answers, {
+      db,
+      idempotencyKey: key,
+      orchestratorRun: (async () => {
+        throw new Error("must not re-score on a duplicate submission — this would double-bill a real LLM call");
+      }) as never,
+      writeMasteryUpdate: async () => {
+        throw new Error("must not re-write mastery on a duplicate submission");
+      },
+      recordActivityEvent: async (eventType) => {
+        activityCalls.push(eventType);
+      },
+    });
+
+    // Scoring only happened once (for the first, genuine call).
+    expect(scoringCalls).toEqual(["score_free_text_answer"]);
+    // ActivityEvent only fired once — the duplicate returned before reaching that step.
+    expect(activityCalls).toEqual(["quiz_completed"]);
+
+    // The aggregate outcome is exactly reconstructed on the duplicate.
+    expect(second.tierScores).toEqual(first.tierScores);
+    expect(second.overallScore).toBeCloseTo(first.overallScore);
+    expect(second.masteryState.knowledgeScore).toBeCloseTo(first.masteryState.knowledgeScore!);
+    expect(second.transferHighScoreAchieved).toBe(first.transferHighScoreAchieved);
+    // The one documented, accepted gap: per-question detail was never persisted, so it can't be reconstructed.
+    expect(second.questionResults).toEqual([]);
+
+    const rows = await db.select().from(quizResults).where(eq(quizResults.lessonId, lessonId));
+    expect(rows).toHaveLength(2); // recall + application, NOT doubled to 4
+  });
+
+  it("a different idempotencyKey for the same lesson records normally (a genuine retake is not blocked)", async () => {
+    const db = await getDb(":memory:");
+    const { lessonId } = await seedLesson(db);
+    const activityCalls: string[] = [];
+
+    await scoreAndRecordQuiz(lessonId, makeQuestions(), answers, {
+      db,
+      idempotencyKey: "idem-key-a",
+      orchestratorRun: makeScoringMock() as never,
+      writeMasteryUpdate: async () => {},
+      recordActivityEvent: async (eventType) => {
+        activityCalls.push(eventType);
+      },
+    });
+    await scoreAndRecordQuiz(lessonId, makeQuestions(), answers, {
+      db,
+      idempotencyKey: "idem-key-b",
+      orchestratorRun: makeScoringMock() as never,
+      writeMasteryUpdate: async () => {},
+      recordActivityEvent: async (eventType) => {
+        activityCalls.push(eventType);
+      },
+    });
+
+    expect(activityCalls).toEqual(["quiz_completed", "quiz_completed"]);
+    const rows = await db.select().from(quizResults).where(eq(quizResults.lessonId, lessonId));
+    expect(rows).toHaveLength(4); // 2 tiers x 2 genuinely distinct attempts
+  });
+
+  it("a submission with no idempotencyKey behaves exactly as before (no dedup at all)", async () => {
+    const db = await getDb(":memory:");
+    const { lessonId } = await seedLesson(db);
+
+    await scoreAndRecordQuiz(lessonId, makeQuestions(), answers, {
+      db,
+      orchestratorRun: makeScoringMock() as never,
+      writeMasteryUpdate: async () => {},
+    });
+    await scoreAndRecordQuiz(lessonId, makeQuestions(), answers, {
+      db,
+      orchestratorRun: makeScoringMock() as never,
+      writeMasteryUpdate: async () => {},
+    });
+
+    const rows = await db.select().from(quizResults).where(eq(quizResults.lessonId, lessonId));
+    expect(rows).toHaveLength(4); // both calls fully recorded, exactly like pre-idempotency behavior
+  });
+});
+
 describe("checkAndMarkCourseCompletion (Phase 6 completion trigger)", () => {
   beforeEach(() => {
     resetDbCache();

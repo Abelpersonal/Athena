@@ -20,7 +20,9 @@ vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => ({
   }),
 }));
 
-const { YoutubeTranscriptMCPProvider } = await import("../src/mcp/youtubeTranscript.js");
+const { YoutubeTranscriptMCPProvider, getTranscript, closeYoutubeTranscript } = await import(
+  "../src/mcp/youtubeTranscript.js"
+);
 
 // The real, confirmed shape of @sinco-lab/mcp-youtube-transcript@0.0.12's get_timed_transcript
 // response (read from its actual published, compiled source — not guessed): one text block
@@ -190,6 +192,38 @@ describe("YoutubeTranscriptMCPProvider", () => {
 
       expect(warnSpy.mock.calls.some(([msg]) => typeof msg === "string" && msg.includes("timed out"))).toBe(true);
       warnSpy.mockRestore();
+    });
+  });
+
+  describe("closeYoutubeTranscript (Missing MCP Cleanup fix)", () => {
+    it("closes the underlying MCP client connection once one has actually been opened", async () => {
+      mockCallTool.mockResolvedValueOnce({ isError: false, content: [realTimedTranscriptBlock()] });
+
+      // The module-level default provider (what the harness's cleanup path actually calls into),
+      // not a directly-constructed instance — this is the real subprocess/connection lifecycle
+      // src/harness/cli.ts's and src/knowledgeUpdate/cli.ts's .finally() blocks now tear down.
+      await getTranscript("https://www.youtube.com/watch?v=abc123");
+      expect(mockConnect).toHaveBeenCalledTimes(1); // confirms a real connection was actually opened first
+
+      await closeYoutubeTranscript();
+
+      expect(mockClose).toHaveBeenCalledTimes(1);
+    });
+
+    it("is a safe no-op when no connection was ever opened (e.g. a harness run that never touched a video source)", async () => {
+      await expect(closeYoutubeTranscript()).resolves.toBeUndefined();
+      expect(mockClose).not.toHaveBeenCalled();
+    });
+
+    it("reconnects on the next call after closing — the singleton isn't left in a broken state", async () => {
+      mockCallTool.mockResolvedValue({ isError: false, content: [realTimedTranscriptBlock()] });
+
+      await getTranscript("https://www.youtube.com/watch?v=abc123");
+      await closeYoutubeTranscript();
+      const result = await getTranscript("https://www.youtube.com/watch?v=xyz789");
+
+      expect(result).not.toBeNull();
+      expect(mockConnect).toHaveBeenCalledTimes(2); // reconnected for the second, post-close call
     });
   });
 });

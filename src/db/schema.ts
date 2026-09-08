@@ -1,4 +1,4 @@
-import { sqliteTable, text, real, integer } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, real, integer, uniqueIndex } from "drizzle-orm/sqlite-core";
 import type { RestructureLayersOutput } from "../orchestrator/templates/restructureLayers.js";
 import type { Locator } from "../shared/locator.js";
 
@@ -158,15 +158,30 @@ export const sources = sqliteTable("sources", {
  * (semantically graded by the Orchestrator) questions — see
  * src/quizEngine/README notes for the full scoring writeup.
  */
-export const quizResults = sqliteTable("quiz_results", {
-  id: text("id").primaryKey(),
-  lessonId: text("lesson_id")
-    .notNull()
-    .references(() => lessons.id),
-  tier: text("tier", { enum: ["recall", "application", "transfer"] }).notNull(),
-  score: real("score").notNull(),
-  date: text("date").notNull(),
-});
+export const quizResults = sqliteTable(
+  "quiz_results",
+  {
+    id: text("id").primaryKey(),
+    lessonId: text("lesson_id")
+      .notNull()
+      .references(() => lessons.id),
+    tier: text("tier", { enum: ["recall", "application", "transfer"] }).notNull(),
+    score: real("score").notNull(),
+    date: text("date").notNull(),
+    /**
+     * SSRF Guard + Idempotent Sync Endpoints addition: a client-generated key (a UUID minted once
+     * when the quiz attempt starts, reused across every retry — see components/QuizClient.tsx and
+     * `src/offline/outbox.ts`'s `OutboxItem.payload`) shared by every tier-row ONE real quiz
+     * session writes. Null for every row written before this column existed, and for any direct
+     * (non-route) caller that doesn't pass one — `scoreAndRecordQuiz()`'s idempotency check is
+     * skipped entirely when absent, exactly today's un-deduped behavior. The unique index below is
+     * on `(idempotencyKey, tier)`, not `idempotencyKey` alone, since one legitimate session
+     * inserts multiple rows (one per tier tested) that must all share the same key.
+     */
+    idempotencyKey: text("idempotency_key"),
+  },
+  (table) => [uniqueIndex("quiz_results_idempotency_key_tier_idx").on(table.idempotencyKey, table.tier)]
+);
 
 /**
  * Phase 4: the Practice/Experience Engine's persisted attempts. Scoped to
@@ -174,17 +189,30 @@ export const quizResults = sqliteTable("quiz_results", {
  * exercises a whole module's worth of content, unlike a quiz which targets
  * one lesson.
  */
-export const practiceAttempts = sqliteTable("practice_attempts", {
-  id: text("id").primaryKey(),
-  moduleId: text("module_id")
-    .notNull()
-    .references(() => modules.id),
-  type: text("type", { enum: ["project", "simulation", "debate"] }).notNull(),
-  attemptNumber: integer("attempt_number").notNull(),
-  feedback: text("feedback").notNull(),
-  reflectionNotes: text("reflection_notes"),
-  date: text("date").notNull(),
-});
+export const practiceAttempts = sqliteTable(
+  "practice_attempts",
+  {
+    id: text("id").primaryKey(),
+    moduleId: text("module_id")
+      .notNull()
+      .references(() => modules.id),
+    type: text("type", { enum: ["project", "simulation", "debate"] }).notNull(),
+    attemptNumber: integer("attempt_number").notNull(),
+    feedback: text("feedback").notNull(),
+    reflectionNotes: text("reflection_notes"),
+    date: text("date").notNull(),
+    /**
+     * SSRF Guard + Idempotent Sync Endpoints addition: the REAL DB write for a practice attempt
+     * happens at `/api/practice/[id]/reflect`, not `/submit` (which never touches this table — it
+     * only calls the critique/reflection-prompt LLM steps and updates the in-memory session) — so
+     * that route's own practice `sessionId` (already stable across a client retry, since it's the
+     * URL param) is reused directly as this key, with no new client-generated UUID needed at all.
+     * One row per call, so — unlike quizResults above — a simple single-column unique index is
+     * enough; no composite key required.
+     */
+    idempotencyKey: text("idempotency_key").unique(),
+  }
+);
 
 /**
  * Phase 4: the queryable current-state mastery table — "what's this

@@ -4,6 +4,7 @@ import path from "node:path";
 import { runKnowledgeUpdateAgent } from "./index.js";
 import { getDb, resetDbCache } from "../db/client.js";
 import { closeWebSearch } from "../mcp/webSearch.js";
+import { closeYoutubeTranscript } from "../mcp/youtubeTranscript.js";
 import { closeMemoryGraph } from "../memoryGraph/index.js";
 import { createMockOrchestratorRun, createMockSearchProvider, mockFetchAndClean } from "../harness/mocks.js";
 
@@ -61,4 +62,5 @@ main()
   .finally(async () => {
     await closeWebSearch();
     await closeMemoryGraph();
+    await closeYoutubeTranscript();
   });

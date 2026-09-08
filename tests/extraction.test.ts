@@ -1,5 +1,16 @@
-import { describe, it, expect, afterEach, vi } from "vitest";
-import { fetchAndClean } from "../src/extraction/fetchAndClean.js";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
+
+// The SSRF guard (src/shared/urlSafety.ts) does a REAL DNS lookup before every fetch — mocked here
+// so every extraction test that isn't specifically about the guard stays fast/deterministic and
+// isolated from a real network dependency, defaulting to a real public address so it never
+// interferes with what these tests actually check. Dedicated SSRF tests below override this
+// per-case to simulate a private/reserved resolution.
+const mockLookup = vi.fn();
+vi.mock("node:dns/promises", () => ({
+  lookup: (...args: unknown[]) => mockLookup(...args),
+}));
+
+const { fetchAndClean } = await import("../src/extraction/fetchAndClean.js");
 
 const originalFetch = global.fetch;
 
@@ -8,6 +19,10 @@ function mockFetchOnce(impl: (...args: unknown[]) => unknown): void {
 }
 
 describe("fetchAndClean", () => {
+  beforeEach(() => {
+    mockLookup.mockReset().mockResolvedValue([{ address: "104.20.23.154", family: 4 }]);
+  });
+
   afterEach(() => {
     global.fetch = originalFetch;
   });
@@ -257,5 +272,80 @@ describe("fetchAndClean", () => {
       expect(result.sourceType).toBe("video");
       expect(result.extractionConfidence).toBe(0);
     });
+  });
+
+  describe("SSRF guard (mocked DNS)", () => {
+    it("refuses to fetch a URL resolving to a private address — no HTTP request is ever made", async () => {
+      mockLookup.mockResolvedValueOnce([{ address: "127.0.0.1", family: 4 }]);
+      const fetchSpy = vi.fn();
+      global.fetch = fetchSpy as unknown as typeof fetch;
+
+      const result = await fetchAndClean("http://totally-normal-looking-domain.com/article");
+
+      expect(result).toEqual({ text: "", title: "", extractionConfidence: 0, sourceType: "unreachable" });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("this is the DNS-rebinding case: a hostname NOT literally 'localhost' that resolves to a private address is still refused", async () => {
+      mockLookup.mockResolvedValueOnce([{ address: "169.254.169.254", family: 4 }]); // cloud metadata
+      const fetchSpy = vi.fn();
+      global.fetch = fetchSpy as unknown as typeof fetch;
+
+      const result = await fetchAndClean("http://looks-like-a-real-blog.com/post");
+
+      expect(result.sourceType).toBe("unreachable");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("also blocks a spoofed YouTube-looking hostname that resolves privately — checked before the video-routing branch", async () => {
+      mockLookup.mockResolvedValueOnce([{ address: "192.168.1.1", family: 4 }]);
+      const fetchSpy = vi.fn();
+      global.fetch = fetchSpy as unknown as typeof fetch;
+      const getTranscript = vi.fn();
+
+      const result = await fetchAndClean("https://www.youtube.com/watch?v=abc123", { getTranscript });
+
+      expect(result.sourceType).toBe("unreachable");
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(getTranscript).not.toHaveBeenCalled();
+    });
+
+    it("still fetches normally when DNS resolves only to public addresses", async () => {
+      mockLookup.mockResolvedValueOnce([{ address: "104.20.23.154", family: 4 }]);
+      mockFetchOnce(
+        async () => new Response("not found", { status: 404, headers: { "content-type": "text/html" } })
+      );
+
+      const result = await fetchAndClean("https://example.com/missing");
+      expect(result.sourceType).toBe("unreachable"); // the 404, not the SSRF guard, is why — proves the guard let it through
+    });
+  });
+});
+
+describe("fetchAndClean SSRF guard (real, non-mocked DNS)", () => {
+  afterEach(() => {
+    vi.doUnmock("node:dns/promises");
+    vi.resetModules();
+  });
+
+  it("a real (non-mocked) safe public URL still fetches successfully end to end — the guard doesn't reject legitimate sources", async () => {
+    vi.doUnmock("node:dns/promises");
+    vi.resetModules();
+    const { fetchAndClean: realFetchAndClean } = await import("../src/extraction/fetchAndClean.js");
+
+    // A real, unmocked fetch against IANA's own stable reserved example domain — real DNS AND
+    // real HTTP, proving the guard's real resolution path doesn't false-positive on a genuine
+    // public source.
+    const result = await realFetchAndClean("https://example.com/");
+    expect(result.sourceType).not.toBe("unreachable");
+  });
+
+  it("a real (non-mocked) DNS resolution to the literal loopback address is genuinely refused end to end", async () => {
+    vi.doUnmock("node:dns/promises");
+    vi.resetModules();
+    const { fetchAndClean: realFetchAndClean } = await import("../src/extraction/fetchAndClean.js");
+
+    const result = await realFetchAndClean("http://127.0.0.1:1/should-never-be-fetched");
+    expect(result).toEqual({ text: "", title: "", extractionConfidence: 0, sourceType: "unreachable" });
   });
 });

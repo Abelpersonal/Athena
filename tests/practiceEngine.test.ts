@@ -5,6 +5,7 @@ import {
   runDialogueTurn,
   critiquePracticeAttempt,
   recordPracticeAttempt,
+  findExistingPracticeAttempt,
   difficultyForAttemptNumber,
   PracticeEngineError,
   DEFAULT_ESCALATION_CAP,
@@ -406,5 +407,133 @@ describe("recordPracticeAttempt", () => {
     });
 
     expect(calls).toEqual([{ eventType: "practice_completed", entityId: moduleId, courseId }]);
+  });
+});
+
+describe("recordPracticeAttempt — idempotency (SSRF Guard + Idempotent Sync Endpoints)", () => {
+  beforeEach(() => {
+    resetDbCache();
+  });
+
+  function makeSession(moduleId: string, overrides: Partial<PracticeSession> = {}): PracticeSession {
+    return {
+      moduleId,
+      moduleTitle: "Test Module",
+      topicType: "skill_based",
+      topicTypeJustification: "j",
+      format: "project",
+      formatJustification: "j",
+      difficulty: "guided",
+      attemptNumber: 1,
+      project: { task: "t", datasetOrPrompt: "d", deliverableExpectations: "e" },
+      ...overrides,
+    };
+  }
+
+  it("a duplicate call (same idempotencyKey) returns the original result without a second PracticeAttempt row, without re-updating mastery, and without double-firing ActivityEvent", async () => {
+    const db = await getDb(":memory:");
+    const { moduleId, lessonIds } = await seedModule(db);
+    const session = makeSession(moduleId);
+    const masteryCalls: string[] = [];
+    const activityCalls: string[] = [];
+    const key = "practice-idem-key-1";
+
+    const first = await recordPracticeAttempt(session, "Good first attempt.", "None.", 0.8, {
+      db,
+      idempotencyKey: key,
+      writeMasteryUpdate: async () => {
+        masteryCalls.push("write");
+      },
+      recordActivityEvent: async (eventType) => {
+        activityCalls.push(eventType);
+      },
+    });
+
+    const second = await recordPracticeAttempt(session, "Good first attempt.", "None.", 0.8, {
+      db,
+      idempotencyKey: key,
+      writeMasteryUpdate: async () => {
+        throw new Error("must not re-write mastery on a duplicate submission");
+      },
+      recordActivityEvent: async (eventType) => {
+        activityCalls.push(eventType);
+      },
+    });
+
+    // Mastery/Memory Graph write and ActivityEvent both fired exactly once — the duplicate
+    // returned before reaching either.
+    expect(masteryCalls).toHaveLength(lessonIds.length);
+    expect(activityCalls).toEqual(["practice_completed"]);
+
+    // Full, exact reconstruction — practice stores one complete row per attempt, unlike quiz's
+    // per-tier aggregates, so nothing here is approximated.
+    expect(second).toEqual(first);
+
+    const rows = await db.select().from(practiceAttempts).where(eq(practiceAttempts.moduleId, moduleId));
+    expect(rows).toHaveLength(1); // NOT doubled to 2
+  });
+
+  it("a different idempotencyKey for the same module records normally (a genuine retry/next attempt is not blocked)", async () => {
+    const db = await getDb(":memory:");
+    const { moduleId } = await seedModule(db);
+    const activityCalls: string[] = [];
+
+    await recordPracticeAttempt(makeSession(moduleId), "Attempt 1.", "None.", 0.7, {
+      db,
+      idempotencyKey: "practice-idem-key-a",
+      writeMasteryUpdate: async () => {},
+      recordActivityEvent: async (eventType) => {
+        activityCalls.push(eventType);
+      },
+    });
+    await recordPracticeAttempt(makeSession(moduleId, { attemptNumber: 2, difficulty: "harder" }), "Attempt 2.", "None.", 0.8, {
+      db,
+      idempotencyKey: "practice-idem-key-b",
+      writeMasteryUpdate: async () => {},
+      recordActivityEvent: async (eventType) => {
+        activityCalls.push(eventType);
+      },
+    });
+
+    expect(activityCalls).toEqual(["practice_completed", "practice_completed"]);
+    const rows = await db.select().from(practiceAttempts).where(eq(practiceAttempts.moduleId, moduleId));
+    expect(rows).toHaveLength(2);
+  });
+
+  it("a call with no idempotencyKey behaves exactly as before (no dedup at all)", async () => {
+    const db = await getDb(":memory:");
+    const { moduleId } = await seedModule(db);
+
+    await recordPracticeAttempt(makeSession(moduleId), "A.", "None.", 0.7, { db, writeMasteryUpdate: async () => {} });
+    await recordPracticeAttempt(makeSession(moduleId), "B.", "None.", 0.7, { db, writeMasteryUpdate: async () => {} });
+
+    const rows = await db.select().from(practiceAttempts).where(eq(practiceAttempts.moduleId, moduleId));
+    expect(rows).toHaveLength(2); // both calls fully recorded, exactly like pre-idempotency behavior
+  });
+
+  describe("findExistingPracticeAttempt", () => {
+    it("returns null when no record with that idempotencyKey exists", async () => {
+      const db = await getDb(":memory:");
+      await seedModule(db);
+      expect(await findExistingPracticeAttempt("no-such-key", { db })).toBeNull();
+    });
+
+    it("reconstructs the original result from just the idempotencyKey — no PracticeSession needed", async () => {
+      const db = await getDb(":memory:");
+      const { moduleId, lessonIds } = await seedModule(db);
+      const key = "practice-idem-key-standalone";
+      const recorded = await recordPracticeAttempt(makeSession(moduleId), "Good.", "None.", 0.8, {
+        db,
+        idempotencyKey: key,
+        writeMasteryUpdate: async () => {},
+      });
+
+      // This is exactly the scenario app/api/practice/[id]/reflect/route.ts hits on a retry after
+      // its in-memory session was already deleted by the first, successful call — the lookup must
+      // succeed with nothing but the key.
+      const found = await findExistingPracticeAttempt(key, { db });
+      expect(found).toEqual(recorded);
+      expect(found!.updatedLessonIds.sort()).toEqual([...lessonIds].sort());
+    });
   });
 });

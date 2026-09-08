@@ -73,6 +73,8 @@ export interface PracticeEngineOptions {
   /** Injectable for tests. Default: the real motivation.recordActivityEvent() (Phase 9). */
   recordActivityEvent?: RecordActivityEventFn;
   escalationCap?: number;
+  /** SSRF Guard + Idempotent Sync Endpoints addition: recordPracticeAttempt()'s dedup key. `app/api/practice/[id]/reflect/route.ts` passes the practice session's own `sessionId` — already stable across a client retry (it's the URL param), so no new client-generated value is needed for this one, unlike the quiz-score route. Undefined for any caller that predates this — behaves exactly as it always did, no dedup at all. */
+  idempotencyKey?: string;
   onProgress?: ProgressListener;
 }
 
@@ -305,7 +307,52 @@ export interface RecordPracticeAttemptResult {
  * ONLY that column, so a practice run never touches knowledgeScore. Also
  * mirrors the update into the Memory Graph as a new dated fact, same as the
  * Quiz Engine does for knowledgeScore.
+ *
+ * SSRF Guard + Idempotent Sync Endpoints addition: `idempotencyKey` (optional — undefined for
+ * every caller that predates this) is checked before the insert. A genuine duplicate call (the
+ * same practice session's `/reflect` retried after its first, real response was lost) returns the
+ * ORIGINAL, already-persisted `RecordPracticeAttemptResult` unchanged — `attemptId`/
+ * `attemptNumber` come straight from the existing row; `updatedLessonIds`/`willEscalateNextAttempt`
+ * are fully, exactly reconstructable (a pure function of `session`, needing no DB round trip at
+ * all) rather than approximated, unlike the quiz-score case's `questionResults` limitation — this
+ * table stores one full attempt per row, not per-tier aggregates. No MasteryState update, Memory
+ * Graph write, or ActivityEvent fires a second time.
  */
+/**
+ * SSRF Guard + Idempotent Sync Endpoints addition: looks up a previously-recorded
+ * `practiceAttempts` row by `idempotencyKey` alone — no `PracticeSession` required — and
+ * reconstructs the exact `RecordPracticeAttemptResult` that the original call returned.
+ *
+ * This is exported standalone (not just inlined in `recordPracticeAttempt` below) because
+ * `app/api/practice/[id]/reflect/route.ts` deletes its in-memory session immediately after a
+ * successful `recordPracticeAttempt` call (`deletePracticeSession`) — so if the client never saw
+ * the response (lost after server-side success) and retries, the route's own
+ * `getPracticeSession(sessionId)` returns undefined and would otherwise 404 *before ever reaching*
+ * `recordPracticeAttempt`'s internal duplicate check. The route must check for an existing record
+ * by `sessionId` FIRST, before it even looks at the (possibly already-deleted) in-memory session.
+ * Needing no `PracticeSession` is what makes that possible: everything required to reconstruct the
+ * result — `moduleId` (for `updatedLessonIds`) and `attemptNumber` (for `willEscalateNextAttempt`,
+ * equal to the original call's `session.attemptNumber`) — is already on the stored row itself.
+ */
+export async function findExistingPracticeAttempt(
+  idempotencyKey: string,
+  options: PracticeEngineOptions = {}
+): Promise<RecordPracticeAttemptResult | null> {
+  const db = options.db ?? (await getDb());
+  const cap = options.escalationCap ?? DEFAULT_ESCALATION_CAP;
+
+  const [existing] = await db.select().from(practiceAttempts).where(eq(practiceAttempts.idempotencyKey, idempotencyKey));
+  if (!existing) return null;
+
+  const moduleLessons = await db.select().from(lessons).where(eq(lessons.moduleId, existing.moduleId));
+  return {
+    attemptId: existing.id,
+    attemptNumber: existing.attemptNumber,
+    updatedLessonIds: moduleLessons.map((l) => l.id),
+    willEscalateNextAttempt: existing.attemptNumber < cap,
+  };
+}
+
 export async function recordPracticeAttempt(
   session: PracticeSession,
   critique: string,
@@ -318,7 +365,18 @@ export async function recordPracticeAttempt(
   const recordActivity = options.recordActivityEvent ?? recordActivityEventDefault;
   const cap = options.escalationCap ?? DEFAULT_ESCALATION_CAP;
   const onProgress = options.onProgress;
+  const idempotencyKey = options.idempotencyKey;
   const now = new Date().toISOString();
+
+  const willEscalateNextAttempt = session.attemptNumber < cap;
+
+  if (idempotencyKey) {
+    const existingResult = await findExistingPracticeAttempt(idempotencyKey, options);
+    if (existingResult) {
+      onProgress?.(`Duplicate submission (idempotency key already recorded) for session on module "${session.moduleTitle}" — returning the original result.`);
+      return existingResult;
+    }
+  }
 
   const attemptId = `pa_${randomUUID()}`;
   await db.insert(practiceAttempts).values({
@@ -329,6 +387,7 @@ export async function recordPracticeAttempt(
     feedback: critique,
     reflectionNotes,
     date: now,
+    idempotencyKey: idempotencyKey ?? null,
   });
 
   const moduleLessons = await db.select().from(lessons).where(eq(lessons.moduleId, session.moduleId));
@@ -355,7 +414,6 @@ export async function recordPracticeAttempt(
     await recordActivity("practice_completed", session.moduleId, mod.courseId, { db });
   }
 
-  const willEscalateNextAttempt = session.attemptNumber < cap;
   onProgress?.(
     willEscalateNextAttempt
       ? `Attempt ${session.attemptNumber} recorded — the next attempt will be generated at a harder difficulty.`

@@ -54,6 +54,7 @@ import { runContinuousLearningAgent, ContinuousLearningError } from "../continuo
 import { getWhatsNewDigest } from "../knowledgeUpdate/index.js";
 import { closeOpenLibrary } from "../mcp/openLibrary.js";
 import { closeGutenberg } from "../mcp/gutenberg.js";
+import { closeYoutubeTranscript } from "../mcp/youtubeTranscript.js";
 import { closeMemoryGraph } from "../memoryGraph/index.js";
 import { createMockOpenLibraryProvider, createMockGutenbergProvider } from "./mocks.js";
 
@@ -838,4 +839,5 @@ main()
     await closeMemoryGraph();
     await closeOpenLibrary();
     await closeGutenberg();
+    await closeYoutubeTranscript();
   });
