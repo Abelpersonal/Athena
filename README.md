@@ -147,7 +147,20 @@ asserted away.
   `npx -y tavily-mcp` over stdio — see "Swapping the MCP search provider" below. Phase 2 reuses
   this same adapter for both its initial and contention-focused searches; no additional search
   providers (arXiv, YouTube, Consensus, Firecrawl) were added — that's a documented later
-  refinement, not a Phase 2 requirement.
+  refinement, not a Phase 2 requirement. **`TAVILY_API_KEY` is optional, not required** —
+  confirmed directly by reading the real installed `tavily-mcp` package's own source
+  (`npm pack tavily-mcp`, inspect `build/index.js`): with no key set, it transparently runs in
+  Tavily's free, rate-limited **keyless** mode, and `tavily_search` (the only tool this codebase
+  calls) works exactly the same way, returning the same plain-text result shape
+  `parseResults()`/`parseDetailedResultsText()` already parse — confirmed with a real, live,
+  end-to-end search through this codebase's own `webSearch()` with `TAVILY_API_KEY` unset,
+  genuine results back. Set a real key only if the keyless rate limit becomes a real constraint.
+  The one confirmed functional difference: a keyless rate-limit hit doesn't come back as an
+  MCP-level error the way other Tavily failures do — the server recognizes that specific response
+  shape and returns it as normal (non-error) text instead, which `webSearch.ts`'s parser doesn't
+  recognize as a result shape either; it still degrades to zero results without crashing (same as
+  any other unparseable response), and now logs a diagnostic warning when that happens rather than
+  failing completely silently.
 - **Content extraction:** Readability.js (`@mozilla/readability` + `jsdom`), in-process
   (`src/extraction/fetchAndClean.ts`). No Trafilatura fallback for low-confidence extractions —
   **deferred, not built** (see "Documented gaps" below); a low-confidence page is simply excluded
@@ -243,7 +256,7 @@ Teacher's own `.env` (repo root):
 | `LLM_PROVIDER` | No | `gemini` | Which vendor the Orchestrator calls: `gemini` or `anthropic`. |
 | `GEMINI_API_KEY` | Yes, if `LLM_PROVIDER=gemini` | — | From [Google AI Studio](https://aistudio.google.com/apikey). |
 | `ANTHROPIC_API_KEY` | Yes, if `LLM_PROVIDER=anthropic` | — | From [console.anthropic.com](https://console.anthropic.com/). |
-| `TAVILY_API_KEY` | Yes (for search) | — | Passed to the Tavily MCP server subprocess. |
+| `TAVILY_API_KEY` | No | — | Passed to the Tavily MCP server subprocess. Optional, not required — leaving it unset runs real search in Tavily's free, rate-limited keyless mode (see above), not a broken state. |
 | `ORCHESTRATOR_MODEL` | No | the selected provider's own default (see below) | One-line override to change the model. |
 | `ORCHESTRATOR_MAX_RETRIES` | No | `2` | Retries after the first attempt before a hard failure. |
 | `ORCHESTRATOR_REQUEST_TIMEOUT_MS` | No | `60000` | Per-request timeout for every LLM call (both providers) — see "Timeouts + Hard Cost Cap" below. |
@@ -362,14 +375,15 @@ real `data/teacher.db` — mock course data (titled "Mock Module (m1)" etc.) sho
 the DB you'd actually inspect real courses in. `npm run inspect` needs the same `--dry-run` flag to
 read that same isolated file.
 
-All real (non-`--dry-run`) `research`/`build` forms need `TAVILY_API_KEY` set, plus either
-`GEMINI_API_KEY` (default provider) or `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY`. `build`
-additionally talks to the Memory Graph service (see Setup) when not run with `--dry-run`, though a
-missing graph service degrades rather than fails the command. `quiz`/`practice` (Phase 4) need only
-an LLM key (no `TAVILY_API_KEY` — they don't search the web) plus a lesson/module id that's
-already persisted, from any prior `build` or `build --dry-run` run; they also talk to the Memory
-Graph the same way `build` does. This is meant to be a scrappy debugging tool across
-Phases 1–6, not a polished CLI.
+All real (non-`--dry-run`) `research`/`build` forms need either `GEMINI_API_KEY` (default
+provider) or `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY`. `TAVILY_API_KEY` is optional, not
+required — real search still works unset, via Tavily's free keyless mode (see "Setup" above);
+set a real key only for a higher rate limit. `build` additionally talks to the Memory Graph service
+(see Setup) when not run with `--dry-run`, though a missing graph service degrades rather than
+fails the command. `quiz`/`practice` (Phase 4) need only an LLM key (no `TAVILY_API_KEY` at all —
+they don't search the web) plus a lesson/module id that's already persisted, from any prior `build`
+or `build --dry-run` run; they also talk to the Memory Graph the same way `build` does. This is
+meant to be a scrappy debugging tool across Phases 1–6, not a polished CLI.
 
 ## Running tests
 
@@ -4082,8 +4096,10 @@ that its required key is present and non-empty — `LLM_PROVIDER=gemini` (defaul
 (default) needs `OPENAI_API_KEY` (`TTS_PROVIDER=browser` needs nothing) — and that VAPID push
 config is all-or-nothing: if any of `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY`/`VAPID_SUBJECT` is set,
 all three must be. `TAVILY_API_KEY` is the one deliberate exception: missing it only warns, never
-throws, since dry-run/mocked workflows are a legitimate, already-established use case that never
-touches real search. On failure, one error lists every unmet requirement by name — not a generic
+throws — not because it's optional-but-broken without it, but because it genuinely isn't required
+at all; real search still works via Tavily's free keyless mode (see "Setup" above, and the
+follow-up fix below that corrected this warning's wording after it was first written). On failure,
+one error lists every unmet requirement by name — not a generic
 "config invalid" — so a `research`/`build` run that would otherwise fail with a cryptic 401 three
 calls into a real pipeline instead fails in under a second, at the very top, naming exactly what's
 missing.
@@ -4118,6 +4134,21 @@ try/catch around it at all, unlike `knowledgeUpdate`'s: a partially-configured V
 have crashed that scheduled cron job uncaught, rather than degrading to a logged failure the way
 `.env.example` claimed for both scripts. `validateEnv()` now catches this class of problem for both
 scripts, at start, before either ever reaches that code path.
+
+**Corrected, follow-up fix**: this section's own `TAVILY_API_KEY` warning, and the equivalent one
+in `src/mcp/webSearch.ts`, originally described a missing key as something that would make search
+"fail" or be "rejected." Both were factually wrong. Confirmed directly (`npm pack tavily-mcp`,
+reading the real installed package's `build/index.js`): the real `tavily-mcp` server transparently
+supports Tavily's free, rate-limited **keyless** mode with no key set — `search` and `extract` (the
+only two tools this codebase calls) both work, confirmed with a real, live, end-to-end search
+through this codebase's own `webSearch()` with `TAVILY_API_KEY` unset, genuine results returned.
+Both warnings now describe this accurately: an informational note about which mode is active, not
+a failure. The one real, verified functional difference: a keyless rate-limit hit comes back as a
+normal (non-error) text block the tavily-mcp server formats specially, in a shape
+`webSearch.ts`'s parser doesn't recognize as a result — it still degrades to zero results without
+crashing, exactly like any other unparseable response, and now logs a diagnostic warning
+distinguishing that case from a genuine zero-hits query (previously silent either way). See
+"Setup" above for the corrected `TAVILY_API_KEY` framing throughout the rest of this README.
 
 ### Deliverable 2: Memory Graph ↔ SQLite drift check
 

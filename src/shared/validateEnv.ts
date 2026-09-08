@@ -27,9 +27,13 @@ export interface ValidateEnvOptions {
  * second copy of the same validation to keep in sync.
  *
  * `TAVILY_API_KEY` is the one deliberate exception to "fail fast": it only warns, never throws —
- * per the SSRF/idempotency pass's established precedent for optional-but-important config, and
- * because dry-run/mocked workflows are a legitimate, already-established use case that never
- * touches real search at all.
+ * not because it's optional-but-broken-without-it, but because it genuinely isn't required at all.
+ * The real `tavily-mcp` server (confirmed directly by reading its own source, not guessed —
+ * `npm pack tavily-mcp` and inspect `build/index.js`) transparently supports Tavily's free,
+ * rate-limited **keyless** access mode when no key is set: search and extract (the only two tools
+ * this codebase calls) both work, just capped at a lower request rate than a real key gets. This
+ * warning exists purely so an operator knows which mode they're in, not because anything is
+ * expected to fail.
  */
 export function validateEnv(options: ValidateEnvOptions = {}): void {
   if (options.skip) return;
@@ -50,9 +54,9 @@ export function validateEnv(options: ValidateEnvOptions = {}): void {
 
   if (!process.env.TAVILY_API_KEY) {
     console.warn(
-      "[validateEnv] TAVILY_API_KEY is not set — real web search will fail once a run reaches a " +
-        "search call. Fine for a dry-run/mocked workflow; set it before any real research/build/" +
-        "knowledge-update run."
+      "[validateEnv] TAVILY_API_KEY is not set — real web search will run in Tavily's free, " +
+        "rate-limited keyless mode (search + extract only). This is a legitimate, working " +
+        "configuration, not a failure; set a real key only if you want a higher rate limit."
     );
   }
 

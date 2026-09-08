@@ -123,7 +123,9 @@ export class TavilyMCPSearchProvider implements SearchProvider {
     this.args = options.args ?? ["-y", "tavily-mcp"];
     if (!this.apiKey) {
       console.warn(
-        "[webSearch] TAVILY_API_KEY is not set — the Tavily MCP server will likely reject every search."
+        "[webSearch] TAVILY_API_KEY is not set — running in Tavily's free, rate-limited keyless " +
+          "mode (search + extract only, confirmed working — see the real tavily-mcp package source). " +
+          "Set a real key only if a higher rate limit is needed."
       );
     }
   }
@@ -224,13 +226,34 @@ export class TavilyMCPSearchProvider implements SearchProvider {
       // confirmed-live shape is plain "Title: / URL: / Content:" text, so
       // fall back to parsing that rather than silently dropping real results.
       let items: TavilyResultItem[];
+      let parsedAsJson = false;
       try {
         items = extractResultItems(JSON.parse(text));
+        parsedAsJson = true;
       } catch {
         items = [];
       }
       if (items.length === 0) {
         items = parseDetailedResultsText(text);
+      }
+
+      // Confirmed directly (reading the real tavily-mcp package source, `npm pack tavily-mcp`):
+      // a keyless rate-limit/usage-cap hit does NOT come back as an MCP tool-level error
+      // (`isError: true`, already logged and handled above in searchOne) — the server catches it
+      // server-side and returns a normal text block describing the limit, since it recognizes that
+      // response shape as its own "recoverable" envelope. That text matches neither JSON nor the
+      // Title:/URL: shape, so it would otherwise silently become zero results with no trace at
+      // all — unlike every other failure path in this file, which logs a warning. This is the one
+      // real, verified gap that distinguishes keyless mode from a real API key: not a crash, not a
+      // thrown error, just a response shape the parser doesn't recognize. Flagged here so it's
+      // diagnosable rather than indistinguishable from "this query genuinely had zero results."
+      if (!parsedAsJson && items.length === 0 && text.trim().length > 0) {
+        console.warn(
+          `[webSearch] Tavily search for "${query}" returned text matching neither the JSON nor ` +
+            "the Detailed Results shape — treating as zero results for this block. A keyless " +
+            "rate-limit/usage-cap response takes exactly this shape; set TAVILY_API_KEY for a " +
+            `higher rate limit if this keeps happening. First 200 chars: "${text.slice(0, 200)}"`
+        );
       }
 
       for (const item of items) {
