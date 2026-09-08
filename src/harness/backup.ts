@@ -2,7 +2,7 @@
 import "dotenv/config";
 import { DatabaseSync } from "node:sqlite";
 import { existsSync } from "node:fs";
-import { mkdir, writeFile, cp } from "node:fs/promises";
+import { mkdir, cp } from "node:fs/promises";
 import path from "node:path";
 
 const DEFAULT_DB_PATH = path.join(process.cwd(), "data", "teacher.db");
@@ -15,28 +15,48 @@ export function timestampForBackup(now: Date = new Date()): string {
 }
 
 /**
- * Backup/Export addition: `node:sqlite` (this codebase's real driver — see src/db/client.ts's own
- * doc comment on why better-sqlite3 isn't used) has no dedicated `.backup()` API the way
- * better-sqlite3 does; confirmed directly (`'backup' in DatabaseSync.prototype` is `false` in the
- * installed Node version). What it DOES have is `.serialize()`/`.deserialize()` — SQLite's own C
- * API for producing/reading a byte-for-byte-consistent snapshot of a database's current state.
- * That's the real equivalent here, used on a fresh, separate, READ-ONLY connection to the source
- * file (never the app's own live connection, which this script doesn't need to know about) —
- * genuinely respecting "a clean copy while no write is in progress" rather than a naive `cp` that
- * could catch the file mid-write, exactly as this deliverable asked for.
+ * Escapes a path for embedding inside a single-quoted SQLite string literal (double any embedded
+ * single quote — standard SQL string-literal escaping, since `VACUUM INTO` doesn't support a bound
+ * parameter for its destination). `backupPath` below is always internally constructed from a
+ * timestamp, never user input, but this is done properly regardless rather than relying on that.
+ */
+function escapeSqliteStringLiteral(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+/**
+ * Backup/Export addition, corrected: `node:sqlite` (this codebase's real driver — see
+ * src/db/client.ts's own doc comment on why better-sqlite3 isn't used) has no dedicated `.backup()`
+ * API the way better-sqlite3 does — confirmed directly, `'backup' in DatabaseSync.prototype` is
+ * `false`. The PREVIOUS version of this function used `.serialize()`/`.deserialize()` instead,
+ * with a comment claiming that was "confirmed directly" too — it wasn't actually checked against
+ * every Node version this app might run on, and `npm run backup` broke with
+ * `TypeError: readDb.serialize is not a function` on at least one real environment where those
+ * methods (added to `node:sqlite` later than the module's original, more stable surface) aren't
+ * present. `exec()`, used here, has been part of `node:sqlite` since its introduction, making this
+ * version portable across Node versions this app might actually run on, not just the one most
+ * recently tested against.
+ *
+ * The real fix: SQLite's own `VACUUM INTO 'path'` statement, run via `exec()` on a fresh, separate,
+ * READ-ONLY connection to the source file (never the app's own live connection, which this script
+ * doesn't need to know about) — SQLite's standard, documented way to produce a consistent,
+ * self-contained snapshot of a live database directly to a new file, genuinely respecting "a clean
+ * copy while no write is in progress" rather than a naive `cp` that could catch the file mid-write.
+ * `VACUUM INTO` refuses to run if the destination already exists, so `backupPath`'s timestamp
+ * naming must keep producing a genuinely new filename every call (already true — see
+ * `timestampForBackup`). It writes the file itself; there's no intermediate byte buffer to hold or
+ * write with a separate `fs` call the way `.serialize()` needed.
  */
 export async function createDbBackup(dbPath: string, backupDir: string, now: Date = new Date()): Promise<string> {
   await mkdir(backupDir, { recursive: true });
   const backupPath = path.join(backupDir, `teacher-${timestampForBackup(now)}.db`);
 
   const readDb = new DatabaseSync(dbPath, { readOnly: true });
-  let bytes: Uint8Array;
   try {
-    bytes = readDb.serialize();
+    readDb.exec(`VACUUM INTO '${escapeSqliteStringLiteral(backupPath)}'`);
   } finally {
     readDb.close();
   }
-  await writeFile(backupPath, bytes);
   return backupPath;
 }
 

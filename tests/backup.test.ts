@@ -74,4 +74,23 @@ describe("createDbBackup", () => {
     await createDbBackup(dbPath, backupDir);
     expect(existsSync(backupDir)).toBe(true);
   });
+
+  it("handles a backup directory path containing a single quote correctly (VACUUM INTO embeds the destination in a SQL string literal)", async () => {
+    // Not a realistic path for this codebase's own BACKUP_DIR (always process.cwd() + "backups"),
+    // but a Windows username can legitimately contain an apostrophe (e.g. "O'Brien") and flow into
+    // an arbitrary caller-supplied backupDir — this proves the escaping is real, not assumed safe.
+    const quotedBackupDir = path.join(tmpDir, "o'brien's backups");
+    const sourceDb = new DatabaseSync(dbPath);
+    sourceDb.exec("CREATE TABLE t (v TEXT)");
+    sourceDb.prepare("INSERT INTO t VALUES (?)").run("quoted-path-ok");
+    sourceDb.close();
+
+    const backupPath = await createDbBackup(dbPath, quotedBackupDir);
+
+    expect(existsSync(backupPath)).toBe(true);
+    const restoredDb = new DatabaseSync(backupPath, { readOnly: true });
+    const rows = restoredDb.prepare("SELECT v FROM t").all();
+    restoredDb.close();
+    expect(rows).toEqual([{ v: "quoted-path-ok" }]);
+  });
 });

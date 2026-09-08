@@ -4171,22 +4171,40 @@ false "no drift found."
 `npm run backup` (`src/harness/backup.ts`) and `npm run restore -- <backup-file>`
 (`src/harness/restore.ts`). `node:sqlite` (this codebase's real driver — see the Phase 3 section
 above for why better-sqlite3 isn't used) has no dedicated `.backup()` API the way better-sqlite3
-does (confirmed directly: `'backup' in DatabaseSync.prototype` is `false` in the installed Node
-version) — what it does have is `.serialize()`/`.deserialize()`, SQLite's own C API for producing a
-byte-for-byte-consistent snapshot of a database's current state. `createDbBackup()` uses exactly
-that, on a fresh, separate, **read-only** connection to the source file, and writes the result to a
-timestamped `backups/teacher-<timestamp>.db` — genuinely respecting "a clean copy while no write is
-in progress" rather than a naive file copy that could catch the live file mid-write.
+does (confirmed directly: `'backup' in DatabaseSync.prototype` is `false`). `createDbBackup()` runs
+SQLite's own `VACUUM INTO 'path'` statement (via `DatabaseSync.exec()`) on a fresh, separate,
+**read-only** connection to the source file — SQLite's standard, documented way to produce a
+consistent, self-contained snapshot of a live database directly to a new file, genuinely respecting
+"a clean copy while no write is in progress" rather than a naive file copy that could catch the live
+file mid-write. The destination path is embedded as a SQL string literal with any single quote
+doubled (standard SQL escaping — `VACUUM INTO` has no bound-parameter form for its destination).
 `--include-audio` optionally also copies the entire `AUDIO_CACHE_DIR` tree; opt-in, not automatic,
 since it's pure regenerable derived data (re-synthesizable from lesson text) that can be large, so
 it's excluded from the default backup rather than silently ballooning every routine run. `restore`
 is deliberately the simplest thing that could work: it can't stop a running app for you (no
 process-management layer exists in this codebase to hook into), so it just warns loudly and copies
-the chosen backup file over the live `TEACHER_DB_PATH`.
+the chosen backup file over the live `TEACHER_DB_PATH` — a plain file copy is legitimate for restore
+(unlike backup) since a `VACUUM INTO`-produced file is already a complete, valid SQLite database.
+
+**Corrected**: this originally used `.serialize()`/`.deserialize()` instead, with a comment
+claiming that API's presence was "confirmed directly" — it wasn't actually checked against every
+Node version this app might run on, and `npm run backup` broke with
+`TypeError: readDb.serialize is not a function` on at least one real environment where those
+methods (added to `node:sqlite` later than the module's original surface) aren't present. `exec()`
+has been part of `node:sqlite` since its introduction, making `VACUUM INTO` portable across Node
+versions this app might actually run on, not just the one most recently tested against — the same
+"verify, don't guess" lesson this project has hit before with `net.BlockList`/SQLite unique-index
+NULL semantics, this time the other direction: a claim that wasn't actually verified everywhere it
+needed to be.
 
 Verified as a real round-trip, not just "a file was created": backed up this repo's own real
-dry-run database, restored it to a fresh path, and confirmed the restored `courses` row is
-byte-for-byte identical to the original via a direct query against both files.
+dry-run database, opened the resulting backup file with a fresh, independent `DatabaseSync`
+connection and queried it directly, then restored it to a fresh path and confirmed the restored
+`courses` row is identical to the original via a direct query against both files. A backup
+destination path containing a single quote (a constructed test case — `tests/backup.test.ts` — not
+a realistic one for this codebase's own `BACKUP_DIR`, which is always `process.cwd() + "backups"`,
+but a real possibility for an arbitrary caller-supplied one, e.g. a Windows username like
+`O'Brien`) is confirmed handled correctly.
 
 **Deliberate scope decision, documented as such**: no cloud backup, no scheduled-backup
 infrastructure — a manual, on-demand command is the whole of this deliverable, the same
