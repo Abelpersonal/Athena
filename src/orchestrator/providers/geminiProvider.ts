@@ -98,6 +98,10 @@ export class GeminiProvider implements LLMProvider {
               // When the template wants thinking on, omit thinkingConfig entirely and
               // let the model's own default apply, rather than guessing a specific level.
               ...(params.thinking ? {} : { thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } }),
+              // `params.effort` (LLMCallParams) is deliberately NOT sent here — the Gemini API has
+              // no equivalent of Anthropic's `output_config.effort` verbosity/thoroughness tier at
+              // all. Explicitly no-opped, accepted only to satisfy the shared `LLMCallParams`
+              // interface; it has zero effect on the actual request against this provider.
             },
           })
         );

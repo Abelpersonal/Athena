@@ -1,16 +1,18 @@
 import type { LLMProvider } from "./types.js";
 import { AnthropicProvider } from "./anthropicProvider.js";
 import { GeminiProvider } from "./geminiProvider.js";
+import { OllamaProvider } from "./ollamaProvider.js";
 
 export type { LLMProvider, LLMCallParams, LLMCallResult, LLMFinishReason } from "./types.js";
 export { AnthropicProvider } from "./anthropicProvider.js";
 export { GeminiProvider } from "./geminiProvider.js";
+export { OllamaProvider, OllamaError } from "./ollamaProvider.js";
 
 let sharedProvider: LLMProvider | null = null;
 let sharedProviderName: string | null = null;
 
 /**
- * Selects the LLM provider via LLM_PROVIDER ("anthropic" | "gemini"), default
+ * Selects the LLM provider via LLM_PROVIDER ("anthropic" | "gemini" | "ollama"), default
  * "gemini". Cached per selected provider name so repeated calls reuse one
  * client — matches each provider's own internal lazy-client pattern.
  */
@@ -29,9 +31,12 @@ export function getProvider(): LLMProvider {
     case "gemini":
       provider = new GeminiProvider(process.env.GEMINI_API_KEY);
       break;
+    case "ollama":
+      provider = new OllamaProvider();
+      break;
     default:
       throw new Error(
-        `Unknown LLM_PROVIDER "${providerName}". Supported values: "anthropic", "gemini".`
+        `Unknown LLM_PROVIDER "${providerName}". Supported values: "anthropic", "gemini", "ollama".`
       );
   }
 

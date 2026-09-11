@@ -129,7 +129,7 @@ export async function run<T = unknown>(
   const startedAt = Date.now();
 
   const finalizeFailure = async (error: string): Promise<void> => {
-    const costUsd = estimateCostUsd(model, totalInputTokens, totalOutputTokens);
+    const costUsd = estimateCostUsd(model, totalInputTokens, totalOutputTokens, provider.name);
     sessionCostUsd += costUsd;
     await logOrchestratorCall({
       taskType,
@@ -195,7 +195,7 @@ export async function run<T = unknown>(
       // ever null when validation succeeded and validateExtra, if present,
       // also passed) but TS can't see that across the branch above.
       const data = (validation as { success: true; data: T }).data;
-      const costUsd = estimateCostUsd(model, totalInputTokens, totalOutputTokens);
+      const costUsd = estimateCostUsd(model, totalInputTokens, totalOutputTokens, provider.name);
       sessionCostUsd += costUsd;
       await logOrchestratorCall({
         taskType,

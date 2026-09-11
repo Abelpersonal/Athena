@@ -31,8 +31,21 @@ export const PRICING_USD_PER_MILLION_TOKENS: Record<
 export function estimateCostUsd(
   model: string,
   inputTokens: number,
-  outputTokens: number
+  outputTokens: number,
+  providerName?: string
 ): number {
+  // Ollama is local inference — there is no per-token API cost, ever, regardless of which model
+  // name the operator has pulled. Checked by PROVIDER, not by trying to enumerate Ollama model
+  // names into the table above: unlike Claude/Gemini's fixed, versioned catalog, an Ollama
+  // install's models are an open-ended, user-controlled set ("llama3.2", "qwen2.5:14b", a custom
+  // finetune, anything `ollama pull` has ever fetched) — hardcoding a few common names would just
+  // reproduce the exact "unrecognized model" warning below for every name not on that
+  // impossible-to-complete list. Returns $0 silently, no warning — $0 is the correct, INTENDED
+  // cost here, not a gap in this table, which is exactly the distinction this check exists to make
+  // visible in the logs (a real "no pricing data" warning still fires for a genuinely unrecognized
+  // hosted-provider model name, below).
+  if (providerName === "ollama") return 0;
+
   const pricing = PRICING_USD_PER_MILLION_TOKENS[model];
   if (!pricing) {
     console.warn(

@@ -5,6 +5,8 @@ const ENV_KEYS = [
   "LLM_PROVIDER",
   "GEMINI_API_KEY",
   "ANTHROPIC_API_KEY",
+  "OLLAMA_BASE_URL",
+  "OLLAMA_MODEL",
   "TTS_PROVIDER",
   "OPENAI_API_KEY",
   "TAVILY_API_KEY",
@@ -59,6 +61,19 @@ describe("validateEnv", () => {
     it("passes when LLM_PROVIDER=anthropic and ANTHROPIC_API_KEY is set (GEMINI_API_KEY not required)", () => {
       process.env.LLM_PROVIDER = "anthropic";
       process.env.ANTHROPIC_API_KEY = "real-key";
+      process.env.OPENAI_API_KEY = "real-key";
+      expect(() => validateEnv()).not.toThrow();
+    });
+
+    it("throws naming OLLAMA_MODEL when LLM_PROVIDER=ollama and it's missing (no sane default)", () => {
+      process.env.LLM_PROVIDER = "ollama";
+      process.env.OPENAI_API_KEY = "real-key";
+      expect(() => validateEnv()).toThrow(/OLLAMA_MODEL/);
+    });
+
+    it("passes when LLM_PROVIDER=ollama and OLLAMA_MODEL is set, with no OLLAMA_BASE_URL needed (it has a working default)", () => {
+      process.env.LLM_PROVIDER = "ollama";
+      process.env.OLLAMA_MODEL = "llama3.2";
       process.env.OPENAI_API_KEY = "real-key";
       expect(() => validateEnv()).not.toThrow();
     });

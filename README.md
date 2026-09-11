@@ -673,14 +673,16 @@ export interface LLMProvider {
 }
 ```
 
-`AnthropicProvider` and `GeminiProvider` both implement it, translating vendor-specific request
-and response shapes (Claude's `thinking`/`output_config`/`stop_reason`, Gemini's
-`thinkingConfig`/`usageMetadata`/`finishReason`) into the same `LLMCallParams` in /
-`LLMCallResult` out shape — including normalizing both a Claude refusal and a Gemini safety
-block to the same `finishReason: "refusal"`, so the Orchestrator's retry loop never needs to know
-which vendor answered. `getProvider()` selects and caches one instance based on `LLM_PROVIDER`
-(default `"gemini"`); `orchestrator.run()` calls only `getProvider()`, never a vendor SDK
-directly, and picks the model as `options.model ?? ORCHESTRATOR_MODEL ?? provider.defaultModel`.
+`AnthropicProvider`, `GeminiProvider`, and `OllamaProvider` all implement it, translating
+vendor-specific request and response shapes (Claude's `thinking`/`output_config`/`stop_reason`,
+Gemini's `thinkingConfig`/`usageMetadata`/`finishReason`, Ollama's `think`/`options.num_predict`/
+`done_reason`) into the same `LLMCallParams` in / `LLMCallResult` out shape — including
+normalizing a Claude refusal, a Gemini safety block, AND (see below) the genuine absence of any
+such signal from Ollama, into a single `finishReason` type the Orchestrator's retry loop never
+needs to branch on by vendor. `getProvider()` selects and caches one instance based on
+`LLM_PROVIDER` (`"anthropic"` | `"gemini"` | `"ollama"`, default `"gemini"`); `orchestrator.run()`
+calls only `getProvider()`, never a vendor SDK directly, and picks the model as
+`options.model ?? ORCHESTRATOR_MODEL ?? provider.defaultModel`.
 
 Each provider's own default model:
 
@@ -688,13 +690,40 @@ Each provider's own default model:
 |---|---|---|
 | `gemini` | `gemini-3.7-flash` | Google's latest stable Flash-tier model, positioned for "complex coding, agentic workflows" — a mid/high-tier pick, and stable rather than a preview model. |
 | `anthropic` | `claude-sonnet-5` | Near-Opus quality on agentic/coding work at roughly a third of Opus 5's price — see the Phase 1 reasoning below. |
+| `ollama` | none — `OLLAMA_MODEL` is required | Unlike Claude/Gemini's fixed, versioned model catalog, an Ollama install's available models are entirely local and user-controlled (whatever `ollama pull` has fetched) — there's no sane name to default to. `validateEnv()` enforces this is set whenever `LLM_PROVIDER=ollama`. |
 
-Both providers request `application/json` output as a best-effort hint (Gemini's
+Both hosted providers request `application/json` output as a best-effort hint (Gemini's
 `responseMimeType`, and system-prompt instructions for Claude), but neither is relied on for
 correctness — the Orchestrator's own parse-and-validate-and-retry loop (`validate.ts`) is what
-actually enforces schema compliance, and that has to work identically regardless of provider.
+actually enforces schema compliance, and that has to work identically regardless of provider
+(including Ollama, which gets no such hint at all — its native `/api/chat` has no equivalent
+field, so it relies purely on the same parse-and-retry loop the other two do anyway).
 
-To add a third provider, implement `LLMProvider` the same way and add a case to `getProvider()`'s
+**Ollama** (`src/orchestrator/providers/ollamaProvider.ts`) is a genuinely different kind of
+provider from the other two: a **local endpoint**, not a hosted API — no API key, no per-token
+cost, requires a real Ollama instance actually running and reachable at `OLLAMA_BASE_URL`
+(default `http://localhost:11434`, Ollama's standard local port). It calls Ollama's **native**
+`POST /api/chat` endpoint rather than Ollama's OpenAI-compatible `/v1/chat/completions` shim —
+chosen over the shim for two concrete reasons: this codebase already has a raw-`fetch()`-without-
+an-SDK precedent (`src/teachingEngine/tts/openaiTts.ts` calls OpenAI's real REST endpoint
+directly), so a new dependency wasn't needed either way; and the native endpoint's `think`
+request field / `message.thinking` response field give the `thinking` parameter a **real**
+mapping — confirmed directly against Ollama's real API docs and its Go source
+(`llm/server.go`'s `DoneReason` enum: `DoneReasonStop -> "stop"`, `DoneReasonLength -> "length"`,
+verified via GitHub code search, not guessed from the docs page alone, which doesn't enumerate
+these) — rather than the no-op the OpenAI-compat shim would have forced it into. `effort` has no
+Ollama equivalent at all and is explicitly no-opped (documented inline, the same choice
+`GeminiProvider` already makes for `effort`, now documented there too rather than left
+undiscoverable-by-reading-only). Ollama has no documented concept of a policy-refusal completion
+reason the way the two hosted providers do, so nothing ever maps to `finishReason: "refusal"` for
+it — a refusal from a local model, if it happens at all, comes back as ordinary generated text.
+`pricing.ts`'s `estimateCostUsd()` takes an optional provider-name argument specifically so a
+local-inference call always logs an explicit, intentional `$0` — never the generic "no pricing
+data for this model" warning meant for a genuinely unrecognized hosted-model name, since
+enumerating Ollama's open-ended, user-controlled model names into the pricing table the way
+Claude/Gemini's fixed catalog is listed would be a losing, incomplete exercise.
+
+To add a fourth provider, implement `LLMProvider` the same way and add a case to `getProvider()`'s
 switch statement — nothing else in the codebase (templates, the research pipeline, tests that
 mock at the `getProvider()` seam) needs to change.
 
@@ -4421,14 +4450,21 @@ and default it to Google Gemini rather than Anthropic. This was **not** part of 
 Phase 1 or Phase 2 kickoff prompts (Phase 1's spec explicitly named `@anthropic-ai/sdk`) — it's
 recorded here as a deliberate, requested deviation, not an oversight. See "Choosing an LLM
 provider" above for the resulting design (an `LLMProvider` interface, `AnthropicProvider` +
-`GeminiProvider`, `LLM_PROVIDER` env var). The Orchestrator's public contract
+`GeminiProvider` + `OllamaProvider`, `LLM_PROVIDER` env var). The Orchestrator's public contract
 (`run(taskType, context, callingModule, options)`) did not change — every template, the retry/
 validation loop, and the entire Research Agent pipeline are unaffected by which vendor is
-selected. `tests/providers.test.ts` covers both providers' request/response mapping and the
+selected. `tests/providers.test.ts` covers all three providers' request/response mapping and the
 selection logic directly; `tests/orchestrator.test.ts` and `tests/grounding.test.ts` were moved
 to mock the vendor-neutral `getProvider()` seam instead of a specific SDK, so the retry and
 grounding-enforcement logic they test is proven vendor-agnostic rather than accidentally
 Anthropic-specific.
+
+**Ollama added as a third provider** (a later, separate follow-up to this original two-provider
+swap): a genuinely different kind of addition, since it's a **local endpoint**, not another hosted
+API — no key, no per-token cost, requires a real Ollama instance running and reachable at
+`OLLAMA_BASE_URL`. See "Choosing an LLM provider" above for the full design (why the native
+`/api/chat` endpoint was chosen over the OpenAI-compatible shim, the real `think`/`effort`
+mapping decisions, and `pricing.ts`'s explicit-`$0`-for-local-inference handling).
 
 ## Definition of done — status
 

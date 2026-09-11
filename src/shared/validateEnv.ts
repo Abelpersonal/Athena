@@ -21,10 +21,18 @@ export interface ValidateEnvOptions {
  * paths already depend on — `LLM_PROVIDER`'s selected key (src/orchestrator/providers/index.ts),
  * `TTS_PROVIDER`'s selected key (src/teachingEngine/tts/index.ts), and the three VAPID push
  * variables (src/push/index.ts) — never key *validity* (a malformed key still passes here; only a
- * live API call can catch that), and never a provider name that isn't one of the two known values
- * for either `LLM_PROVIDER`/`TTS_PROVIDER` — `getProvider()`/`getTtsProvider()` already throw a
- * clear error for that lazily, on first real use, and duplicating that check here would just be a
- * second copy of the same validation to keep in sync.
+ * live API call can catch that), and never a provider name that isn't one of the three known
+ * values for `LLM_PROVIDER` (or the two for `TTS_PROVIDER`) — `getProvider()`/`getTtsProvider()`
+ * already throw a clear error for that lazily, on first real use, and duplicating that check here
+ * would just be a second copy of the same validation to keep in sync.
+ *
+ * `LLM_PROVIDER=ollama` is checked differently from the other two: only `OLLAMA_MODEL` is
+ * required, never `OLLAMA_BASE_URL` — Ollama is a local endpoint, not a hosted API, so there's no
+ * key to be missing, and `OLLAMA_BASE_URL` has a genuinely working default
+ * (`http://localhost:11434`, the standard local Ollama port) the same way `GRAPHITI_MCP_URL` does
+ * and is never checked here either. `OLLAMA_MODEL` has no such default — unlike Claude/Gemini's
+ * fixed model catalog, it depends entirely on what the operator has actually pulled locally, so
+ * guessing one would be worse than requiring it explicitly.
  *
  * `TAVILY_API_KEY` is the one deliberate exception to "fail fast": it only warns, never throws —
  * not because it's optional-but-broken-without-it, but because it genuinely isn't required at all.
@@ -45,6 +53,12 @@ export function validateEnv(options: ValidateEnvOptions = {}): void {
     errors.push("LLM_PROVIDER=gemini (the default) requires GEMINI_API_KEY to be set.");
   } else if (llmProvider === "anthropic" && !process.env.ANTHROPIC_API_KEY) {
     errors.push("LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY to be set.");
+  } else if (llmProvider === "ollama" && !process.env.OLLAMA_MODEL) {
+    errors.push(
+      "LLM_PROVIDER=ollama requires OLLAMA_MODEL to be set — there's no sane default since it " +
+        "depends entirely on what you've pulled locally (e.g. `ollama pull llama3.2`, then " +
+        "OLLAMA_MODEL=llama3.2)."
+    );
   }
 
   const ttsProvider = (process.env.TTS_PROVIDER || "openai").toLowerCase();
