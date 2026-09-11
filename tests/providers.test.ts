@@ -1,4 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { EventEmitter } from "node:events";
+
+// OllamaProvider uses node:http (never fetch/undici — see its own doc comment for why), so its
+// tests mock the request() entry point on both node:http and node:https rather than global.fetch.
+const mockHttpRequest = vi.fn();
+vi.mock("node:http", () => ({ default: { request: (...args: unknown[]) => mockHttpRequest(...args) } }));
+vi.mock("node:https", () => ({ default: { request: (...args: unknown[]) => mockHttpRequest(...args) } }));
 
 const mockAnthropicCreate = vi.fn();
 vi.mock("@anthropic-ai/sdk", () => ({
@@ -308,51 +315,90 @@ describe("GeminiProvider retry on transient errors", () => {
 });
 
 describe("OllamaProvider", () => {
-  const originalFetch = global.fetch;
+  interface CapturedRequest {
+    url: URL;
+    options: Record<string, unknown>;
+    writtenBody: string;
+  }
+  let capturedRequests: CapturedRequest[] = [];
 
   beforeEach(() => {
-    global.fetch = vi.fn();
+    capturedRequests = [];
+    mockHttpRequest.mockReset();
   });
 
   afterEach(() => {
-    global.fetch = originalFetch;
     vi.restoreAllMocks();
   });
 
-  function mockOllamaResponse(body: Record<string, unknown>): void {
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
-      ok: true,
-      json: async () => body,
-    });
+  /**
+   * OllamaProvider uses node:http/https directly, never fetch() — see its own class doc comment
+   * for the real, live-confirmed reasons (undici's default 300s headersTimeout killing genuinely
+   * slow CPU-only local generations, in a way `stream: true` alone didn't fully fix either). This
+   * builds a fake `http.request`-shaped implementation: a request object (write/end) and, once
+   * `.end()` is called, invokes the real request callback with a response object (a real
+   * `EventEmitter`, matching Node's own `IncomingMessage`) emitting the given status/body.
+   */
+  function ollamaHttpImpl(status: number, bodyLines: string[]) {
+    return (url: URL, options: Record<string, unknown>, callback: (res: EventEmitter & { statusCode: number }) => void) => {
+      const entry: CapturedRequest = { url, options, writtenBody: "" };
+      capturedRequests.push(entry);
+      const req = new EventEmitter() as EventEmitter & { write: (chunk: string) => void; end: () => void };
+      req.write = vi.fn((chunk: string) => {
+        entry.writtenBody += chunk;
+      });
+      req.end = vi.fn(() => {
+        const res = new EventEmitter() as EventEmitter & { statusCode: number; setEncoding: (enc: string) => void };
+        res.statusCode = status;
+        res.setEncoding = vi.fn();
+        callback(res);
+        res.emit("data", bodyLines.join("\n"));
+        res.emit("end");
+      });
+      return req;
+    };
+  }
+
+  /** Simulates a real streamed (NDJSON) Ollama response — one or more lines, matching the real
+   * wire format (see the class doc comment: `stream: true` is always sent now). */
+  function mockOllamaHttp(status: number, bodyLines: string[]): void {
+    mockHttpRequest.mockImplementation(ollamaHttpImpl(status, bodyLines));
   }
 
   it("calls the real Ollama /api/chat endpoint with the confirmed request shape", async () => {
-    mockOllamaResponse({
-      message: { role: "assistant", content: "hello from ollama" },
-      done_reason: "stop",
-      prompt_eval_count: 10,
-      eval_count: 5,
-    });
+    mockOllamaHttp(200, [
+      JSON.stringify({
+        message: { role: "assistant", content: "hello from ollama" },
+        done_reason: "stop",
+        prompt_eval_count: 10,
+        eval_count: 5,
+      }),
+    ]);
 
     const provider = new OllamaProvider({ baseUrl: "http://localhost:11434", model: "llama3.2" });
     const result = await provider.call({ ...baseParams, model: "llama3.2" });
 
-    expect(global.fetch).toHaveBeenCalledTimes(1);
-    const [url, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0]!;
-    expect(url).toBe("http://localhost:11434/api/chat");
-    expect(init.method).toBe("POST");
+    expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+    const { url, options, writtenBody } = capturedRequests[0]!;
+    expect(url.toString()).toBe("http://localhost:11434/api/chat");
+    expect(options.method).toBe("POST");
+    expect((options.headers as Record<string, string>)["Content-Type"]).toBe("application/json");
 
-    const body = JSON.parse(init.body);
+    const body = JSON.parse(writtenBody);
     expect(body).toMatchObject({
       model: "llama3.2",
       messages: [
         { role: "system", content: "sys" },
         { role: "user", content: "user" },
       ],
-      stream: false,
-      think: false,
+      stream: true,
       options: { num_predict: 100 },
     });
+    // think is omitted entirely (not sent as false) when thinking wasn't requested — confirmed
+    // live that a real Ollama instance accepts both forms equally when thinking is off, but this
+    // keeps the payload minimal, and omission is required (see the retry test below) for the
+    // "true" case since some real local models reject the field outright rather than ignore it.
+    expect(body.think).toBeUndefined();
     // effort is deliberately never sent — no Ollama request field corresponds to it.
     expect(body.effort).toBeUndefined();
 
@@ -364,44 +410,89 @@ describe("OllamaProvider", () => {
     });
   });
 
+  it("accumulates message.content across a real multi-chunk NDJSON stream, taking metadata only from the final (done: true) line", async () => {
+    // Reproduces the real shape a streamed /api/chat response actually takes — several partial
+    // chunks (no metadata yet) followed by one final chunk carrying done_reason/token counts.
+    mockOllamaHttp(200, [
+      JSON.stringify({ message: { role: "assistant", content: "The " } }),
+      JSON.stringify({ message: { role: "assistant", content: "answer " } }),
+      JSON.stringify({ message: { role: "assistant", content: "is 42." } }),
+      JSON.stringify({
+        message: { role: "assistant", content: "" },
+        done: true,
+        done_reason: "stop",
+        prompt_eval_count: 20,
+        eval_count: 7,
+      }),
+    ]);
+
+    const provider = new OllamaProvider({ model: "llama3.2" });
+    const result = await provider.call(baseParams);
+
+    expect(result).toEqual({
+      text: "The answer is 42.",
+      inputTokens: 20,
+      outputTokens: 7,
+      finishReason: "end_turn",
+    });
+  });
+
   it("passes thinking: true through as the real `think` request field", async () => {
-    mockOllamaResponse({ message: { content: "reasoned answer" }, done_reason: "stop" });
+    mockOllamaHttp(200, [JSON.stringify({ message: { content: "reasoned answer" }, done_reason: "stop" })]);
 
     const provider = new OllamaProvider({ model: "deepseek-r1" });
     await provider.call({ ...baseParams, thinking: true });
 
-    const [, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0]!;
-    expect(JSON.parse(init.body).think).toBe(true);
+    expect(JSON.parse(capturedRequests[0]!.writtenBody).think).toBe(true);
+  });
+
+  it("retries once with think omitted when the model rejects thinking outright (real, live-confirmed Ollama behavior on qwen2.5:7b)", async () => {
+    mockHttpRequest
+      .mockImplementationOnce(ollamaHttpImpl(400, ['{"error":"\\"qwen2.5:7b\\" does not support thinking"}']))
+      .mockImplementationOnce(
+        ollamaHttpImpl(200, [JSON.stringify({ message: { content: "answered without thinking" }, done_reason: "stop" })])
+      );
+
+    const provider = new OllamaProvider({ model: "qwen2.5:7b" });
+    const result = await provider.call({ ...baseParams, thinking: true });
+
+    expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(capturedRequests[0]!.writtenBody).think).toBe(true);
+    expect(capturedRequests[1]!.writtenBody.includes('"think"')).toBe(false);
+    expect(result.text).toBe("answered without thinking");
+  });
+
+  it("does NOT retry a 400 for an unrelated reason (only the exact 'does not support thinking' message triggers the fallback)", async () => {
+    mockOllamaHttp(400, ['{"error":"some other validation error"}']);
+
+    const provider = new OllamaProvider({ model: "qwen2.5:7b" });
+    await expect(provider.call({ ...baseParams, thinking: true })).rejects.toThrow(OllamaError);
+    expect(mockHttpRequest).toHaveBeenCalledTimes(1);
   });
 
   it('maps done_reason "length" to finishReason: max_tokens', async () => {
-    mockOllamaResponse({ message: { content: "cut off" }, done_reason: "length" });
+    mockOllamaHttp(200, [JSON.stringify({ message: { content: "cut off" }, done_reason: "length" })]);
     const provider = new OllamaProvider({ model: "llama3.2" });
     const result = await provider.call(baseParams);
     expect(result.finishReason).toBe("max_tokens");
   });
 
   it("maps an unrecognized/absent done_reason to finishReason: other (never refusal — Ollama has no such signal)", async () => {
-    mockOllamaResponse({ message: { content: "..." }, done_reason: undefined });
+    mockOllamaHttp(200, [JSON.stringify({ message: { content: "..." } })]);
     const provider = new OllamaProvider({ model: "llama3.2" });
     const result = await provider.call(baseParams);
     expect(result.finishReason).toBe("other");
   });
 
   it("defaults OLLAMA_BASE_URL to http://localhost:11434 when unset", async () => {
-    mockOllamaResponse({ message: { content: "x" }, done_reason: "stop" });
+    mockOllamaHttp(200, [JSON.stringify({ message: { content: "x" }, done_reason: "stop" })]);
     const provider = new OllamaProvider({ model: "llama3.2" });
     await provider.call(baseParams);
-    const [url] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0]!;
-    expect(url).toBe("http://localhost:11434/api/chat");
+    expect(capturedRequests[0]!.url.toString()).toBe("http://localhost:11434/api/chat");
   });
 
   it("throws OllamaError with the real status/body on a non-ok response", async () => {
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
-      ok: false,
-      status: 404,
-      text: async () => 'model "llama3.2" not found, try pulling it first',
-    });
+    mockOllamaHttp(404, ['model "llama3.2" not found, try pulling it first']);
 
     const provider = new OllamaProvider({ model: "llama3.2" });
     await expect(provider.call(baseParams)).rejects.toThrow(OllamaError);
@@ -410,7 +501,15 @@ describe("OllamaProvider", () => {
 
   it("times out with a TimeoutError (not hanging forever) when the request never resolves", async () => {
     vi.useFakeTimers();
-    (global.fetch as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise(() => {}));
+    // A request whose .end() never invokes the callback at all — the real-world equivalent of a
+    // connection that never receives a response, which node:http (deliberately, see the class doc
+    // comment) does NOT time out on its own; only the caller's own AbortSignal should.
+    mockHttpRequest.mockImplementation(() => {
+      const req = new EventEmitter() as EventEmitter & { write: (chunk: string) => void; end: () => void };
+      req.write = vi.fn();
+      req.end = vi.fn();
+      return req;
+    });
 
     const provider = new OllamaProvider({ model: "llama3.2" });
     const resultPromise = provider.call({ ...baseParams, timeoutMs: 30_000 });
