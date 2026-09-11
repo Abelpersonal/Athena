@@ -1,3 +1,5 @@
+import http from "node:http";
+import https from "node:https";
 import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import type { Locator } from "../shared/locator.js";
@@ -43,6 +45,7 @@ export interface CleanedContent {
 }
 
 const FETCH_TIMEOUT_MS = 15_000;
+const MAX_REDIRECTS = 10;
 const USER_AGENT =
   "TeacherResearchBot/0.1 (+personal educational research project; single on-demand fetch, no crawling)";
 /** Below this, Readability's output is too thin to trust even if it "succeeded". Also reused for the PDF/video text-length confidence heuristic (Deliverables 2/3) — one definition of "usable enough to cite", not a second one that could drift. */
@@ -118,15 +121,7 @@ async function fetchAndCleanVideo(url: string, getTranscript: TranscriptProvider
   };
 }
 
-async function fetchAndCleanPdfResponse(response: Response, parsePdf: ParsePdfFn): Promise<CleanedContent> {
-  let buffer: ArrayBuffer;
-  try {
-    buffer = await response.arrayBuffer();
-  } catch (error) {
-    console.warn(`[extraction] Failed to read PDF body: ${(error as Error).message}`);
-    return emptyResult("unreachable");
-  }
-
+async function fetchAndCleanPdfResponse(buffer: ArrayBuffer, parsePdf: ParsePdfFn): Promise<CleanedContent> {
   let parsed: Awaited<ReturnType<ParsePdfFn>>;
   try {
     parsed = await parsePdf(buffer);
@@ -153,6 +148,90 @@ async function fetchAndCleanPdfResponse(response: Response, parsePdf: ParsePdfFn
     chunks: parsed.chunks.map((c) => ({ text: c.text, locator: { type: "page", value: c.pageNumber } })),
     maxLocatorValue: parsed.totalPages,
   };
+}
+
+interface RawHttpResponse {
+  statusCode: number;
+  headers: http.IncomingHttpHeaders;
+  body: Buffer;
+}
+
+/**
+ * Confirmed live (Missing MCP Cleanup / SSRF follow-up pass): Node's global `fetch()` (built on
+ * undici) has a hardcoded 300-second default `headersTimeout` — confirmed directly in the
+ * installed `undici` package's own source (`lib/dispatcher/client.js`'s `kHeadersTimeout` default
+ * of `300e3`) — that is NOT reliably superseded by this function's own, much shorter
+ * `AbortController`-based `FETCH_TIMEOUT_MS` (15s): a real, live-observed failure mode is this
+ * function's own 15-second abort correctly firing and being caught below, while undici's
+ * internal per-connection timer for that same request is not always fully torn down and can fire
+ * independently, ~300 seconds after the ORIGINAL request started — by which point the function
+ * call that started it has long since returned, so that later error has no live Promise/try-catch
+ * left to land in, and surfaces instead as a raw, unhandled rejection that crashed the whole
+ * harness process (observed live, twice in six real runs). This is the exact same root cause
+ * already diagnosed and fixed in `src/orchestrator/providers/ollamaProvider.ts` — see that file's
+ * own doc comment for the fuller investigation (including why a custom undici `Agent` dispatcher
+ * was tried and rejected as version-incompatible with Node's internal `fetch`).
+ *
+ * Uses `node:http`/`node:https` directly instead, which impose no such hidden timeout of their
+ * own — only this function's own `AbortSignal` (still `FETCH_TIMEOUT_MS`, unchanged) governs how
+ * long a request is allowed to hang, with nothing shorter OR longer lurking underneath it.
+ *
+ * Follows redirects manually (`fetch()`'s `redirect: "follow"` doesn't exist here — node:http/
+ * https never follow automatically) — and, doing so, closes a real, related gap the previous
+ * `fetch()`-based version had: `isSafeToFetch()` was checked once, on the ORIGINAL url, before
+ * fetching, but `fetch()`'s own internal redirect-following happened AFTER that check with no
+ * hook to re-validate each hop — a classic SSRF-via-redirect bypass (an initially-safe URL
+ * redirecting to a private/internal address) that this rewrite closes for free by re-checking
+ * `isSafeToFetch()` on every redirect target before following it, capped at `MAX_REDIRECTS` hops.
+ *
+ * The caller (`fetchAndClean` below) is responsible for having already validated `url` itself —
+ * this function only re-validates REDIRECT TARGETS, at the point it's about to follow one (see
+ * below), rather than redundantly re-checking the same already-validated url on every top-level
+ * call (which would mean two real DNS lookups per fetch for no benefit).
+ */
+async function httpGetFollowingRedirects(
+  url: string,
+  signal: AbortSignal,
+  redirectsLeft: number = MAX_REDIRECTS
+): Promise<RawHttpResponse> {
+  const parsedUrl = new URL(url);
+  const transport = parsedUrl.protocol === "https:" ? https : http;
+
+  const response = await new Promise<RawHttpResponse>((resolve, reject) => {
+    const req = transport.request(
+      parsedUrl,
+      {
+        method: "GET",
+        signal,
+        headers: {
+          "User-Agent": USER_AGENT,
+          Accept: "text/html,application/xhtml+xml,application/pdf",
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => resolve({ statusCode: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks) }));
+        res.on("error", reject);
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+
+  const { statusCode, headers } = response;
+  if (statusCode >= 300 && statusCode < 400 && headers.location) {
+    if (redirectsLeft <= 0) {
+      throw new Error(`Too many redirects (> ${MAX_REDIRECTS}) for ${url}`);
+    }
+    const nextUrl = new URL(headers.location, parsedUrl).toString();
+    if (!(await isSafeToFetch(nextUrl))) {
+      throw new Error(`Refusing to follow redirect to ${nextUrl} — it resolves to a private/reserved network address.`);
+    }
+    return httpGetFollowingRedirects(nextUrl, signal, redirectsLeft - 1);
+  }
+
+  return response;
 }
 
 /**
@@ -188,16 +267,9 @@ export async function fetchAndClean(url: string, options: FetchAndCleanOptions =
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-  let response: Response;
+  let response: RawHttpResponse;
   try {
-    response = await fetch(url, {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: {
-        "User-Agent": USER_AGENT,
-        Accept: "text/html,application/xhtml+xml,application/pdf",
-      },
-    });
+    response = await httpGetFollowingRedirects(url, controller.signal);
   } catch (error) {
     console.warn(`[extraction] Fetch failed for ${url}: ${(error as Error).message}`);
     return emptyResult("unreachable");
@@ -205,28 +277,27 @@ export async function fetchAndClean(url: string, options: FetchAndCleanOptions =
     clearTimeout(timeout);
   }
 
-  if (!response.ok) {
-    console.warn(`[extraction] Fetch returned HTTP ${response.status} for ${url}`);
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    console.warn(`[extraction] Fetch returned HTTP ${response.statusCode} for ${url}`);
     return emptyResult("unreachable");
   }
 
-  const contentType = response.headers.get("content-type") ?? "";
+  const contentType = response.headers["content-type"] ?? "";
   if (!contentType.includes("html")) {
     const nonHtmlType = classifyNonHtmlContentType(contentType);
     if (nonHtmlType === "pdf") {
-      return fetchAndCleanPdfResponse(response, parsePdf);
+      // A genuine, fresh ArrayBuffer copy — Buffer.buffer is typed ArrayBufferLike (it could in
+      // principle be backed by a SharedArrayBuffer), which ParsePdfFn's real ArrayBuffer parameter
+      // doesn't accept; parsePdf (src/extraction/fetchAndCleanPdf.ts) needs the copy regardless.
+      const buffer = new ArrayBuffer(response.body.byteLength);
+      new Uint8Array(buffer).set(response.body);
+      return fetchAndCleanPdfResponse(buffer, parsePdf);
     }
     console.warn(`[extraction] Skipping non-HTML content-type "${contentType}" for ${url}`);
     return emptyResult(nonHtmlType);
   }
 
-  let html: string;
-  try {
-    html = await response.text();
-  } catch (error) {
-    console.warn(`[extraction] Failed to read response body for ${url}: ${(error as Error).message}`);
-    return emptyResult("unreachable");
-  }
+  const html = response.body.toString("utf-8");
 
   try {
     const dom = new JSDOM(html, { url });
