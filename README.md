@@ -4325,6 +4325,95 @@ against an actual directory on disk, confirmed by listing the resulting files di
   unrelated to startup validation, outside this pass's stated scope, and is now at least documented
   here instead of only being discoverable by reading both files side by side.
 
+## Hosting over Tailscale (an ops fix, not a code phase)
+
+Accessing this app from a phone via a Tailscale hostname (e.g. `https://<machine>.<tailnet>.ts.net`
+instead of `localhost`) needs two things a bare `next start` doesn't provide on its own: real HTTPS
+(service workers refuse to register over plain HTTP on any origin except `localhost`) and not being
+reachable from the office LAN/WiFi at the same time. Checked and fixed as follows:
+
+- **Bind address (fixed)**: `next start` was verified (via a real run + `netstat`) to bind to
+  `0.0.0.0`/`::` by default — already reachable from Tailscale, but also already reachable from
+  anyone on the same LAN/WiFi, which isn't wanted. `package.json`'s `start` script now runs
+  `next start -H 127.0.0.1` — loopback-only, verified again via `netstat` afterward. The app is no
+  longer reachable from any network interface directly; only something else on the *same machine*
+  can reach it.
+- **HTTPS (fixed, via Tailscale Serve, not a reverse proxy)**: rather than wiring a manually
+  generated `tailscale cert` cert/key into a custom Node HTTPS server or standing up Caddy/nginx,
+  `tailscale serve --bg 3000` is used instead — Tailscale's own built-in reverse proxy, which
+  terminates real HTTPS (auto-provisioned and auto-renewed, no cert files to manage by hand) and
+  is *only* reachable via the tailnet by construction (traffic has to arrive over the encrypted
+  Tailscale tunnel to reach it at all — there's no separate "which interface does it bind" question
+  the way there would be with a self-hosted reverse proxy). This is why the loopback-only bind
+  above is safe: `tailscale serve` proxies `https://<hostname>.ts.net/` on the tailnet to
+  `http://127.0.0.1:3000` on the same machine, which only it needs to reach.
+  Verified end-to-end with real `curl` requests against the live tailnet hostname (not just
+  `curl -k`/self-signed): a valid, browser-trusted cert (`ssl_verify_result: 0`), the real app
+  content, a relative `/onboarding` redirect resolving correctly, and `/sw.js` serving with the
+  correct `Content-Type: application/javascript`.
+- **Dev mode / `allowedDevOrigins` (not applicable — use production instead)**: no
+  `allowedDevOrigins` config exists, and none is needed, because dev mode isn't the right way to
+  host this. `next dev`'s hot-reload/on-demand compilation overhead is real per-request latency you'd
+  feel on every phone request, and Next.js's dev-only cross-origin origin-checking exists
+  specifically to protect a mode meant for one trusted local browser tab, not a small always-on
+  personal server. **Production (`next build && next start`) is the right mode for this hosting
+  setup.** The real tradeoff: a code change now needs `next build` (a real compile step, not
+  instant) before it's live, rather than dev mode's automatic hot-reload — a deliberate cost for a
+  personal-use server that's up far more than it's being actively coded against. (If dev mode is
+  ever wanted for a quick live-reload test over the same tailnet hostname, that specific hostname
+  would need adding to `next.config.ts`'s `allowedDevOrigins` array — not done here since production
+  is the recommended path.)
+- **Hardcoded `localhost`/origin references (already correct, no changes needed)**: grepped
+  `app/`, `components/`, `lib/`, and `public/` for `localhost`/`127.0.0.1`/absolute-URL
+  `fetch`/`EventSource`/`WebSocket` calls and `NEXT_PUBLIC_*` env vars (the one build-time-inlined
+  way an origin could get frozen into the client bundle) — zero hits. `public/sw.js`'s same-origin
+  check uses `self.location.origin`, its registration (`components/ServiceWorkerRegister.tsx`)
+  registers `"/sw.js"` (a relative path), every SSE (`EventSource`) URL is built from a relative
+  `/api/...` path, the VAPID public key reaches the client via a relative API route rather than a
+  baked-in env var, and `app/manifest.ts` uses only relative icon/`start_url` paths. Every one of
+  these already resolves correctly against whatever origin the page was actually loaded from — no
+  code needed to change for this. The only `localhost`/`127.0.0.1` references anywhere in the
+  codebase are `src/memoryGraph/graphitiClient.ts`'s default same-machine Graphiti connection URL
+  and `src/shared/urlSafety.ts`'s SSRF blocklist — both intentionally scoped to backend-only,
+  same-machine concerns, unrelated to how a phone reaches the app.
+
+### Verifying from a phone
+
+1. **Service worker registered**: open the app at `https://<hostname>.ts.net` in the phone's
+   browser (Chrome/Firefox on Android support inspecting this remotely from a desktop via
+   `chrome://inspect`/`about:debugging` over USB; Safari on iOS via the Mac's Web Inspector with
+   the phone's Safari remote-debugging enabled). Without a remote-debugging setup, the simplest
+   manual check: install the app to the home screen (the browser's "Add to Home Screen"/install
+   prompt only appears at all once a valid manifest + a successfully-registered service worker are
+   both present over HTTPS — its *availability* is itself a real, visible signal). A more direct
+   check needing no cable: visit the app, then turn on Airplane Mode and reload — if the app shell
+   still loads (even to a "you're offline" state rather than a browser network-error page), the
+   service worker registered and its `install` handler's `APP_SHELL` pre-cache worked.
+2. **An offline-downloaded lesson still loads with no connectivity**: while online, open a course,
+   use the real "Download for offline" action on a lesson/course, and wait for it to report done.
+   Then enable Airplane Mode (or turn off Wi-Fi *and* mobile data — Airplane Mode is the more
+   reliable test since it also blocks any leftover Tailscale connectivity a plain Wi-Fi toggle
+   might not). Reload the app and navigate to that same downloaded lesson — it should render its
+   real content from the service worker's cache. Navigating to a *different*, never-visited lesson
+   should correctly fail to load (proving the first one worked because it was genuinely cached, not
+   because something else papered over the offline state entirely).
+
+### Documented gaps
+
+- **This still needs `npm start` (or the equivalent) run manually each time** — `tailscale serve`'s
+  config persists across reboots (it's stored in Tailscale's own local daemon state, not tied to
+  the CLI invocation that set it), and the Tailscale Windows service auto-starts on boot, but the
+  Next.js app itself has no auto-start/process-supervision setup in this repo. Out of scope for
+  this pass; a real fix would be a Windows service wrapper or a Scheduled Task, neither of which
+  exist here yet.
+- **Unrelated pre-existing gap surfaced while verifying this**: `next start` currently refuses to
+  boot at all against this repo's real `.env` — `TTS_PROVIDER` defaults to `"openai"` but
+  `OPENAI_API_KEY` was never set, and `validateEnv()`'s `instrumentation.ts` hook (see "Startup
+  Validation" above) correctly fails fast on it. This is the same gap flagged, but not resolved, at
+  the end of that earlier pass. Verification here used a one-off `TTS_PROVIDER=browser` override
+  rather than editing `.env`, since choosing between a real key and `TTS_PROVIDER=browser` is a
+  real product decision, not an ops fix.
+
 ## LLM provider swap (added mid-Phase-2, not in the original kickoff prompt)
 
 Partway through Phase 2, the decision was made to make the Orchestrator's LLM vendor swappable
